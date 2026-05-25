@@ -272,6 +272,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--num_init_threads",
+        type=int,
+        default=4,
+        help="Number of threads to use during the init heightmap search.",
+    )
+
+    parser.add_argument(
         "--num_init_cluster_layers",
         type=int,
         default=-1,
@@ -578,7 +585,7 @@ def _initialize_heightmap(
                 args.layer_height,
                 bgr_tuple,
                 random_seed=random_seed,
-                num_threads=4,
+                num_threads=args.num_init_threads,
                 init_method="kmeans",
                 cluster_layers=args.num_init_cluster_layers,
                 material_colors=material_colors_np,

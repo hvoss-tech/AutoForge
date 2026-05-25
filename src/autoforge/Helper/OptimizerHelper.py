@@ -170,28 +170,39 @@ def composite_image_cont(
 
     # 4. thickness and opacity
     p_print_bleed = bleed_layer_effect(p_print, strength=0.1)  # [L,H,W]
+    del p_print
     eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
+    del p_print_bleed
     thick_ratio = eff_thick / layer_TDs.view(-1, 1, 1)  # [L,H,W]
+    del eff_thick
 
     o, A, k, b = -1.2416557e-02, 9.6407950e-01, 3.4103447e01, -4.1554203e00
     opac = o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio)
+    del thick_ratio
     opac = torch.clamp(opac, 0.0, 1.0)  # [L,H,W]
 
-    # 5. flip to top→bottom order before compositing
+    # 5. flip to top->bottom order before compositing
     opac_fb = torch.flip(opac, dims=[0])  # [L,H,W]
+    del opac
     colors_fb = torch.flip(layer_colors, dims=[0])  # [L,3]
+    del layer_colors
 
     trans_fb = 1.0 - opac_fb  # [L,H,W]
     trans_shift = torch.cat([torch.ones_like(trans_fb[:1]), trans_fb[:-1]], dim=0)
     remain_fb = torch.cumprod(trans_shift, dim=0)  # remaining before each layer [L,H,W]
+    del trans_shift
 
     comp_layers = (remain_fb * opac_fb).unsqueeze(-1) * colors_fb.view(
         -1, 1, 1, 3
     )  # [L,H,W,3]
+    del opac_fb, colors_fb
+
     comp = comp_layers.sum(dim=0)  # [H,W,3]
+    del comp_layers
 
     # 6. background
     rem_after = remain_fb[-1] * trans_fb[-1]  # remaining after bottom layer
+    del remain_fb, trans_fb
     comp = comp + rem_after.unsqueeze(-1) * background  # [H,W,3]
     return comp * 255.0
 
@@ -292,28 +303,39 @@ def composite_image_disc(
 
     # 4. Thickness, opacity and the rest exactly as in the continuous version.
     p_print_bleed = bleed_layer_effect(p_print, strength=0.1)  # [L,H,W]
+    del p_print
     eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
+    del p_print_bleed
     thick_ratio: torch.Tensor = eff_thick / layer_TDs.view(-1, 1, 1)  # [L,H,W]
+    del eff_thick
 
     o, A, k, b = -1.2416557e-02, 9.6407950e-01, 3.4103447e01, -4.1554203e00
     opac: torch.Tensor = o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio)
+    del thick_ratio
     opac = torch.clamp(opac, 0.0, 1.0)  # [L,H,W]
 
     # 5. Top-to-bottom compositing (same flipping trick as before).
     opac_fb = torch.flip(opac, dims=[0])  # [L,H,W]
+    del opac
     colors_fb = torch.flip(layer_colors, dims=[0])  # [L,3]
+    del layer_colors
 
     trans_fb = 1.0 - opac_fb  # [L,H,W]
     trans_prev = torch.cat([torch.ones_like(trans_fb[:1]), trans_fb[:-1]], dim=0)
     remain_fb = torch.cumprod(trans_prev, dim=0)  # [L,H,W]
+    del trans_prev
 
     comp_layers = (remain_fb * opac_fb).unsqueeze(-1) * colors_fb.view(
         -1, 1, 1, 3
     )  # [L,H,W,3]
+    del opac_fb, colors_fb
+
     comp = comp_layers.sum(dim=0)  # [H,W,3]
+    del comp_layers
 
     # 6. Background
     rem_after = remain_fb[-1] * trans_fb[-1]
+    del remain_fb, trans_fb
     comp = comp + rem_after.unsqueeze(-1) * background  # [H,W,3]
 
     return comp * 255.0

@@ -354,7 +354,6 @@ class FilamentOptimizer:
             background=self.background,
             add_penalty_loss=10.0,
             focus_map=self.focus_map,
-            focus_strength=10.0,
         )
 
         self.precision.backward_and_step(loss, self.optimizer)
@@ -636,20 +635,24 @@ class FilamentOptimizer:
         custom_global_logits: torch.Tensor = None,
     ):
         with torch.no_grad():
-            effective_logits = self._apply_height_offset(
-                self.best_params["pixel_height_logits"],
-                self.best_params["height_offsets"],
-            )
-            best_comp = composite_image_disc(
-                effective_logits
-                if custom_height_logits is None
-                else self._apply_height_offset(
+            if custom_height_logits is not None:
+                effective_logits = self._apply_height_offset(
                     custom_height_logits,
                     self.best_params["height_offsets"],
-                ),
-                self.best_params["global_logits"]
-                if custom_global_logits is None
-                else custom_global_logits,
+                )
+            else:
+                effective_logits = self._apply_height_offset(
+                    self.best_params["pixel_height_logits"],
+                    self.best_params["height_offsets"],
+                )
+            global_logits = (
+                custom_global_logits
+                if custom_global_logits is not None
+                else self.best_params["global_logits"]
+            )
+            best_comp = composite_image_disc(
+                effective_logits,
+                global_logits,
                 self.vis_tau,
                 self.vis_tau,
                 self.h,
@@ -788,49 +791,53 @@ class FilamentOptimizer:
         Discretize the current solution, compute the discrete-mode loss,
         and update the best solution if it improves.
         """
+        seed = np.random.randint(0, 1000000)
 
-        for i in range(1):
-            # draw random integer seed
-            seed = np.random.randint(0, 1000000)
+        tau_g = self.vis_tau
+        with torch.no_grad():
+            effective_logits = self._apply_height_offset()
 
-            # 1) Discretize
-            tau_g = self.vis_tau
-            with torch.no_grad():
-                effective_logits = self._apply_height_offset()
-                disc_global, disc_height_image = self.discretize_solution(
-                    self.params, tau_g, self.h, self.max_layers, rng_seed=seed
-                )
+            # Discretize to get disc_global (per-layer material assignments)
+            disc_global, disc_height_image = self.discretize_solution(
+                self.params, tau_g, self.h, self.max_layers, rng_seed=seed
+            )
 
-                # 2) Compute discrete-mode composite
-                with torch.no_grad():
-                    comp_disc = composite_image_disc(
-                        effective_logits,
-                        self.params["global_logits"],
-                        self.vis_tau,
-                        self.vis_tau,
-                        self.h,
-                        self.max_layers,
-                        self.material_colors,
-                        self.material_TDs,
-                        self.background,
-                        rng_seed=seed,
-                    )
+            # Build discrete global logits from disc_global to avoid
+            # re-running Gumbel-Softmax inside composite_image_disc.
+            num_materials = self.material_colors.shape[0]
+            from autoforge.Helper.PruningHelper import disc_to_logits
+            disc_global_logits = disc_to_logits(
+                disc_global, num_materials, big_pos=1e5
+            )
 
-                current_disc_loss = compute_loss(
-                    comp=comp_disc,
-                    target=self.target,
-                    focus_map=self.focus_map,
-                ).item()
-                from autoforge.Helper.PruningHelper import find_color_bands
+            # Composite using the already-discretized global assignment
+            comp_disc = composite_image_disc(
+                effective_logits,
+                disc_global_logits,
+                tau_g,
+                tau_g,
+                self.h,
+                self.max_layers,
+                self.material_colors,
+                self.material_TDs,
+                self.background,
+                rng_seed=seed,
+            )
 
-                # 4) Update if better
-                if current_disc_loss < self.best_discrete_loss:
-                    self.best_discrete_loss = current_disc_loss
-                    self.best_params = self.get_current_parameters()
-                    self.best_tau = tau_g
-                    self.best_seed = seed
-                    self.best_swaps = len(find_color_bands(disc_global)) - 1
-                    self.best_step = self.num_steps_done
+            current_disc_loss = compute_loss(
+                comp=comp_disc,
+                target=self.target,
+                focus_map=self.focus_map,
+            ).item()
+            from autoforge.Helper.PruningHelper import find_color_bands
+
+            if current_disc_loss < self.best_discrete_loss:
+                self.best_discrete_loss = current_disc_loss
+                self.best_params = self.get_current_parameters()
+                self.best_tau = tau_g
+                self.best_seed = seed
+                self.best_swaps = len(find_color_bands(disc_global)) - 1
+                self.best_step = self.num_steps_done
 
     def rng_seed_search(
         self, start_loss: float, num_seeds: int, autoset_seed: bool = False

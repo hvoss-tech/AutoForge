@@ -17,7 +17,7 @@ def loss_fn(
     background: torch.Tensor,
     add_penalty_loss: float = 0.0,
     focus_map: torch.Tensor = None,
-    focus_strength: float = 10.0,
+    focus_strength: float = None,
 ) -> torch.Tensor:
     """
     Full forward pass for continuous assignment:
@@ -53,7 +53,7 @@ def compute_loss(
     tau_height: float = 1.0,
     add_penalty_loss: float = 0.0,
     focus_map: torch.Tensor = None,
-    focus_strength: float = 10.0,
+    focus_strength: float = None,
 ) -> torch.Tensor:
     """
     Compute loss between composite and target.
@@ -84,11 +84,11 @@ def compute_loss(
     # Per-pixel MSE over Lab channels
     per_pixel_mse = (comp_lab - target_lab).pow(2).mean(dim=2)  # [H,W]
 
-    weights = 1.0 + focus_strength * focus_map_proc  # [H,W]
+    weights = 0.1 + 0.9 * focus_map_proc  # [H,W] range [0.1, 1.0]
     weighted_loss = per_pixel_mse * weights
     # Normalize by average weight so scale comparable to original MSE
     total_loss = weighted_loss.mean() / weights.mean()
 
-    return total_loss.mean()
+    return total_loss
 
     # (Additional smoothness and penalties are currently disabled.)
