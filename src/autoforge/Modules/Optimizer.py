@@ -6,6 +6,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -262,6 +263,12 @@ class FilamentOptimizer:
         gathered = offsets_1d[labels]  # [H,W]
         mask = (labels != 0).to(gathered.dtype)
         offsets = gathered * mask  # zero-out background
+        if offsets.shape != pixel_logits.shape:
+            offsets = F.interpolate(
+                offsets.unsqueeze(0).unsqueeze(0),
+                size=pixel_logits.shape[-2:],
+                mode="bicubic",
+            ).squeeze(0).squeeze(0)
         return pixel_logits + offsets
 
     def _remove_height_offset(
@@ -286,6 +293,12 @@ class FilamentOptimizer:
         gathered = offsets_1d[labels]  # [H, W]
         mask = (labels != 0).to(gathered.dtype)
         offsets = gathered * mask  # zero-out background
+        if offsets.shape != pixel_logits.shape:
+            offsets = F.interpolate(
+                offsets.unsqueeze(0).unsqueeze(0),
+                size=pixel_logits.shape[-2:],
+                mode="bicubic",
+            ).squeeze(0).squeeze(0)
 
         return pixel_logits - offsets
 
@@ -694,7 +707,7 @@ class FilamentOptimizer:
         # Calculate and Print current loss
         dg, dh = self.get_discretized_solution(best=True)
         if dh is not None:
-            current_loss = _compute_loss_for_heightmap(self, dg, dh)
+            current_loss = _compute_loss_for_heightmap(self, dg)
             print(f"Pre-prune discrete loss: {current_loss:.4f}")
 
         # clear pytorch and system cache to reduce vram usage
@@ -737,7 +750,7 @@ class FilamentOptimizer:
         # Calculate and Print current loss
         dg, dh = self.get_discretized_solution(best=True)
         if dh is not None:
-            current_loss = _compute_loss_for_heightmap(self, dg, dh)
+            current_loss = _compute_loss_for_heightmap(self, dg)
             print(f"Post-prune discrete loss: {current_loss:.4f}")
 
     def post_remove_spikes(self):
@@ -748,7 +761,7 @@ class FilamentOptimizer:
 
         dg_post, dh_post = self.get_discretized_solution(best=True)
         if dh_post is not None:
-            pre_loss = _compute_loss_for_heightmap(self, dg_post, dh_post)
+            pre_loss = _compute_loss_for_heightmap(self, dg_post)
 
             # Work on continuous height map to avoid discretization and numpy round-trips.
             eff_logits = self._apply_height_offset(
@@ -762,16 +775,15 @@ class FilamentOptimizer:
             )
 
             normalized = dh_clean.clamp(0, self.max_layers) / float(self.max_layers)
+            normalized = normalized.clamp(1e-6, 1 - 1e-6)
             cleaned_logits = self._remove_height_offset(
                 pixel_logits=torch.log(normalized) - torch.log1p(-normalized),
                 height_offsets=self.best_params["height_offsets"],
             )
-            # normalized = normalized.clamp(1e-6, 1 - 1e-6)
-            # cleaned_logits = torch.log(normalized) - torch.log1p(-normalized)
             self.best_params["pixel_height_logits"] = cleaned_logits.to(self.device)
             self.pixel_height_logits = cleaned_logits.to(self.device)
             dg_post, dh_post = self.get_discretized_solution(best=True)
-            post_loss = _compute_loss_for_heightmap(self, dg_post, dh_post)
+            post_loss = _compute_loss_for_heightmap(self, dg_post)
             print(
                 f"Spike removal: loss {pre_loss:.4f} -> {post_loss:.4f} | spikes fixed {spikes}"
             )

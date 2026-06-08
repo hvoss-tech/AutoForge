@@ -467,7 +467,7 @@ def _prepare_background_and_materials(
     device: torch.device,
     material_colors_np: np.ndarray,
     material_TDs_np: np.ndarray,
-) -> Tuple[Tuple[int, int, int], torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[Tuple[float, float, float], torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create torch tensors for materials & background color.
 
     Args:
@@ -477,15 +477,15 @@ def _prepare_background_and_materials(
         material_TDs_np: (N,*) array of material transmission / diffusion parameters.
 
     Returns:
-        (bgr_tuple_uint8, background_tensor, material_colors_tensor, material_TDs_tensor)
+        (rgb_tuple, background_tensor, material_colors_tensor, material_TDs_tensor)
     """
-    bgr_tuple = tuple(hex_to_rgb(args.background_color))
-    background = torch.tensor(bgr_tuple, dtype=torch.float32, device=device)
+    rgb_tuple = tuple(hex_to_rgb(args.background_color))
+    background = torch.tensor(rgb_tuple, dtype=torch.float32, device=device)
     material_colors = torch.tensor(
         material_colors_np, dtype=torch.float32, device=device
     )
     material_TDs = torch.tensor(material_TDs_np, dtype=torch.float32, device=device)
-    return bgr_tuple, background, material_colors, material_TDs
+    return rgb_tuple, background, material_colors, material_TDs
 
 
 def _compute_pixel_sizes(args) -> Tuple[int, int]:
@@ -541,7 +541,7 @@ def _load_priority_mask(
 def _initialize_heightmap(
     args,
     output_img_np: np.ndarray,
-    bgr_tuple: Tuple[int, int, int],
+    bg_rgb: Tuple[float, float, float],
     material_colors_np: np.ndarray,
     random_seed: int,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
@@ -583,7 +583,7 @@ def _initialize_heightmap(
                 output_img_np,
                 args.max_layers,
                 args.layer_height,
-                bgr_tuple,
+                bg_rgb,
                 random_seed=random_seed,
                 num_threads=args.num_init_threads,
                 init_method="kmeans",
@@ -719,7 +719,6 @@ def _post_optimize_and_export(
     material_colors_np: np.ndarray,
     material_TDs_np: np.ndarray,
     material_names: List[str],
-    bgr_tuple: Tuple[int, int, int],
     device: torch.device,
     focus_map_full: Optional[torch.Tensor],
     focus_map_proc: Optional[torch.Tensor],
@@ -742,7 +741,9 @@ def _post_optimize_and_export(
         interval=1, namespace="post_opt", step=(post_opt_step := post_opt_step + 1)
     )
 
-    optimizer.pixel_height_logits = torch.from_numpy(pixel_height_logits_init)
+    optimizer.pixel_height_logits = torch.from_numpy(
+        pixel_height_logits_init
+    ).to(device)
     optimizer.best_params["pixel_height_logits"] = torch.from_numpy(
         pixel_height_logits_init
     ).to(device)
@@ -932,7 +933,7 @@ def start(args) -> float:
     )
 
     # Prepare background color tensor and material tensors
-    bgr_tuple, background, material_colors, material_TDs = (
+    bg_rgb, background, material_colors, material_TDs = (
         _prepare_background_and_materials(
             args, device, material_colors_np, material_TDs_np
         )
@@ -957,11 +958,15 @@ def start(args) -> float:
         _initialize_heightmap(
             args,
             output_img_np,
-            bgr_tuple,
+            bg_rgb,
             material_colors_np,
             random_seed,
         )
     )
+
+    # Apply alpha mask to full-res logits BEFORE creating processing copies
+    if alpha is not None:
+        pixel_height_logits_init[alpha < 128] = -13.815512
 
     # Prepare processing targets and focus map (processing-res)
     processing_img_np, processing_target, focus_map_proc = _prepare_processing_targets(
@@ -979,10 +984,6 @@ def start(args) -> float:
         interpolation=cv2.INTER_NEAREST,
         dsize=(processing_target.shape[1], processing_target.shape[0]),
     )
-
-    # Apply alpha mask to full-res logits (keep original order/behavior)
-    if alpha is not None:
-        pixel_height_logits_init[alpha < 128] = -13.815512
 
     perception_loss_module = None
 
@@ -1015,7 +1016,6 @@ def start(args) -> float:
         material_colors_np,
         material_TDs_np,
         material_names,
-        bgr_tuple,
         device,
         focus_map_full,
         focus_map_proc,

@@ -50,16 +50,18 @@ class MultiLayerVGGPerceptualLoss(nn.Module):
         x = (x / 255.0 - self.mean) / self.std
         y = (y / 255.0 - self.mean) / self.std
 
+        with torch.no_grad():
+            y_features = {}
+            y_out = y
+            for i, layer in enumerate(self.vgg):
+                y_out = layer(y_out)
+                if i in self.layers:
+                    y_features[i] = y_out
+
         loss = 0.0
         out = x
-        # Loop through VGG layers and compute losses at the selected layers.
         for i, layer in enumerate(self.vgg):
             out = layer(out)
             if i in self.layers:
-                # Extract corresponding feature for y by running y through the same layers.
-                with torch.no_grad():
-                    out_y = y
-                    for j in range(i + 1):
-                        out_y = self.vgg[j](out_y)
-                loss += self.weights[self.layers.index(i)] * F.mse_loss(out, out_y)
+                loss += self.weights[self.layers.index(i)] * F.mse_loss(out, y_features[i])
         return loss

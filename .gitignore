@@ -173,6 +173,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Runtime data
+filament_library/
+
 # Created by https://www.toptal.com/developers/gitignore/api/pycharm
 # Edit at https://www.toptal.com/developers/gitignore?templates=pycharm
 

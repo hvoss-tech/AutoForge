@@ -28,6 +28,11 @@ dependencies = [
   "trimesh>=4.6.4",
   "joblib>=1.4.2",
   "uvicorn[standard]>=0.44.0",
+  "fastapi>=0.115.0",
+  "python-multipart>=0.0.12",
+  "aiofiles>=24.1.0",
+  "websockets>=15.0",
+  "pydantic-settings>=2.0.0",
 ]
 
 [tool.setuptools]

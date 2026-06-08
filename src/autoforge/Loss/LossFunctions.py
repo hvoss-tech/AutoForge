@@ -17,11 +17,10 @@ def loss_fn(
     background: torch.Tensor,
     add_penalty_loss: float = 0.0,
     focus_map: torch.Tensor = None,
-    focus_strength: float = None,
 ) -> torch.Tensor:
     """
     Full forward pass for continuous assignment:
-    composite, then compute unified loss on (global_logits).
+    composite, then compute unified loss.
     focus_map acts as a priority mask (values in [0,1]) where 1.0 means full weight and 0 means low weight.
     """
     comp = composite_image_cont(
@@ -42,7 +41,6 @@ def loss_fn(
         tau_height=tau_height,
         add_penalty_loss=add_penalty_loss,
         focus_map=focus_map,
-        focus_strength=focus_strength,
     )
 
 
@@ -53,7 +51,6 @@ def compute_loss(
     tau_height: float = 1.0,
     add_penalty_loss: float = 0.0,
     focus_map: torch.Tensor = None,
-    focus_strength: float = None,
 ) -> torch.Tensor:
     """
     Compute loss between composite and target.
@@ -71,24 +68,27 @@ def compute_loss(
         # standard mean squared error in Lab space
         mse_loss = F.mse_loss(comp_lab, target_lab)
         total_loss = mse_loss
-        return total_loss
-
-    # Ensure focus_map shape compatibility: [H,W]
-    if focus_map.dim() == 3 and focus_map.shape[-1] == 1:
-        focus_map_proc = focus_map.squeeze(-1)
     else:
-        focus_map_proc = focus_map
-    # Clamp/normalize safety
-    focus_map_proc = torch.clamp(focus_map_proc, 0.0, 1.0)
+        # Ensure focus_map shape compatibility: [H,W]
+        if focus_map.dim() == 3 and focus_map.shape[-1] == 1:
+            focus_map_proc = focus_map.squeeze(-1)
+        else:
+            focus_map_proc = focus_map
+        # Clamp/normalize safety
+        focus_map_proc = torch.clamp(focus_map_proc, 0.0, 1.0)
 
-    # Per-pixel MSE over Lab channels
-    per_pixel_mse = (comp_lab - target_lab).pow(2).mean(dim=2)  # [H,W]
+        # Per-pixel MSE over Lab channels
+        per_pixel_mse = (comp_lab - target_lab).pow(2).mean(dim=2)  # [H,W]
 
-    weights = 0.1 + 0.9 * focus_map_proc  # [H,W] range [0.1, 1.0]
-    weighted_loss = per_pixel_mse * weights
-    # Normalize by average weight so scale comparable to original MSE
-    total_loss = weighted_loss.mean() / weights.mean()
+        weights = 0.1 + 0.9 * focus_map_proc  # [H,W] range [0.1, 1.0]
+        weighted_loss = per_pixel_mse * weights
+        # Normalize by average weight so scale comparable to original MSE
+        total_loss = weighted_loss.mean() / weights.mean()
+
+    # Height-map smoothness penalty (Laplacian / total variation)
+    if add_penalty_loss > 0 and pixel_height_logits is not None and pixel_height_logits.dim() == 2:
+        dy = (pixel_height_logits[:, 1:] - pixel_height_logits[:, :-1]).pow(2).mean()
+        dx = (pixel_height_logits[1:, :] - pixel_height_logits[:-1, :]).pow(2).mean()
+        total_loss = total_loss + (dx + dy) * add_penalty_loss
 
     return total_loss
-
-    # (Additional smoothness and penalties are currently disabled.)

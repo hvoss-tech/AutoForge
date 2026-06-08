@@ -69,7 +69,7 @@ def prune_num_colors(
             out_im = optimizer.get_best_discretized_image(
                 custom_global_logits=logits_for_disc
             )
-            loss = compute_loss(comp=out_im, target=optimizer.target)
+            loss = compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map)
 
         return loss, dg_test
 
@@ -80,7 +80,7 @@ def prune_num_colors(
             out_im = optimizer.get_best_discretized_image(
                 custom_global_logits=logits_for_disc
             )
-            loss = compute_loss(comp=out_im, target=optimizer.target)
+            loss = compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map)
 
         return loss
 
@@ -217,7 +217,7 @@ def prune_num_swaps(
             out_im = optimizer.get_best_discretized_image(
                 custom_global_logits=logits_for_disc
             )
-            loss = compute_loss(comp=out_im, target=optimizer.target)
+            loss = compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map)
         return loss
 
     def score_swap(dg_base: torch.Tensor, band_a, band_b, direction: str):
@@ -227,7 +227,7 @@ def prune_num_swaps(
             out_im = optimizer.get_best_discretized_image(
                 custom_global_logits=logits_for_disc
             )
-            loss = compute_loss(comp=out_im, target=optimizer.target)
+            loss = compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map)
         return loss, dg_test
 
     best_dg = disc_global.clone()
@@ -529,7 +529,7 @@ def prune_redundant_layers(
                 optimizer.background,
                 rng_seed=optimizer.best_seed,
             )
-            cand_loss = compute_loss(cand_comp, optimizer.target).item()
+            cand_loss = compute_loss(cand_comp, optimizer.target, focus_map=optimizer.focus_map).item()
         return cand_loss, cand_params, cand_max_layers
 
     # ----------------------------------------------------------
@@ -660,7 +660,7 @@ def get_initial_loss(current_max_layers, optimizer):
             optimizer.background,
             rng_seed=optimizer.best_seed,
         )
-        best_loss = compute_loss(ref_comp, optimizer.target).item()
+        best_loss = compute_loss(ref_comp, optimizer.target, focus_map=optimizer.focus_map).item()
     return best_loss
 
 
@@ -754,6 +754,7 @@ def prune_fireflies(optimizer, start_threshold=10, auto_set=True):
         best_loss = compute_loss(
             comp=out_im,
             target=optimizer.target,
+            focus_map=optimizer.focus_map,
         )
     new_loss = best_loss
     while th > 0.1:
@@ -768,6 +769,7 @@ def prune_fireflies(optimizer, start_threshold=10, auto_set=True):
             loss = compute_loss(
                 comp=out_im,
                 target=optimizer.target,
+                focus_map=optimizer.focus_map,
             )
 
         # print(f"Threshold: {th:.3f}, Loss: {loss:.4f}")
@@ -892,7 +894,7 @@ def optimise_swap_positions(
             out = optimizer.get_best_discretized_image(
                 custom_global_logits=logits_for_disc
             )
-            return compute_loss(comp=out, target=optimizer.target).item()
+            return compute_loss(comp=out, target=optimizer.target, focus_map=optimizer.focus_map).item()
 
     best_dg, _ = optimizer.get_discretized_solution(best=True)
     best_loss = disc_loss(best_dg)
@@ -969,7 +971,6 @@ def optimise_swap_positions(
 def _compute_loss_for_heightmap(
     optimizer: FilamentOptimizer,
     disc_global: torch.Tensor,
-    disc_height: torch.Tensor,
     *,
     custom_height_logits: torch.Tensor | None = None,
 ) -> float:
@@ -987,7 +988,7 @@ def _compute_loss_for_heightmap(
             custom_height_logits=custom_height_logits,
             custom_global_logits=logits_for_disc,
         )
-        return compute_loss(comp=out_im, target=optimizer.target).item()
+        return compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map).item()
 
 
 def _median_without_outliers(
