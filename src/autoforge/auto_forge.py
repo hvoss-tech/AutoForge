@@ -31,7 +31,7 @@ from tqdm import tqdm
 from autoforge.Helper import PruningHelper
 from autoforge.Helper.AmpUtils import safe_autocast
 from autoforge.Helper.FilamentHelper import hex_to_rgb, load_materials
-from autoforge.Helper.Heightmaps.ChristofidesHeightMap import (
+from autoforge.Helper.Heightmaps.FastTSPHeightMap import (
     run_init_threads,
 )
 
@@ -268,7 +268,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_init_rounds",
         type=int,
-        default=32,
+        default=64,
         help="Number of rounds to choose the starting height map from.",
     )
 
