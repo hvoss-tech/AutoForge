@@ -268,7 +268,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_init_rounds",
         type=int,
-        default=16,
+        default=32,
         help="Number of rounds to choose the starting height map from.",
     )
 

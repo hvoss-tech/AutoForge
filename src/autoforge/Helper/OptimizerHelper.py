@@ -176,7 +176,7 @@ def composite_image_cont(
     thick_ratio = eff_thick / layer_TDs.view(-1, 1, 1)  # [L,H,W]
     del eff_thick
 
-    o, A, k, b = -1.2416557e-02, 9.6407950e-01, 3.4103447e01, -4.1554203e00
+    o, A, k, b = -2.9864511e-02, 4.0532556e-01, 8.2597107e+01, 1.2547257e+00
     opac = o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio)
     del thick_ratio
     opac = torch.clamp(opac, 0.0, 1.0)  # [L,H,W]
@@ -309,7 +309,7 @@ def composite_image_disc(
     thick_ratio: torch.Tensor = eff_thick / layer_TDs.view(-1, 1, 1)  # [L,H,W]
     del eff_thick
 
-    o, A, k, b = -1.2416557e-02, 9.6407950e-01, 3.4103447e01, -4.1554203e00
+    o, A, k, b = -2.9864511e-02, 4.0532556e-01, 8.2597107e+01, 1.2547257e+00
     opac: torch.Tensor = o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio)
     del thick_ratio
     opac = torch.clamp(opac, 0.0, 1.0)  # [L,H,W]
