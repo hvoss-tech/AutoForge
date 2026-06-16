@@ -585,6 +585,48 @@ class FilamentOptimizer:
                 plt.pause(0.01)
             plt.savefig(self.args.output_folder + "/vis_temp.png")
 
+    def _draw_prune_preview(self):
+        """
+        Lightweight matplotlib update for pruning steps.
+        Only renders the best (discrete) composite — skips the full pipeline.
+        """
+        if not self.visualize_flag or not hasattr(self, "fig"):
+            return
+
+        with torch.no_grad():
+            try:
+                eff_logits = self._apply_height_offset(
+                    self.best_params["pixel_height_logits"],
+                    self.best_params["height_offsets"],
+                )
+                best_comp = composite_image_disc(
+                    eff_logits,
+                    self.best_params["global_logits"],
+                    self.vis_tau,
+                    self.vis_tau,
+                    self.h,
+                    self.max_layers,
+                    self.material_colors,
+                    self.material_TDs,
+                    self.background,
+                    rng_seed=self.best_seed,
+                )
+                comp_np = np.clip(best_comp.cpu().detach().numpy(), 0, 255).astype(np.uint8)
+                self.best_comp_ax.set_data(comp_np)
+
+                # Update the title to reflect we're in the pruning stage
+                self.fig.suptitle(
+                    f"Pruning — best discrete loss: {self.best_discrete_loss:.4f}"
+                )
+
+                # Repaint the GUI window
+                self.fig.canvas.draw_idle()
+                self.fig.canvas.manager.start_event_loop(0.01) if hasattr(
+                    self.fig.canvas.manager, "start_event_loop"
+                ) else plt.pause(0.01)
+            except Exception:
+                pass
+
     def get_current_parameters(self):
         """
         Return a copy of the current parameters (pixel_height_logits, global_logits).
@@ -718,6 +760,17 @@ class FilamentOptimizer:
         gc.collect()
         torch.cuda.empty_cache()
 
+        # Build a combined callback that updates the matplotlib window (CLI)
+        # and also fires the external WebSocket callback (WebUI).
+        def _prune_callback(_optimizer, _percent):
+            # Update the matplotlib preview during pruning steps
+            self._draw_prune_preview()
+            if self.preview_callback is not None:
+                try:
+                    self.preview_callback(_optimizer, _percent)
+                except Exception:
+                    pass
+
         prune_num_colors(
             self,
             max_colors_allowed,
@@ -726,6 +779,7 @@ class FilamentOptimizer:
             fast=fast_pruning,
             chunking_percent=fast_pruning_percent,
             pruning_batch_size=pruning_batch_size,
+            preview_callback=_prune_callback,
         )
 
         prune_num_swaps(
@@ -736,6 +790,7 @@ class FilamentOptimizer:
             fast=fast_pruning,
             chunking_percent=fast_pruning_percent,
             pruning_batch_size=pruning_batch_size,
+            preview_callback=_prune_callback,
         )
 
         prune_redundant_layers(
@@ -745,9 +800,13 @@ class FilamentOptimizer:
             max_layers_allowed,
             fast=fast_pruning,
             chunking_percent=fast_pruning_percent,
+            preview_callback=_prune_callback,
         )
 
-        optimise_swap_positions(self)
+        optimise_swap_positions(
+            self,
+            preview_callback=_prune_callback,
+        )
         if getattr(self.args, "spike_removal", False):
             self.post_remove_spikes()
         # Calculate and Print current loss
