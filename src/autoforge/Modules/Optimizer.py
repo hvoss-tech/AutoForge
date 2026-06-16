@@ -774,7 +774,9 @@ class FilamentOptimizer:
             height_map = torch.sigmoid(eff_logits) * float(self.max_layers)
 
             dh_clean, spikes = remove_height_spikes(
-                height_map, threshold_layers=self.args.spike_threshold_layers
+                height_map,
+                threshold_layers=self.args.spike_threshold_layers,
+                num_passes=getattr(self.args, "spike_removal_passes", 4),
             )
 
             normalized = dh_clean.clamp(0, self.max_layers) / float(self.max_layers)

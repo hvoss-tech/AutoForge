@@ -225,6 +225,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--spike_removal_passes",
+        type=int,
+        default=4,
+        help="Number of spike removal passes (4 approximates old BFS; higher = smoother but slower)",
+    )
+
+    parser.add_argument(
         "--pruning_max_colors",
         type=int,
         default=100,

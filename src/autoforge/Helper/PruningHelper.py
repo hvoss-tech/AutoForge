@@ -16,7 +16,6 @@ from autoforge.Helper.OptimizerHelper import (
 )
 from autoforge.Loss.LossFunctions import compute_loss
 from autoforge.Modules.Optimizer import FilamentOptimizer
-from collections import deque
 
 # One global lock that serialises every call that needs GPU / VRAM
 _gpu_lock = threading.Lock()
@@ -1240,91 +1239,98 @@ def _compute_loss_for_heightmap(
         return compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map).item()
 
 
-def _median_without_outliers(
-    window: np.ndarray, threshold: float, max_outliers: int = 2
-) -> tuple[float, bool, int]:
-    """Return replacement for center pixel if it is a spike; also report spike count.
-
-    A spike is when the center pixel is >= ``threshold`` above the window median and
-    the window has at most ``max_outliers`` such outliers. Returns (replacement_value,
-    is_spike, spike_count).
-    """
-    med = np.median(window)
-    outlier_mask = window - med >= threshold
-    spike_count = int(outlier_mask.sum())
-    center_is_outlier = bool(outlier_mask[1, 1])
-    if not center_is_outlier or spike_count == 0 or spike_count > max_outliers:
-        return float(window[1, 1]), False, 0
-    non_outliers = window[~outlier_mask]
-    if non_outliers.size == 0:
-        return float(window[1, 1]), False, 0
-    replacement = float(np.median(non_outliers))
-    return replacement, True, spike_count
-
-
 def remove_height_spikes(
-    disc_height: torch.Tensor, threshold_layers: int = 3, max_outliers: int = 2
+    disc_height: torch.Tensor, threshold_layers: int = 3, max_outliers: int = 2,
+    num_passes: int = 4,
 ) -> tuple[torch.Tensor, int]:
     """Remove tall spikes in a discrete height map using a 3x3 neighborhood.
 
+    Vectorized GPU implementation — no BFS / Python loop per pixel.  Multiple
+    passes approximate the old BFS propagation behaviour (fixing a spike may
+    reveal new spikes in its neighbourhood on the next pass).
+
     A spike occurs only when the *center* pixel of a 3x3 window is at least
     ``threshold_layers`` higher than the window median and the window has at most
-    two such outliers. Only those center pixels are replaced with the median of
-    the non-outlier values. Operates in layer units (0..max_layers).
+    ``max_outliers`` such outliers.  Those center pixels are replaced with the
+    median of the non-outlier values.
+
+    Args:
+        disc_height: [H, W] tensor (any device).
+        threshold_layers: pixels whose value exceeds window median by this
+                          amount are considered outliers.
+        max_outliers:  spike only if window has at most this many outliers.
+        num_passes:    number of refinement passes (1 = one-shot, 4 ≈ old BFS).
 
     Returns:
-        cleaned_height: torch.Tensor matching ``disc_height`` shape/device.
-        spike_count: int number of pixels corrected.
+        cleaned_height, spike_count
     """
     if disc_height.ndim != 2:
         raise ValueError("disc_height must be 2D [H,W]")
-    if threshold_layers <= 0:
-        return disc_height, 0
-    if max_outliers <= 0:
+    if threshold_layers <= 0 or max_outliers <= 0 or num_passes < 1:
         return disc_height, 0
 
-    dh_np = disc_height.detach().cpu().numpy()
-    H, W = dh_np.shape
+    H, W = disc_height.shape
     if H < 3 or W < 3:
         return disc_height, 0
 
-    out = dh_np.copy()
-    spikes = 0
-    queue = deque((y, x) for y in range(1, H - 1) for x in range(1, W - 1))
-    total_num = len(queue)
-    max_iters = (H - 2) * (W - 2) * 10  # safety cap
-    iters = 0
-    tbar = tqdm(total=total_num, desc="Removing height spikes", leave=False)
-    while queue and iters < max_iters:
-        tbar.update(1)
-        y, x = queue.popleft()
-        iters += 1
-        window = out[y - 1 : y + 2, x - 1 : x + 2]
-        replacement, is_spike, _ = _median_without_outliers(
-            window, threshold_layers, max_outliers
-        )
-        center_val = out[y, x]
-        if (
-            not is_spike
-            or center_val < replacement + threshold_layers
-            or replacement == center_val
-        ):
-            continue
-        out[y, x] = replacement
-        spikes += 1
-        for ny in range(y - 1, y + 2):
-            if ny <= 0 or ny >= H - 1:
-                continue
-            for nx in range(x - 1, x + 2):
-                if nx <= 0 or nx >= W - 1:
-                    continue
-                queue.append((ny, nx))
-                total_num += 1
-                tbar.total = total_num
-    tbar.close()
+    device = disc_height.device
+    dtype = disc_height.dtype
+    threshold = float(threshold_layers)
 
-    if spikes == 0:
+    # Pre-compute the 3x3 unfold once (it's the same every pass)
+    img = disc_height.float().view(1, 1, H, W)
+    img_pad = F.pad(img, (1, 1, 1, 1), mode="replicate")
+    windows = F.unfold(img_pad, kernel_size=3, padding=0, stride=1)  # [1, 9, H*W]
+    del img, img_pad
+
+    # Static: window values are always the first 9 rows of the unfold result.
+    # But after fixes we need to re-extract.  We'll recompute unfold each pass
+    # on the current data; it's still sub-millisecond for 1500x1500.
+    total_spikes = 0
+    cur = disc_height.contiguous()
+
+    for _ in range(num_passes):
+        # Re-extract windows from current data
+        img_cur = cur.float().view(1, 1, H, W)
+        img_pad = F.pad(img_cur, (1, 1, 1, 1), mode="replicate")
+        wins = F.unfold(img_pad, kernel_size=3, padding=0, stride=1)  # [1, 9, H*W]
+        wins = wins.squeeze(0)  # [9, H*W]
+        del img_cur, img_pad
+
+        x_sorted, _ = wins.sort(dim=0)  # [9, H*W]
+        median_all = x_sorted[4]         # [H*W]
+
+        outlier_mask = (wins - median_all.unsqueeze(0)) >= threshold  # [9, H*W]
+        is_center_outlier = outlier_mask[4]  # [H*W]
+        outlier_count = outlier_mask.sum(dim=0)  # [H*W]
+        del outlier_mask
+
+        fix_mask = (
+            is_center_outlier & (outlier_count <= max_outliers) & (outlier_count > 0)
+        )
+        n_this = int(fix_mask.sum().item())
+        if n_this == 0:
+            break
+        total_spikes += n_this
+        print("Removed",n_this,"spikes...")
+
+        # Replacement: median of non-outlier values
+        wins_masked = wins.clone()
+        wins_masked[wins - median_all.unsqueeze(0) >= threshold] = float("inf")
+
+        x_masked_sorted, _ = wins_masked.sort(dim=0)  # [9, H*W]
+        n_valid = 9 - outlier_count  # [H*W]
+        med_idx = (n_valid // 2).clamp(0, 8)
+
+        replacement = x_masked_sorted[
+            med_idx, torch.arange(H * W, device=device)
+        ]
+        replacement = torch.where(n_valid > 0, replacement, wins[4])
+
+        flat = cur.view(-1)  # [H*W]
+        flat[fix_mask] = replacement[fix_mask].to(dtype)
+
+    if total_spikes == 0:
         return disc_height, 0
 
-    cleaned = torch.tensor(out, dtype=disc_height.dtype, device=disc_height.device)
-    return cleaned, spikes
+    return cur, total_spikes
