@@ -686,6 +686,7 @@ class FilamentOptimizer:
         search_seed: bool = True,
         fast_pruning: bool = False,
         fast_pruning_percent: float = 0.20,
+        pruning_batch_size: int = 0,
     ):
         # Now run pruning
         from autoforge.Helper.PruningHelper import (
@@ -724,6 +725,7 @@ class FilamentOptimizer:
             None,
             fast=fast_pruning,
             chunking_percent=fast_pruning_percent,
+            pruning_batch_size=pruning_batch_size,
         )
 
         prune_num_swaps(
@@ -733,6 +735,7 @@ class FilamentOptimizer:
             None,
             fast=fast_pruning,
             chunking_percent=fast_pruning_percent,
+            pruning_batch_size=pruning_batch_size,
         )
 
         prune_redundant_layers(

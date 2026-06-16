@@ -245,6 +245,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--pruning_batch_size",
+        type=int,
+        default=8,
+        help="Number of pruning candidates to evaluate per batch (0 = disabled, 8 = good default, higher = faster but slightly more VRAM used)",
+    )
+
+    parser.add_argument(
         "--random_seed",
         type=int,
         default=0,
@@ -780,6 +787,7 @@ def _post_optimize_and_export(
                     search_seed=True,
                     fast_pruning=args.fast_pruning,
                     fast_pruning_percent=args.fast_pruning_percent,
+                    pruning_batch_size=args.pruning_batch_size,
                 )
                 optimizer.log_to_tensorboard(
                     interval=1,
