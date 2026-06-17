@@ -1,5 +1,9 @@
-from hypothesis import given, strategies as st, settings
+import pytest
 import torch
+
+pytest.importorskip("hypothesis")
+
+from hypothesis import given, strategies as st, settings
 
 from autoforge.Helper.FilamentHelper import hex_to_rgb
 from autoforge.Helper.OptimizerHelper import adaptive_round, deterministic_rand_like
