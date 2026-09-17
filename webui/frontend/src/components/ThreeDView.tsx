@@ -14,15 +14,8 @@ interface ThreeDViewProps {
    * yet — a simple stacked-slab preview of the color sliders' filament
    * stack, so the panel shows something meaningful before the first run. */
   stackSegments?: StackSegment[]
-  /** A band to point out: its height range (mm above the build plate) on a
-   * mesh, or its layer range on the stack preview. */
-  highlight?: { startMm: number; endMm: number; startLayer: number; endLayer: number } | null
   className?: string
 }
-
-type Highlight = NonNullable<ThreeDViewProps['highlight']>
-
-const HIGHLIGHT_COLOR = '#22d3ee'
 
 export type CameraView = 'top' | 'angled'
 
@@ -49,7 +42,7 @@ const CameraRig: React.FC<{ request: { view: CameraView; n: number }; controls: 
   return null
 }
 
-const ColorStackPreview: React.FC<{ segments: StackSegment[]; highlight?: Highlight | null }> = ({ segments, highlight }) => {
+const ColorStackPreview: React.FC<{ segments: StackSegment[] }> = ({ segments }) => {
   if (segments.length === 0) return null
   const maxLayer = segments[segments.length - 1].layerIndex
   const footprint = 3
@@ -64,25 +57,11 @@ const ColorStackPreview: React.FC<{ segments: StackSegment[]; highlight?: Highli
           <meshStandardMaterial color={seg.color} roughness={0.7} metalness={0.1} toneMapped={false} />
         </mesh>
       ))}
-      {highlight && highlight.endLayer >= highlight.startLayer && (
-        <mesh position={[0, ((highlight.startLayer - 1 + highlight.endLayer) / 2) * bandHeight, 0]} renderOrder={1}>
-          <boxGeometry args={[footprint * 1.08, (highlight.endLayer - highlight.startLayer + 1) * bandHeight, footprint * 1.08]} />
-          <meshBasicMaterial color={HIGHLIGHT_COLOR} transparent opacity={0.3} depthWrite={false} toneMapped={false} />
-        </mesh>
-      )}
     </group>
   )
 }
 
-interface MeshFrame {
-  /** Mesh units (mm) → scene units: scene = (mm - center) * scale. */
-  centerZ: number
-  scale: number
-  width: number
-  depth: number
-}
-
-function centerAndScaleGeom(geom: THREE.BufferGeometry, frame?: { current: MeshFrame | null }): THREE.BufferGeometry {
+function centerAndScaleGeom(geom: THREE.BufferGeometry): THREE.BufferGeometry {
   geom.computeBoundingBox()
   const box = geom.boundingBox
   if (!box || !isFinite(box.max.x - box.min.x)) return geom
@@ -96,27 +75,11 @@ function centerAndScaleGeom(geom: THREE.BufferGeometry, frame?: { current: MeshF
   const scale = targetSize / maxDim
   if (isFinite(scale) && scale > 0) {
     geom.scale(scale, scale, scale)
-    if (frame) frame.current = { centerZ: center.z, scale, width: size.x * scale, depth: size.y * scale }
   }
   return geom
 }
 
-/** Translucent slab over the height range of the selected band. */
-const HeightHighlight: React.FC<{ frame: MeshFrame; highlight: Highlight }> = ({ frame, highlight }) => {
-  const invalidate = useThree((s) => s.invalidate)
-  const z0 = (highlight.startMm - frame.centerZ) * frame.scale
-  const z1 = (highlight.endMm - frame.centerZ) * frame.scale
-  useEffect(() => invalidate(), [z0, z1, invalidate])
-  return (
-    <mesh position={[0, 0, (z0 + z1) / 2]} renderOrder={1}>
-      <boxGeometry args={[frame.width * 1.04, frame.depth * 1.04, Math.max(Math.abs(z1 - z0), 0.004)]} />
-      <meshBasicMaterial color={HIGHLIGHT_COLOR} transparent opacity={0.28} depthWrite={false} toneMapped={false} />
-    </mesh>
-  )
-}
-
-const ColoredMesh: React.FC<{ plyUrl: string; highlight?: Highlight | null }> = ({ plyUrl, highlight }) => {
-  const frameRef = useRef<MeshFrame | null>(null)
+const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
   const [mesh, setMesh] = useState<{ geom: THREE.BufferGeometry; colors: boolean } | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -193,7 +156,7 @@ const ColoredMesh: React.FC<{ plyUrl: string; highlight?: Highlight | null }> = 
         geom.setIndex(new THREE.BufferAttribute(indices, 1))
         geom.computeVertexNormals()
 
-        const centered = centerAndScaleGeom(geom, frameRef)
+        const centered = centerAndScaleGeom(geom)
 
         if (colors) {
           centered.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3))
@@ -257,18 +220,15 @@ const ColoredMesh: React.FC<{ plyUrl: string; highlight?: Highlight | null }> = 
   }
 
   return (
-    <>
-      <mesh geometry={mesh.geom}>
-        <meshStandardMaterial
-          roughness={0.7}
-          metalness={0.1}
-          side={THREE.DoubleSide}
-          vertexColors={mesh.colors}
-          toneMapped={false}
-        />
-      </mesh>
-      {highlight && frameRef.current && <HeightHighlight frame={frameRef.current} highlight={highlight} />}
-    </>
+    <mesh geometry={mesh.geom}>
+      <meshStandardMaterial
+        roughness={0.7}
+        metalness={0.1}
+        side={THREE.DoubleSide}
+        vertexColors={mesh.colors}
+        toneMapped={false}
+      />
+    </mesh>
   )
 }
 
@@ -309,7 +269,6 @@ export const ThreeDView: React.FC<ThreeDViewProps> = ({
   stlUrl,
   coloredPlyUrl,
   stackSegments,
-  highlight,
   className,
 }) => {
   const theme = useThreeDTheme()
@@ -370,11 +329,11 @@ export const ThreeDView: React.FC<ThreeDViewProps> = ({
         <directionalLight position={[5, 10, 5]} intensity={0.35} />
         <directionalLight position={[-5, -5, -5]} intensity={0.15} />
         {coloredPlyUrl ? (
-          <ColoredMesh plyUrl={coloredPlyUrl} highlight={highlight} />
+          <ColoredMesh plyUrl={coloredPlyUrl} />
         ) : stlUrl ? (
-          <ColoredMesh plyUrl={stlUrl} highlight={highlight} />
+          <ColoredMesh plyUrl={stlUrl} />
         ) : stackSegments ? (
-          <ColorStackPreview segments={stackSegments} highlight={highlight} />
+          <ColorStackPreview segments={stackSegments} />
         ) : null}
         <OrbitControls
           ref={controlsRef}

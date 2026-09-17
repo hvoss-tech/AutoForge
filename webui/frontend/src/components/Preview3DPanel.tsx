@@ -3,7 +3,6 @@ import { acceptsPreviewFor, isInitRequestInFlight, useAppStore } from '../store/
 import { Box, Loader2, AlertTriangle } from 'lucide-react'
 import { ThreeDView } from './ThreeDView'
 import { getStackHandles, getStackSegments, filterActiveHandles } from '../lib/colorStack'
-import { getPlanBands } from '../lib/printPlan'
 
 export const Preview3DPanel: React.FC = () => {
   const previewImage = useAppStore((s) => s.previewImage)
@@ -25,17 +24,6 @@ export const Preview3DPanel: React.FC = () => {
   const colorSliders = useAppStore((s) => s.colorSliders)
   const filaments = useAppStore((s) => s.filaments)
   const colorSlidersRef = useRef(colorSliders)
-  const settings = useAppStore((s) => s.settings)
-  const selectedBand = useAppStore((s) => s.selectedBand)
-  const hoveredBand = useAppStore((s) => s.hoveredBand)
-
-  // The band under the pointer (else the selected one) is outlined in 3D.
-  const focusBand = hoveredBand ?? selectedBand
-  const highlight = useMemo(() => {
-    if (focusBand === null) return null
-    const band = getPlanBands(colorSliders, [], settings).find((b) => b.storeIndex === focusBand)
-    return band ? { startMm: band.startHeightMm, endMm: band.endHeightMm, startLayer: band.startLayer, endLayer: band.endLayer } : null
-  }, [focusBand, colorSliders, settings])
 
   // Before any optimization result exists, show what the currently-assigned
   // slider colors would look like as a simple stacked-layer preview instead
@@ -229,7 +217,7 @@ export const Preview3DPanel: React.FC = () => {
       <div className="flex-1 relative overflow-hidden">
         {stlFile ? (
           <div key="three-d-view" data-testid="three-d-view" className="w-full h-full">
-            <ThreeDView coloredPlyUrl={coloredPlyUrl} highlight={highlight} className="w-full h-full" />
+            <ThreeDView coloredPlyUrl={coloredPlyUrl} className="w-full h-full" />
           </div>
         ) : optimizationStarted && previewImage ? (
           <img
@@ -274,11 +262,11 @@ export const Preview3DPanel: React.FC = () => {
           </div>
         ) : initMeshUrl ? (
           <div key="init-three-d-view" data-testid="init-three-d-view" className="w-full h-full">
-            <ThreeDView coloredPlyUrl={initMeshUrl} highlight={highlight} className="w-full h-full" />
+            <ThreeDView coloredPlyUrl={initMeshUrl} className="w-full h-full" />
           </div>
         ) : stackSegments.length > 0 ? (
           <div key="color-stack-preview" data-testid="color-stack-preview" className="w-full h-full">
-            <ThreeDView stackSegments={stackSegments} highlight={highlight} className="w-full h-full" />
+            <ThreeDView stackSegments={stackSegments} className="w-full h-full" />
           </div>
         ) : previewImage ? (
           <img
