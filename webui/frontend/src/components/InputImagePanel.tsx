@@ -7,10 +7,12 @@ export const InputImagePanel: React.FC = () => {
   const setInputImage = useAppStore((s) => s.setInputImage)
   const setSettings = useAppStore((s) => s.setSettings)
   const [isDragging, setIsDragging] = useState(false)
+  const [uploadError, setUploadError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const handleFile = useCallback(async (file: File) => {
     if (!file.type.startsWith('image/')) return
+    setUploadError(null)
 
     const formData = new FormData()
     formData.append('file', file)
@@ -20,7 +22,13 @@ export const InputImagePanel: React.FC = () => {
         method: 'POST',
         body: formData,
       })
+      if (!response.ok) {
+        throw new Error(`Upload failed (HTTP ${response.status})`)
+      }
       const data = await response.json()
+      if (!data.filename) {
+        throw new Error('Upload failed: server did not return a filename')
+      }
 
       const url = URL.createObjectURL(file)
       setInputImage(url)
@@ -34,9 +42,15 @@ export const InputImagePanel: React.FC = () => {
       // filaments were already active, firing runInit() twice and logging
       // a spurious "Already initializing" rejection for the second one.
     } catch (e) {
+      // Deliberately NOT falling back to a local blob preview here. That
+      // used to set `inputImage` (which alone drives the Run button's
+      // enabled state) to an object URL even though the upload never
+      // reached the server — `settings.input_image` stayed empty (or kept
+      // whatever the previous successful upload was), so Run looked ready
+      // but either rejected with "Upload an input image" or silently
+      // reran the old image while the preview showed the new one.
       console.error('Failed to upload image:', e)
-      const url = URL.createObjectURL(file)
-      setInputImage(url)
+      setUploadError(e instanceof Error ? e.message : 'Failed to upload image')
     }
   }, [setInputImage, setSettings])
 
@@ -65,6 +79,11 @@ export const InputImagePanel: React.FC = () => {
           Input Image
         </h3>
       </div>
+      {uploadError && (
+        <div className="px-3 py-1 bg-red-900/40 text-xs text-red-300" data-testid="image-upload-error">
+          {uploadError}
+        </div>
+      )}
       <div
         className="flex-1 relative p-2 flex items-center justify-center overflow-hidden"
         onDrop={handleDrop}

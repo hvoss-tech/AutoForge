@@ -25,7 +25,12 @@ test.describe('AutoForge WebUI - Application Shell', () => {
   test('top bar is visible', async ({ page }) => {
     await expect(page.locator('[data-testid="top-bar"]')).toBeVisible()
     await expect(page.locator('text=AutoForge')).toBeVisible()
-    await expect(page.locator('text=v1.9.4')).toBeVisible()
+    // Was a hardcoded "v1.9.4" literal that silently drifted from the real
+    // (pyproject.toml) version — now fetched from /api/system/version, so
+    // assert the shape (v<major>.<minor>.<patch>) rather than a pinned
+    // string that would go stale the same way.
+    await expect(page.locator('[data-testid="app-version"]')).toBeVisible()
+    await expect(page.locator('[data-testid="app-version"]')).toHaveText(/^v\d+\.\d+\.\d+$/)
   })
 
   test('top bar has start button', async ({ page }) => {
@@ -41,7 +46,11 @@ test.describe('AutoForge WebUI - Application Shell', () => {
   })
 
   test('input image panel is visible', async ({ page }) => {
-    await expect(page.locator('text=Input Image')).toBeVisible()
+    // A plain `text=Input Image` substring-matches TopBar's
+    // "Upload an input image first" run-disabled-reason too (now
+    // consistently rendered since resetActiveFilaments actually clears
+    // active filaments between tests) — scope to the panel's own heading.
+    await expect(page.getByRole('heading', { name: 'Input Image' })).toBeVisible()
   })
 
   test('3D preview panel is visible', async ({ page }) => {
@@ -61,8 +70,12 @@ test.describe('AutoForge WebUI - Application Shell', () => {
   })
 
   test('mesh height label reflects real slider state', async ({ page }) => {
-    // Defaults: column 4 (index 3) is the highest enabled slider, depth 2.24mm.
-    await expect(page.locator('[data-testid="mesh-height-label"]')).toContainText('2.24')
+    // Defaults: column 4 (index 3) is the highest enabled slider, depth
+    // 2.24mm — plus the default background_height (0.24mm), which the
+    // label now includes so it matches the actual mesh's Z height
+    // (background_height + print layers, see helpers/colored_mesh.py's
+    // top_z) instead of undercounting by exactly the background slab.
+    await expect(page.locator('[data-testid="mesh-height-label"]')).toContainText('2.48')
   })
 
   test('layout order: filament left, input center-left, color core center, preview center-right', async ({ page }) => {
@@ -83,7 +96,9 @@ test.describe('AutoForge WebUI - Application Shell', () => {
   })
 
   test('color sliders are below image panels', async ({ page }) => {
-    const inputImage = page.locator('text=Input Image')
+    // See the "input image panel is visible" test above for why this can't
+    // be a plain `text=Input Image` substring locator.
+    const inputImage = page.getByRole('heading', { name: 'Input Image' })
     const sliders = page.locator('text=Color Sliders')
 
     const inputBox = await inputImage.boundingBox()
@@ -1198,6 +1213,9 @@ test.describe('Import Filament Modal (UI)', () => {
       mimeType: 'application/json',
       buffer: Buffer.from(filePayload),
     })
+    // Selecting a file only stages it — ImportModal asks merge-vs-replace
+    // before actually calling the import API.
+    await page.locator('[data-testid="import-mode-merge"]').click()
     await expect(page.getByText(/Imported \d+ filaments/)).toBeVisible()
 
     await page.locator('[data-testid="close-import"]').click()
@@ -1216,6 +1234,9 @@ test.describe('Import Filament Modal (UI)', () => {
       mimeType: 'text/csv',
       buffer: Buffer.from(csv),
     })
+    // Selecting a file only stages it — ImportModal asks merge-vs-replace
+    // before actually calling the import API.
+    await page.locator('[data-testid="import-mode-merge"]').click()
     await expect(page.getByText(/Imported \d+ filaments/)).toBeVisible()
 
     await page.locator('[data-testid="close-import"]').click()
@@ -1922,7 +1943,7 @@ test.describe('Edge Cases and Boundary Tests', () => {
 
   test('top bar shows version', async ({ page }) => {
     await page.goto('/')
-    await expect(page.locator('text=v1.9.4')).toBeVisible()
+    await expect(page.locator('[data-testid="app-version"]')).toHaveText(/^v\d+\.\d+\.\d+$/)
   })
 
   test('filament library shows active tab in blue', async ({ page }) => {

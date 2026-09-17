@@ -8,7 +8,7 @@ from ..models import OptimizationSettings, StateSnapshot
 from ..services.optimization_service import get_optimization_service
 from ..services.project_service import get_project_service
 from ..services.filament_service import get_filament_service
-from ..helpers.pipeline_runner import run_pipeline as _run_pipeline
+from ..helpers.pipeline_runner import run_pipeline as _run_pipeline, friendly_error_message
 from ..config import config
 from .ws import broadcast_preview
 
@@ -68,7 +68,8 @@ async def start_optimization(settings: OptimizationSettings):
 
     filament_dicts = [
         {"color": f.color, "td": f.td, "name": f"{f.brand} - {f.name}",
-         "brand": f.brand, "uuid": f.uuid, "filament_type": f.filament_type}
+         "brand": f.brand, "short_name": f.name, "owned": f.owned,
+         "uuid": f.uuid, "filament_type": f.filament_type}
         for f in active
     ]
 
@@ -194,9 +195,8 @@ async def start_optimization(settings: OptimizationSettings):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            err_msg = f"Optimization failed: {e}"
-            logger.error(err_msg)
-            svc.update_status(job.job_id, "failed", error=str(e))
+            logger.error("Optimization failed: %s", e)
+            svc.update_status(job.job_id, "failed", error=friendly_error_message(e))
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()

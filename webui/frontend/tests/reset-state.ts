@@ -6,9 +6,33 @@ export const DEFAULT_SLIDERS = [
   ...Array.from({ length: 11 }, () => ({ td: 5.0, layer: 0, depth_mm: 0.0, filament_uuid: '', enabled: false })),
 ]
 
+/** Clear the *real* active-filaments list (FilamentService's `_active` map,
+ * served at GET/DELETE /api/filaments/active) — a completely separate store
+ * from the `active_filaments` field POSTed to /api/project/state below.
+ * resetProjectState() only ever touched the latter, so any filament
+ * activated through the UI (the library's +/toggle button, drag-onto-slider,
+ * ...) stayed active across tests/runs regardless of that reset — e.g. a
+ * test that activates the first library filament left it active for every
+ * later test in the same run, silently inflating "active filaments" counts. */
+export async function resetActiveFilaments(baseURL: string): Promise<void> {
+  try {
+    const res = await fetch(`${baseURL}/api/filaments/active`)
+    if (res.ok) {
+      const active: { uuid: string }[] = await res.json()
+      for (const f of active) {
+        await fetch(`${baseURL}/api/filaments/active/${f.uuid}`, { method: 'DELETE' }).catch(() => {})
+      }
+    }
+  } catch {
+    // Backend may not be reachable yet in some setups; tests will surface that.
+  }
+}
+
 /** Reset server-side project state (color sliders / settings) to the
- * documented defaults. The backend persists this across reloads, so without
- * a reset, mutations from one test (or one run) bleed into the next.
+ * documented defaults, and the real active-filaments list alongside it (see
+ * resetActiveFilaments — these are two separate backend stores that both
+ * need clearing). The backend persists this across reloads, so without a
+ * reset, mutations from one test (or one run) bleed into the next.
  * `settings: {}` resolves to OptimizationSettings' own field defaults
  * (layer_height, background_height, stl_output_size, ...) via Pydantic. */
 export async function resetProjectState(baseURL: string): Promise<void> {
@@ -21,6 +45,7 @@ export async function resetProjectState(baseURL: string): Promise<void> {
       active_filaments: [],
     }),
   }).catch(() => {})
+  await resetActiveFilaments(baseURL)
 }
 
 /** Remove filaments created by test runs so brand/tab lists and counts stay

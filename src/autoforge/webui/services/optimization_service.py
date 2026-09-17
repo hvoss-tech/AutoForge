@@ -202,7 +202,19 @@ def get_optimization_service() -> OptimizationService:
     if _service is None:
         with _init_lock:
             if _service is None:
-                _service = OptimizationService(checkpoints_dir="checkpoints")
+                # Was a hardcoded "checkpoints" literal — never read
+                # config.checkpoints_path at all, unlike every other
+                # service (filament_service, image_service,
+                # project_service). That meant job history was never
+                # actually redirected by AUTOFORGE_WEBUI_CHECKPOINTS_DIR
+                # (e.g. tests/webui/conftest.py's isolation fixture), so
+                # every /api/optimize/start call from the webui test suite
+                # wrote real job records straight into the real, shared
+                # checkpoints/history.json — confirmed in practice (it had
+                # accumulated 28 fake "Input image not found: whatever.png"
+                # entries from automated test runs).
+                from ..config import config
+                _service = OptimizationService(checkpoints_dir=config.checkpoints_path)
     return _service
 
 

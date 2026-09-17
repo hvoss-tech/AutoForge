@@ -41,6 +41,7 @@ export const ColorCore: React.FC = () => {
   const sliderLayerRange = useAppStore((s) => s.sliderLayerRange)
   const filaments = useAppStore((s) => s.filaments)
   const updateSlider = useAppStore((s) => s.updateSlider)
+  const addActiveFilament = useAppStore((s) => s.addActiveFilament)
   const containerRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
   const [focusedHandle, setFocusedHandle] = useState<number | null>(null)
@@ -266,12 +267,13 @@ export const ColorCore: React.FC = () => {
         const filament: Filament = JSON.parse(e.dataTransfer.getData('application/json'))
         const firstDisabled = colorSliders.findIndex((s) => !s.enabled)
         const targetIndex = firstDisabled >= 0 ? firstDisabled : colorSliders.length - 1
+        addActiveFilament(filament)
         updateSlider(targetIndex, { filament_uuid: filament.uuid, enabled: true, td: filament.td, layer: 10 })
       } catch {
         // ignore
       }
     },
-    [colorSliders, updateSlider],
+    [colorSliders, updateSlider, addActiveFilament],
   )
 
   const handleDragOver = useCallback((e: React.DragEvent) => {

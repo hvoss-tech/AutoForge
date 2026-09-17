@@ -1,15 +1,47 @@
+import os
 from contextlib import contextmanager
-from typing import Optional
+from typing import Final, Optional
 
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from autoforge.Helper.AmpUtils import get_selected_autocast
 
+# --------------------------------------------------------------------------
+# Ablation switches (paper experiments only).
+#
+# Each flag is read once, at import time, from an environment variable that
+# is unset in normal/production use - so with no env var set, every branch
+# below compiles to exactly the original behavior (TorchScript treats these
+# as compile-time constants and dead-code-eliminates the unused branch).
+# Set via e.g. AUTOFORGE_ABLATION_ROUNDING=hard before invoking the CLI; see
+# paper/experiments/ for the scripts that exercise these.
+# --------------------------------------------------------------------------
+ABLATION_NO_ADAPTIVE_ROUNDING: bool = (
+    os.environ.get("AUTOFORGE_ABLATION_ROUNDING", "") == "hard"
+)
+ABLATION_BEER_LAMBERT_OPACITY: bool = (
+    os.environ.get("AUTOFORGE_ABLATION_OPACITY", "") == "beer_lambert"
+)
+ABLATION_NO_GUMBEL_NOISE: bool = (
+    os.environ.get("AUTOFORGE_ABLATION_GUMBEL", "") == "off"
+)
+# TorchScript can't close over a plain Python global inside a compiled
+# function body, so the flags above are threaded through as ordinary boolean
+# parameters instead, defaulted to these module-level values (evaluated once,
+# at import time, exactly like the flags themselves) - every call site below
+# that doesn't explicitly pass the parameter gets the ablation behavior
+# selected by the environment at process start.
+
 
 @torch.jit.script
 def adaptive_round(
-    x: torch.Tensor, tau: float, high_tau: float, low_tau: float, temp: float
+    x: torch.Tensor,
+    tau: float,
+    high_tau: float,
+    low_tau: float,
+    temp: float,
+    no_adaptive: bool = ABLATION_NO_ADAPTIVE_ROUNDING,
 ) -> torch.Tensor:
     """
     Smooth rounding based on temperature 'tau'.
@@ -20,10 +52,15 @@ def adaptive_round(
         high_tau (float): The high threshold for the temperature.
         low_tau (float): The low threshold for the temperature.
         temp (float): The temperature parameter for the sigmoid function.
+        no_adaptive (bool): "Without Adaptive Rounding" ablation - when set,
+            always hard-round regardless of tau (see
+            ``ABLATION_NO_ADAPTIVE_ROUNDING`` above).
 
     Returns:
         torch.Tensor: The rounded tensor.
     """
+    if no_adaptive:
+        return torch.round(x)
     if tau <= low_tau:
         return torch.round(x)
     elif tau >= high_tau:
@@ -190,6 +227,24 @@ def bleed_layer_effect(mask: torch.Tensor, strength: float = 0.1) -> torch.Tenso
     return mask + strength * blurred
 
 
+@torch.jit.script
+def _compute_opacity(
+    thick_ratio: torch.Tensor, beer_lambert: bool = ABLATION_BEER_LAMBERT_OPACITY
+) -> torch.Tensor:
+    """Opacity as a function of thickness/TD.
+
+    Default: the empirically-fitted 4-parameter model (see Appendix A of the
+    design doc). Under ``AUTOFORGE_ABLATION_OPACITY=beer_lambert`` this is
+    replaced with the textbook single-scattering Beer-Lambert law
+    ``1 - exp(-thick_ratio)`` instead - the "Without Opacity Calibration"
+    ablation.
+    """
+    if beer_lambert:
+        return torch.clamp(1.0 - torch.exp(-thick_ratio), 0.0, 1.0)
+    o, A, k, b = -2.9864511e-02, 4.0532556e-01, 8.2597107e+01, 1.2547257e+00
+    return torch.clamp(o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio), 0.0, 1.0)
+
+
 class _CumprodDim0(torch.autograd.Function):
     """``torch.cumprod(x, dim=0, dtype=torch.float32)`` with a sync-free backward.
 
@@ -241,6 +296,7 @@ def _composite_cont_pre(
     material_TDs: torch.Tensor,  # [M]
     compute_dtype: Optional[torch.dtype] = None,
     gumbel_exp: Optional[torch.Tensor] = None,  # [L,M] Exponential(1) samples
+    no_gumbel: bool = ABLATION_NO_GUMBEL_NOISE,
 ):
     """Everything in the continuous composite up to (and including) the
     shifted top-to-bottom transmittance stack.
@@ -267,7 +323,12 @@ def _composite_cont_pre(
     # different noise stream than the eager path. Both branches compute the
     # identical expression - F.gumbel_softmax(logits, tau, hard=False) is
     # exactly softmax((logits + -log(Exponential(1))) / tau).
-    if gumbel_exp is None:
+    if no_gumbel:
+        # "Without Gumbel Softmax" ablation: plain temperature-scaled softmax,
+        # no stochastic relaxation noise (isolates the noise's contribution
+        # from the softmax reparameterization itself).
+        p_mat = F.softmax(global_logits / tau_global, dim=1)  # [L,M]
+    elif gumbel_exp is None:
         p_mat = F.gumbel_softmax(global_logits, tau_global, hard=False, dim=1)  # [L,M]
     else:
         p_mat = F.softmax(
@@ -311,10 +372,8 @@ def _composite_cont_pre(
     thick_ratio = eff_thick / layer_TDs.view(-1, 1, 1)  # [L,H,W]
     del eff_thick
 
-    o, A, k, b = -2.9864511e-02, 4.0532556e-01, 8.2597107e+01, 1.2547257e+00
-    opac = o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio)
+    opac = _compute_opacity(thick_ratio)  # [L,H,W]
     del thick_ratio
-    opac = torch.clamp(opac, 0.0, 1.0)  # [L,H,W]
 
     # 5. flip to top->bottom order before compositing
     opac_fb = torch.flip(opac, dims=[0])  # [L,H,W]
@@ -429,10 +488,8 @@ def _composite_cont_chunk(
     thick_ratio = eff_thick / layer_TDs_fb.view(-1, 1, 1)
     del eff_thick
 
-    o, A, k, b = -2.9864511e-02, 4.0532556e-01, 8.2597107e+01, 1.2547257e+00
-    opac = o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio)
+    opac = _compute_opacity(thick_ratio)  # [k,H,W]
     del thick_ratio
-    opac = torch.clamp(opac, 0.0, 1.0)  # [k,H,W]
 
     trans = 1.0 - opac
     rem_local = torch.cumprod(
@@ -488,7 +545,9 @@ def composite_image_cont_lowmem(
     continuous_z = adaptive_round(pixel_height / h, tau_height, 1.0, 0.0, 0.1)
 
     # 2. global material weights - see composite_image_cont on gumbel_exp
-    if gumbel_exp is None:
+    if ABLATION_NO_GUMBEL_NOISE:
+        p_mat = F.softmax(global_logits / tau_global, dim=1)
+    elif gumbel_exp is None:
         p_mat = F.gumbel_softmax(global_logits, tau_global, hard=False, dim=1)
     else:
         p_mat = F.softmax(
@@ -634,8 +693,6 @@ def composite_image_disc(
         (H_out, W_out), dtype=torch.float32, device=pixel_height.device
     )
 
-    o, A, k, b = -2.9864511e-02, 4.0532556e-01, 8.2597107e+01, 1.2547257e+00
-
     hi: int = max_layers
     while hi > 0:
         lo: int = hi - layer_chunk
@@ -662,9 +719,7 @@ def composite_image_disc(
         p_print_bleed = bleed_layer_effect(p_print, strength=0.1)
         eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
         thick_ratio = eff_thick / tds_c.view(-1, 1, 1)
-        opac = torch.clamp(
-            o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio), 0.0, 1.0
-        )
+        opac = _compute_opacity(thick_ratio)
         trans = 1.0 - opac
         # Accumulate cumprod/sum in fp32 regardless of compute_dtype
         # (rounding error compounds across layers), then drop back down so

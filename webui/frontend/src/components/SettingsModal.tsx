@@ -75,6 +75,7 @@ export const SettingsModal: React.FC = () => {
   const currentJob = useAppStore((s) => s.currentJob)
   const startOptimization = useAppStore((s) => s.startOptimization)
   const cancelOptimization = useAppStore((s) => s.cancelOptimization)
+  const pushToast = useAppStore((s) => s.pushToast)
 
   const [expandedGroups, setExpandedGroups] = React.useState<Record<string, boolean>>(
     Object.fromEntries(SETTINGS_GROUPS.map((g) => [g.title, true]))
@@ -92,7 +93,12 @@ export const SettingsModal: React.FC = () => {
     try {
       await startOptimization()
     } catch (e) {
+      // Unlike TopBar's own Run button (which shows an inline error), this
+      // one had no visible failure path at all — a rejection (e.g. "add an
+      // active filament first") just did nothing, with the reason only in
+      // the console.
       console.error('Failed to start optimization:', e)
+      pushToast(`Failed to start optimization: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 

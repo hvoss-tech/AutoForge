@@ -1,9 +1,11 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
+import { loadFilamentTypes } from '../services/filamentService'
 import { X, Plus } from 'lucide-react'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from './ui/dialog'
 
 const DEFAULT_TYPES = ['PLA', 'PETG', 'ABS', 'TPU', 'ASA', 'Nylon', 'PC', 'PVB']
+const NEW_TYPE_SENTINEL = '__new_type__'
 
 export const NewFilamentModal: React.FC = () => {
   const newFilamentModalOpen = useAppStore((s) => s.newFilamentModalOpen)
@@ -11,21 +13,27 @@ export const NewFilamentModal: React.FC = () => {
   const filamentTypes = useAppStore((s) => s.filamentTypes)
   const setFilaments = useAppStore((s) => s.setFilaments)
   const setCustomLibraryLoaded = useAppStore((s) => s.setCustomLibraryLoaded)
+  const pushToast = useAppStore((s) => s.pushToast)
 
   const [brand, setBrand] = React.useState('')
   const [name, setName] = React.useState('')
   const [filamentType, setFilamentType] = React.useState(filamentTypes[0] || 'PLA')
+  const [customType, setCustomType] = React.useState('')
   const [td, setTd] = React.useState(5.0)
   const [owned, setOwned] = React.useState(false)
   const [colorR, setColorR] = React.useState(128)
   const [colorG, setColorG] = React.useState(128)
   const [colorB, setColorB] = React.useState(128)
 
+  const isAddingCustomType = filamentType === NEW_TYPE_SENTINEL
+  const effectiveType = isAddingCustomType ? customType.trim() : filamentType
+
   const hexColor = `#${colorR.toString(16).padStart(2, '0')}${colorG.toString(16).padStart(2, '0')}${colorB.toString(16).padStart(2, '0')}`
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!brand || !name) return
+    if (isAddingCustomType && !effectiveType) return
 
     const newFilament = {
       brand,
@@ -34,7 +42,7 @@ export const NewFilamentModal: React.FC = () => {
       td,
       owned,
       uuid: '',
-      filament_type: filamentType,
+      filament_type: effectiveType,
       source: 'user',
     }
 
@@ -44,18 +52,28 @@ export const NewFilamentModal: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newFilament),
       })
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ detail: `HTTP ${response.status}` }))
+        throw new Error(err.detail ?? `HTTP ${response.status}`)
+      }
       const data = await response.json()
 
       const params = new URLSearchParams()
-      if (filamentType) params.set('filament_type', filamentType)
+      if (effectiveType) params.set('filament_type', effectiveType)
       const refetch = await fetch(`/api/filaments?${params.toString()}`)
       const filaments = await refetch.json()
       setFilaments(filaments)
       setCustomLibraryLoaded(true)
+      // A brand-new type (not among the preset/known tabs) needs the tab
+      // bar refreshed immediately, or it only appears after a reload even
+      // though the filament itself was created and is otherwise usable.
+      if (isAddingCustomType) await loadFilamentTypes()
 
       setNewFilamentModalOpen(false)
       setBrand('')
       setName('')
+      setFilamentType(effectiveType)
+      setCustomType('')
       setTd(5.0)
       setOwned(false)
       setColorR(128)
@@ -63,6 +81,7 @@ export const NewFilamentModal: React.FC = () => {
       setColorB(128)
     } catch (err) {
       console.error('Failed to create filament:', err)
+      pushToast(`Failed to create filament: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
 
@@ -124,11 +143,25 @@ export const NewFilamentModal: React.FC = () => {
                 value={filamentType}
                 onChange={(e) => setFilamentType(e.target.value)}
                 className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-gray-200 focus:outline-none focus:border-blue-500"
+                data-testid="new-filament-type"
               >
                 {allTypes.map((t) => (
                   <option key={t} value={t}>{t}</option>
                 ))}
+                <option value={NEW_TYPE_SENTINEL}>+ Add new category…</option>
               </select>
+              {isAddingCustomType && (
+                <input
+                  type="text"
+                  value={customType}
+                  onChange={(e) => setCustomType(e.target.value)}
+                  required
+                  autoFocus
+                  placeholder="New category name"
+                  className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-gray-200 focus:outline-none focus:border-blue-500"
+                  data-testid="new-filament-custom-type"
+                />
+              )}
             </div>
             <div className="flex flex-col gap-1">
               <label className="text-xs text-gray-400">Transmission Distance (TD)</label>

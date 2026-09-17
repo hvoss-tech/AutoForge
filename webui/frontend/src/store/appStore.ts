@@ -23,6 +23,41 @@ function snapshotToHistoryEntry(s: Snapshot): HistoryEntry {
 
 let pruningPollTimer: ReturnType<typeof setTimeout> | null = null
 
+export type ToastLevel = 'error' | 'warning' | 'info'
+
+export interface Toast {
+  id: number
+  message: string
+  level: ToastLevel
+}
+
+let nextToastId = 1
+
+// /api/optimize/latest returns the single most recent job ever run against
+// this backend — it has no concept of "belongs to this browser session".
+// A 'running'/'paused' job is worth reconnecting to, and a 'completed' one
+// still has a real result worth showing, but a 'failed' or 'cancelled' job
+// is just history: resurrecting it on every fresh page load showed
+// "Optimization failed: ..." before the user had uploaded anything or
+// clicked Run, for a run that may be from a completely unrelated session.
+export function shouldRestoreJobOnLoad(status: string): boolean {
+  return status === 'running' || status === 'paused' || status === 'completed'
+}
+
+// `inputImage` holds a `blob:` object URL right after a local upload (valid
+// only in this browser tab, until the page reloads or is closed) — it's
+// swapped for the durable `/uploads/<filename>` server path on the next
+// `loadProjectState()` call, but nothing re-captures a snapshot at that
+// point. Anything persisted (undo/redo snapshots, "Save Project" files)
+// must use the durable path outright, or restoring/loading it later shows a
+// permanently broken image even though the server still has the real file.
+export function durableInputImageUrl(inputImage: string | null, settings: OptimizationSettings): string | null {
+  if (inputImage && inputImage.startsWith('blob:') && settings.input_image) {
+    return `/uploads/${settings.input_image}`
+  }
+  return inputImage
+}
+
 // 10 columns before anything has been run — 4 pre-populated (so a first-time
 // user sees something to drag filaments onto) plus 6 empty slots to grow
 // into, rather than the full ~15-40 columns a real optimizer/pruner result
@@ -143,6 +178,7 @@ interface AppState {
   editFilamentModalOpen: boolean
   editingFilament: Filament | null
   theme: 'dark' | 'light'
+  toasts: Toast[]
 
   setFilaments: (filaments: Filament[]) => void
   setFilamentTypes: (types: string[]) => void
@@ -155,6 +191,7 @@ interface AppState {
   updateSlider: (index: number, updates: Partial<ColorSliderConfig>) => void
   setSettings: (settings: OptimizationSettings) => void
   setCurrentJob: (job: JobStatus | null) => void
+  setSliderLayerRange: (range: { min: number; max: number }) => void
   setInputImage: (image: string | null) => void
   setPreviewImage: (image: string | null) => void
   bumpPreviewVersion: () => void
@@ -175,6 +212,8 @@ interface AppState {
   setEditFilamentModalOpen: (open: boolean) => void
   setEditingFilament: (filament: Filament | null) => void
   toggleTheme: () => void
+  pushToast: (message: string, level?: ToastLevel) => void
+  dismissToast: (id: number) => void
   startOptimization: () => Promise<string>
   pauseOptimization: (jobId: string) => Promise<void>
   resumeOptimization: (jobId: string) => Promise<void>
@@ -231,6 +270,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   historyLength: 0,
   historyIndex: -1,
   historyEntries: [],
+  toasts: [],
+
+  pushToast: (message, level = 'error') => {
+    const id = nextToastId++
+    set((state) => ({ toasts: [...state.toasts, { id, message, level }] }))
+    // Errors stay until dismissed (they may need to be read/copied); info
+    // and warning toasts self-clear so they don't pile up.
+    if (level !== 'error') {
+      setTimeout(() => get().dismissToast(id), 6000)
+    }
+  },
+  dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
 
   setFilaments: (filaments) => { set({ filaments }); queueCaptureSnapshot('Filament library updated') },
   setFilamentTypes: (types) => set({ filamentTypes: types }),
@@ -270,6 +321,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       })
     } catch (e) {
       console.error('Failed to add active filament:', e)
+      get().pushToast(`Failed to add "${filament.name}" to active filaments — it may not be saved on the server.`)
     }
     queueCaptureSnapshot('Added filament')
   },
@@ -281,6 +333,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       await fetch(`/api/filaments/active/${uuid}`, { method: 'DELETE' })
     } catch (e) {
       console.error('Failed to remove active filament:', e)
+      get().pushToast('Failed to remove active filament on the server — it may reappear after a reload.')
     }
     queueCaptureSnapshot('Removed filament')
   },
@@ -323,6 +376,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       queueCaptureSnapshot(label)
     }
   },
+  setSliderLayerRange: (range) => set({ sliderLayerRange: range }),
   setInputImage: (image) => { set({ inputImage: image }); queueCaptureSnapshot('Input image changed') },
   setPreviewImage: (image) => set({ previewImage: image }),
   bumpPreviewVersion: () => set((state) => ({ previewVersion: state.previewVersion + 1 })),
@@ -365,6 +419,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const response = await fetch('/api/optimize/latest')
       if (!response.ok) return
       const job: JobStatus = await response.json()
+      if (!shouldRestoreJobOnLoad(job.status)) return
       set({ currentJob: job })
       if (job.status === 'completed') set({ stlFile: job.job_id })
     } catch {
@@ -428,20 +483,41 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   runInit: async () => {
+    const state = get()
     set({ initState: { status: 'initializing', preview_image: null } })
     try {
-      const response = await fetch('/api/init/run', { method: 'POST' })
+      // /api/init/run used to take no body at all and read a settings
+      // singleton the rest of the app never writes to (POST /api/optimize/
+      // start is what actually carries live settings) — it had no way to
+      // know which image or filaments to use for anything but a stub.
+      const response = await fetch('/api/init/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(state.settings),
+      })
       if (!response.ok) {
-        const err = await response.json()
+        const err = await response.json().catch(() => ({ detail: `HTTP ${response.status}` }))
         console.error('[store] Init rejected:', err.detail)
         set({ initState: { status: 'idle', preview_image: null } })
+        // "Already initializing" is a benign race (see the comment on
+        // ActiveFilamentsPanel's effect) — not worth alarming the user
+        // about; anything else (including an OOM from heightmap init,
+        // which runs real GPU work) is not.
+        if (!String(err.detail ?? '').includes('Already initializing')) {
+          get().pushToast(`Failed to prepare preview: ${err.detail ?? `HTTP ${response.status}`}`)
+        }
         return
       }
       const result = await response.json()
       set({ initState: { status: 'ready', preview_image: result.preview_image ?? null } })
+      if (Number.isFinite(result.min_layer) && Number.isFinite(result.max_layer)) {
+        set({ sliderLayerRange: { min: result.min_layer, max: result.max_layer } })
+      }
+      get().bumpPreviewVersion()
     } catch (e) {
       console.error('[store] Failed to run init:', e)
       set({ initState: { status: 'idle', preview_image: null } })
+      get().pushToast(`Failed to prepare preview: ${e instanceof Error ? e.message : String(e)}`)
     }
   },
 
@@ -601,7 +677,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeFilaments: state.activeFilaments,
       colorSliders: state.colorSliders,
       settings: state.settings,
-      inputImage: state.inputImage,
+      inputImage: durableInputImageUrl(state.inputImage, state.settings),
       currentJobId: state.currentJob?.job_id ?? null,
       optimizationResultId: state.currentJob?.status === 'completed' ? state.currentJob?.job_id : null,
       jobStatus: state.currentJob?.status ?? null,

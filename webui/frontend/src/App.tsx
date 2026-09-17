@@ -9,6 +9,7 @@ import { StatusBar } from './components/StatusBar'
 import { SettingsModal } from './components/SettingsModal'
 import { NewFilamentModal } from './components/NewFilamentModal'
 import { ImportModal } from './components/ImportModal'
+import { ToastContainer } from './components/ToastContainer'
 import { useAppStore } from './store/appStore'
 import { useJobWebSocket } from './hooks/useJobWebSocket'
 
@@ -22,8 +23,24 @@ const App: React.FC = () => {
   const settings = useAppStore((s) => s.settings)
 
   const enabledDepths = colorSliders.filter((s) => s.enabled && s.layer > 0).map((s) => s.depth_mm)
-  const currentMeshHeight = enabledDepths.length > 0 ? Math.max(...enabledDepths) : 0
-  const totalMeshHeight = sliderLayerRange.max * (settings.layer_height || 0.04)
+  // Both current and total measure from the true build-plate Z=0, matching
+  // the actual mesh's top surface (background_height + print layers, see
+  // helpers/colored_mesh.py's top_z) — even with zero color layers placed,
+  // the physical mesh is still background_height tall.
+  const currentMeshHeight = (settings.background_height || 0) + (enabledDepths.length > 0 ? Math.max(...enabledDepths) : 0)
+  // sliderLayerRange.max is the *print-layer* count of the last real
+  // optimizer/pruner result (or a hardcoded 75 placeholder before any
+  // result exists — it's never derived from live settings). Two bugs this
+  // fixes: (1) the total was missing background_height entirely, even
+  // though the actual mesh's top surface is height_map + background_height
+  // (see helpers/colored_mesh.py's top_z) — every displayed total was short
+  // by exactly that much; (2) before a job completes (or after the user
+  // changes Max Layers in Settings without re-running), the total kept
+  // showing that stale 75-layer placeholder instead of what the *next* run
+  // would actually produce.
+  const jobHasResult = currentJob?.status === 'completed'
+  const totalMeshLayers = jobHasResult ? sliderLayerRange.max : (settings.max_layers || sliderLayerRange.max)
+  const totalMeshHeight = (settings.background_height || 0) + totalMeshLayers * (settings.layer_height || 0.04)
 
   // Connect to optimization WebSocket when a job is active
   const activeJobId = currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
@@ -48,6 +65,27 @@ const App: React.FC = () => {
     }
     loadInitial()
   }, [loadProjectState, loadActiveFilaments, loadCurrentJob])
+
+  // Last-resort safety net: an uncaught exception or unhandled promise
+  // rejection anywhere in the app used to just vanish into the browser
+  // console — the page kept running in whatever broken state caused it,
+  // with nothing telling the user something failed.
+  useEffect(() => {
+    const pushToast = useAppStore.getState().pushToast
+    const onError = (e: ErrorEvent) => {
+      pushToast(`Unexpected error: ${e.message}`)
+    }
+    const onRejection = (e: PromiseRejectionEvent) => {
+      const reason = e.reason instanceof Error ? e.reason.message : String(e.reason)
+      pushToast(`Unexpected error: ${reason}`)
+    }
+    window.addEventListener('error', onError)
+    window.addEventListener('unhandledrejection', onRejection)
+    return () => {
+      window.removeEventListener('error', onError)
+      window.removeEventListener('unhandledrejection', onRejection)
+    }
+  }, [])
 
   // Keyboard shortcuts for undo/redo
   useEffect(() => {
@@ -101,6 +139,7 @@ const App: React.FC = () => {
       <SettingsModal />
       <NewFilamentModal />
       <ImportModal />
+      <ToastContainer />
     </div>
   )
 }

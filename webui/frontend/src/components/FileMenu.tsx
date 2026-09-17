@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { useAppStore } from '../store/appStore'
+import { durableInputImageUrl, useAppStore } from '../store/appStore'
 import { ChevronDown, Save, FolderOpen, PackageOpen } from 'lucide-react'
 
 export const FileMenu: React.FC = () => {
@@ -44,7 +44,12 @@ export const FileMenu: React.FC = () => {
       colorSliders,
       settings,
       activeFilaments,
-      inputImage,
+      // A raw `blob:` object URL only resolves in this browser tab — saving
+      // it verbatim means reopening the file later (or on another
+      // machine/profile) shows a permanently broken image even though the
+      // server still has the real upload. Persist the durable server path
+      // instead.
+      inputImage: durableInputImageUrl(inputImage, settings),
     }
     downloadBlob(
       new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }),

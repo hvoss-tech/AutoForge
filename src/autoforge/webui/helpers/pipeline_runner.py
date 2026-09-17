@@ -6,6 +6,7 @@ argparse + CSV, and returns a state dict for later pruning/export.
 """
 
 import argparse
+import csv
 import os
 import time
 import traceback
@@ -32,6 +33,29 @@ from autoforge.auto_forge import (
     _build_optimizer,
 )
 from autoforge.webui.helpers.colored_mesh import generate_colored_preview_mesh
+
+
+def friendly_error_message(exc: BaseException) -> str:
+    """A short, user-facing summary for a job-thread exception, with the
+    full technical detail kept after a blank line.
+
+    Job failures previously surfaced str(exc) verbatim — for a CUDA OOM
+    that's a multi-paragraph allocator dump (fragmentation stats, per-pool
+    byte counts) with no actionable takeaway, shown as-is in both the
+    Preview3DPanel failure banner and (now) an error toast. Detecting the
+    common OOM shape and leading with a plain-language cause + concrete
+    knobs to turn makes the failure actually actionable at a glance, while
+    the raw message stays available underneath for anyone who does want it.
+    """
+    text = str(exc)
+    is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in text.lower()
+    if is_oom:
+        return (
+            "Out of GPU memory. Try reducing Max Layers, the processing "
+            "resolution (Processing Reduction Factor), or the input "
+            "image size, then run again.\n\n" + text
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -97,18 +121,25 @@ def _make_settings(overrides: dict) -> argparse.Namespace:
 # Top-level pipeline (mirrors auto_forge.start())
 # ---------------------------------------------------------------------------
 
-def run_pipeline(
+def build_pipeline_state(
     input_image_path: str,
     active_filaments: List[Dict[str, Any]],
     output_dir: str,
     settings: dict,
     device: Optional[torch.device] = None,
-    preview_callback: Optional[Callable] = None,
-    progress_callback: Optional[Callable] = None,
-    cancel_event: Optional[threading.Event] = None,
-    pause_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
-    """Run the full optimization pipeline in the current thread.
+    """Everything ``run_pipeline()`` does up to (and including) building the
+    ``FilamentOptimizer`` — material/image loading, background selection,
+    heightmap initialization — but stopping short of actually running any
+    gradient-descent steps.
+
+    Split out of ``run_pipeline()`` so the webui's "auto-preview on image
+    upload" flow (``api/init.py``) can build a real optimizer against the
+    real heightmap-initialization algorithm and hand it straight to
+    ``export_results()``/``render_with_sliders()``/``derive_sliders_from_result()``
+    without duplicating this setup or paying for a training loop that flow
+    doesn't want (the whole point is showing the *untrained* init result so
+    the user can assign colors manually).
 
     Parameters
     ----------
@@ -125,24 +156,19 @@ def run_pipeline(
         Torch device.  When ``None``, auto-detected via ``get_device()``
         (CUDA/ROCm, then Apple Metal, then CPU), honoring a ``device`` entry
         in ``settings`` or the ``AUTOFORGE_DEVICE`` environment variable.
-    preview_callback :
-        Called as ``preview_callback(optimizer, num_steps_done)`` periodically.
-    cancel_event :
-        When set, the optimization loop will exit at the next step boundary.
-    pause_event :
-        When set, the optimization loop will sleep in 100 ms intervals until
-        cleared (or cancelled).
 
     Returns
     -------
     dict
-        State dict with all intermediate data needed for ``export_results()``.
+        State dict with all intermediate data needed for
+        ``run_pipeline()``'s training loop and for ``export_results()``.
         Keys: ``optimizer, args, material_colors_np, material_TDs_np,
-        material_names, colors_list, background, material_colors,
-        material_TDs, device, alpha, output_target, focus_map_full,
-        focus_map_proc, pixel_height_logits_init, global_logits_init,
-        pixel_height_labels, processing_target, bg_rgb,
-        num_init_cluster_layers, computed_output_size, cancelled``.
+        material_names, material_uuids, active_filaments, colors_list,
+        background, material_colors, material_TDs, device, alpha,
+        output_target, focus_map_full, focus_map_proc,
+        pixel_height_logits_init, global_logits_init, pixel_height_labels,
+        processing_target, bg_rgb, num_init_cluster_layers,
+        computed_output_size``.
     """
     args = _make_settings(settings)
     args.input_image = input_image_path
@@ -276,21 +302,6 @@ def run_pipeline(
         alpha_proc=alpha_proc,
     )
 
-    # --- Run optimisation loop with cancel/pause support ---
-    _run_optimization_loop(
-        optimizer,
-        args,
-        device,
-        preview_callback=preview_callback,
-        progress_callback=progress_callback,
-        cancel_event=cancel_event,
-        pause_event=pause_event,
-    )
-
-    cancelled = (
-        cancel_event.is_set() if cancel_event is not None else False
-    )
-
     # --- Return everything for later export / inspection ---
     return {
         "optimizer": optimizer,
@@ -299,6 +310,7 @@ def run_pipeline(
         "material_TDs_np": material_TDs_np,
         "material_names": material_names,
         "material_uuids": material_uuids,
+        "active_filaments": active_filaments,
         "colors_list": colors_list,
         "background": background,
         "material_colors": material_colors,
@@ -312,11 +324,102 @@ def run_pipeline(
         "global_logits_init": global_logits_init,
         "pixel_height_labels": pixel_height_labels,
         "processing_target": processing_target,
+        "processing_img_np": processing_img_np,
+        "alpha_proc": alpha_proc,
         "bg_rgb": bg_rgb,
         "num_init_cluster_layers": args.num_init_cluster_layers,
         "computed_output_size": computed_output_size,
-        "cancelled": cancelled,
     }
+
+
+def run_pipeline(
+    input_image_path: str,
+    active_filaments: List[Dict[str, Any]],
+    output_dir: str,
+    settings: dict,
+    device: Optional[torch.device] = None,
+    preview_callback: Optional[Callable] = None,
+    progress_callback: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+) -> Dict[str, Any]:
+    """Build the pipeline state (see ``build_pipeline_state()``) and run the
+    full gradient-descent training loop.
+
+    Parameters mirror ``build_pipeline_state()`` plus:
+
+    preview_callback :
+        Called as ``preview_callback(optimizer, num_steps_done)`` periodically.
+    cancel_event :
+        When set, the optimization loop will exit at the next step boundary.
+    pause_event :
+        When set, the optimization loop will sleep in 100 ms intervals until
+        cleared (or cancelled).
+
+    Returns
+    -------
+    dict
+        Same shape as ``build_pipeline_state()``, plus ``cancelled``.
+    """
+    state = build_pipeline_state(
+        input_image_path, active_filaments, output_dir, settings, device=device
+    )
+    optimizer = state["optimizer"]
+    args = state["args"]
+    device = state["device"]
+
+    # --- Run optimisation loop with cancel/pause support ---
+    _run_optimization_loop(
+        optimizer,
+        args,
+        device,
+        preview_callback=preview_callback,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+    )
+
+    state["cancelled"] = cancel_event.is_set() if cancel_event is not None else False
+    return state
+
+
+def build_init_preview(
+    input_image_path: str,
+    active_filaments: List[Dict[str, Any]],
+    output_dir: str,
+    settings: dict,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    """Build pipeline state and seed a *discretizable* solution straight
+    from the raw heightmap-initialization output, without running any
+    training steps.
+
+    ``FilamentOptimizer.best_params`` is ``None`` until the first
+    ``step(record_best=True)`` call, so ``get_discretized_solution(best=True)``
+    — which ``render_with_sliders()``/``derive_sliders_from_result()``/
+    ``export_results()`` all rely on — would return ``(None, None)`` on a
+    freshly-built optimizer. Seeding it from ``get_current_parameters()`` (a
+    cheap tensor snapshot, not a training step) makes the *initial* heightmap
+    solution discretizable immediately: the point of this function is
+    showing that untrained heightmap result in the 3D view right after an
+    image is uploaded, so the user can assign layer colors manually before
+    ever running the real optimizer.
+
+    Note this makes the *material* assignment (``disc_global`` — the
+    "colors") meaningless: ``global_logits_init`` is effectively arbitrary
+    at this point. That's fine for this flow specifically —
+    ``render_with_sliders()`` only ever reads the height map
+    (``disc_height_image``), never ``disc_global``, and assigning colors
+    here is explicitly the user's job via the slider stack, not the
+    optimizer's.
+    """
+    state = build_pipeline_state(
+        input_image_path, active_filaments, output_dir, settings, device=device
+    )
+    optimizer = state["optimizer"]
+    optimizer.best_params = optimizer.get_current_parameters()
+    optimizer.best_seed = 0
+    return state
 
 
 # --- Optimisation loop with pause / cancel ---
@@ -594,10 +697,38 @@ def export_results(
                         f.write(line + "\n")
 
             # ---- Project file (traditional mode only) ----
+            # generate_project_file() reads its material data from a CSV on
+            # disk (args.csv_file) rather than from the active_filaments list
+            # directly. run_pipeline() blanks args.csv_file/json_file up
+            # front (webui runs never start from a CSV), so without writing
+            # one out here has_material_file was always False and
+            # project_file.hfp was silently never produced for any webui
+            # run — GET /api/outputs/project/{job_id} 404s and the "Download
+            # Project" button does nothing. Write the active filaments the
+            # run actually used to a CSV in the job's output folder so the
+            # project file can be generated the same way the CLI does.
             project_path = None
-            has_material_file = bool(args.csv_file) or bool(args.json_file)
-            if not args.flatforge and has_material_file:
+            if not args.flatforge:
                 from autoforge.Helper.OutputHelper import generate_project_file
+
+                active_filaments = result.get("active_filaments") or []
+                materials_csv_path = os.path.join(args.output_folder, "materials.csv")
+                with open(materials_csv_path, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        ["Brand", "Name", "Color", "Transmissivity", "Type", "Owned", "Uuid"]
+                    )
+                    for mat in active_filaments:
+                        writer.writerow([
+                            mat.get("brand", ""),
+                            mat.get("short_name", mat.get("name", "")),
+                            mat.get("color", "#ffffff"),
+                            mat.get("td", 0.0),
+                            mat.get("filament_type") or "PLA",
+                            mat.get("owned", False),
+                            mat.get("uuid", ""),
+                        ])
+                args.csv_file = materials_csv_path
 
                 project_path = os.path.join(args.output_folder, "project_file.hfp")
                 generate_project_file(

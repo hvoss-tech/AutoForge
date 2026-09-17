@@ -89,6 +89,26 @@ def derive_sliders_from_optimizer(
     return {"sliders": sliders, "min_layer": min_layer, "max_layer": max_layer}
 
 
+def derive_layer_range_from_result(result: dict):
+    """Return just ``{"min_layer": int, "max_layer": int}`` for a pipeline
+    result, without grouping the discrete solution into material segments.
+
+    Used for the post-upload "auto-preview" flow (``api/init.py``): at that
+    point the optimizer hasn't been trained, so ``disc_global`` (the
+    layer->material assignment ``derive_sliders_from_result`` groups into
+    segments) is meaningless — but ``disc_height_image`` (pure per-pixel
+    height, from the heightmap-initialization algorithm) is already the
+    real result, and the slider track's range should reflect it immediately
+    rather than staying at a placeholder default.
+    """
+    optimizer = result["optimizer"]
+    disc_global, disc_height_image = optimizer.get_discretized_solution(best=True)
+    if disc_height_image is None:
+        return None
+    height_map = disc_height_image.detach().cpu().numpy()
+    return {"min_layer": int(height_map.min()), "max_layer": int(height_map.max())}
+
+
 def derive_sliders_from_result(result: dict):
     """Derive sliders from a pipeline result dict (see ``run_pipeline``)."""
     optimizer = result["optimizer"]

@@ -33,6 +33,20 @@ export const TopBar: React.FC = () => {
   const [elapsedEta, setElapsedEta] = useState<{ elapsed: number; eta: number; stalled: boolean } | null>(null)
   const [startError, setStartError] = useState<string | null>(null)
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
+  // Was a hardcoded "v1.9.4" literal in the JSX below — it silently fell out
+  // of sync with pyproject.toml's actual version (already at 1.9.7) since
+  // nothing updated it on release. /api/system/version reads the installed
+  // package's real version (from pyproject.toml at build/install time), so
+  // this follows it automatically. Unlike /api/system/update-check below,
+  // it's a local read with no GitHub call, so it's safe to fetch immediately.
+  const [currentVersion, setCurrentVersion] = useState<string | null>(null)
+
+  useEffect(() => {
+    fetch('/api/system/version')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data?.version) setCurrentVersion(data.version) })
+      .catch(() => {})
+  }, [])
 
   useEffect(() => {
     // Deliberately delayed: this is pure background/non-urgent work, but
@@ -146,7 +160,7 @@ export const TopBar: React.FC = () => {
     <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-700" data-testid="top-bar">
       <div className="flex items-center gap-3">
         <h1 className="text-sm font-bold text-gray-100">AutoForge</h1>
-        <span className="text-xs text-gray-500">v1.9.4</span>
+        {currentVersion && <span className="text-xs text-gray-500" data-testid="app-version">v{currentVersion}</span>}
         <FileMenu />
       </div>
 

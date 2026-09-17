@@ -37,6 +37,23 @@ export function useJobWebSocket(jobId: string | null) {
     ws.onmessage = (event) => {
       try {
         const data: JobStatus = JSON.parse(event.data)
+        // The in-panel "Optimization failed" banner (Preview3DPanel) only
+        // helps if that panel happens to be visible — it's fully covered
+        // by the Settings/Pruning modals, which is exactly where a user
+        // who just clicked Run is likely looking. A toast surfaces the
+        // same failure (including an OOM's message) regardless of what's
+        // currently on screen.
+        const previousStatus = useAppStore.getState().currentJob?.status
+        if (data.status === 'failed' && previousStatus !== 'failed') {
+          // Only the summary line(s) — friendly_error_message() (backend)
+          // puts the full raw exception after a blank line, which belongs
+          // in Preview3DPanel's collapsible "Show details", not stretching
+          // a toast across the screen.
+          const summary = data.error?.split('\n\n')[0]
+          useAppStore.getState().pushToast(
+            summary ? `Optimization failed: ${summary}` : 'Optimization failed.'
+          )
+        }
         setCurrentJob(data)
         if (['completed', 'failed', 'cancelled'].includes(data.status)) {
           intentionalClose = true

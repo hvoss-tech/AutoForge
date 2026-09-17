@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 import urllib.error
@@ -24,7 +25,43 @@ _UPDATE_CACHE_TTL = 3600  # seconds — avoid hitting GitHub's API on every page
 _update_cache: dict = {"checked_at": 0.0, "data": None}
 
 
+_PYPROJECT_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "pyproject.toml")
+)
+
+
+def _version_from_pyproject() -> str | None:
+    """Read [project].version straight out of pyproject.toml, when running
+    from a source checkout (the webui's normal deployment — see
+    run_webui.sh/Dockerfile.webui). This is what makes a version bump show
+    up immediately without reinstalling the package: pip's installed
+    dist-info metadata (the importlib.metadata fallback below) is a
+    snapshot taken at install time and silently goes stale otherwise — the
+    frontend's version badge used to be a hand-edited literal that drifted
+    just the same way, out of sync with both this file and pyproject.toml."""
+    try:
+        with open(_PYPROJECT_PATH, "rb") as f:
+            try:
+                import tomllib
+                data = tomllib.load(f)
+            except ModuleNotFoundError:
+                # Python 3.10 has no stdlib tomllib; pyproject.toml's
+                # [project] table is simple enough that a targeted regex
+                # avoids adding a tomli dependency just for this.
+                f.seek(0)
+                text = f.read().decode("utf-8")
+                match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+                return match.group(1) if match else None
+        version = data.get("project", {}).get("version")
+        return str(version) if version else None
+    except Exception:
+        return None
+
+
 def _current_version() -> str:
+    from_pyproject = _version_from_pyproject()
+    if from_pyproject:
+        return from_pyproject
     for name in ("autoforge", "AutoForge"):
         try:
             return pkg_version(name)

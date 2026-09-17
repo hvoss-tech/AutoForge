@@ -13,6 +13,7 @@ export const Preview3DPanel: React.FC = () => {
   const inputImage = useAppStore((s) => s.inputImage)
   const setPreviewImage = useAppStore((s) => s.setPreviewImage)
   const setInitState = useAppStore((s) => s.setInitState)
+  const setSliderLayerRange = useAppStore((s) => s.setSliderLayerRange)
   const currentJob = useAppStore((s) => s.currentJob)
   const previewVersion = useAppStore((s) => s.previewVersion)
   const bumpPreviewVersion = useAppStore((s) => s.bumpPreviewVersion)
@@ -149,16 +150,22 @@ export const Preview3DPanel: React.FC = () => {
 
           const slidersRes = await fetch('/api/sliders/from-optimizer')
           const slidersData = await slidersRes.json()
-          if (
-            !cancelled &&
-            slidersData.sliders &&
-            Array.isArray(slidersData.sliders) &&
-            slidersData.sliders.length > 0
-          ) {
-            const range = Number.isFinite(slidersData.min_layer) && Number.isFinite(slidersData.max_layer)
-              ? { min: slidersData.min_layer, max: slidersData.max_layer }
-              : undefined
-            applySliders(slidersData.sliders, range)
+          if (!cancelled) {
+            const hasRange = Number.isFinite(slidersData.min_layer) && Number.isFinite(slidersData.max_layer)
+            if (
+              slidersData.sliders &&
+              Array.isArray(slidersData.sliders) &&
+              slidersData.sliders.length > 0
+            ) {
+              applySliders(slidersData.sliders, hasRange ? { min: slidersData.min_layer, max: slidersData.max_layer } : undefined)
+            } else if (hasRange) {
+              // No segments to apply (e.g. the pre-run auto-preview phase,
+              // where the layer->material assignment is meaningless — see
+              // api/sliders.py) but the real heightmap-derived range is
+              // still worth reflecting immediately, instead of leaving the
+              // slider track at its 0-75 placeholder default.
+              setSliderLayerRange({ min: slidersData.min_layer, max: slidersData.max_layer })
+            }
           }
         }
       } catch {
@@ -173,10 +180,20 @@ export const Preview3DPanel: React.FC = () => {
       cancelled = true
       clearInterval(interval)
     }
-    }, [inputImage, setPreviewImage, setInitState, updateSlider, optimizationStarted, jobFailed, jobHasResult])
+    }, [inputImage, setPreviewImage, setInitState, setSliderLayerRange, updateSlider, optimizationStarted, jobFailed, jobHasResult])
 
   const coloredPlyUrl = stlFile && currentJob?.job_id
     ? `/api/outputs/colored-ply/${currentJob.job_id}?v=${previewVersion}`
+    : null
+  // The auto-preview mesh (api/init.py) — the real heightmap-init result,
+  // draped with the original photo, so the 3D view shows actual geometry
+  // (not a flat 2D image or the fake uniform-block stackSegments preview)
+  // the moment an image + filament are present, before the user has ever
+  // clicked Run. `previewVersion` also bumps on every slider-triggered
+  // re-render (ColorSliders posts job_id: "__init__" during this phase),
+  // so manually assigning colors updates this mesh live.
+  const initMeshUrl = !stlFile && initState.status === 'ready'
+    ? `/api/init/mesh?v=${previewVersion}`
     : null
 
   const showNoFilamentsWarning = inputImage && activeFilaments.length === 0 && initState.status !== 'initializing' && !previewImage
@@ -202,10 +219,34 @@ export const Preview3DPanel: React.FC = () => {
             data-testid="preview-image"
           />
         ) : jobFailed ? (
-          <div className="w-full h-full flex flex-col items-center justify-center text-red-400 p-4" data-testid="optimization-error">
-            <AlertTriangle className="w-8 h-8 mb-2 opacity-70" />
+          <div className="w-full h-full flex flex-col items-center justify-center text-red-400 p-4 overflow-y-auto" data-testid="optimization-error">
+            <AlertTriangle className="w-8 h-8 mb-2 opacity-70 flex-shrink-0" />
             <p className="text-xs text-center mb-1">Optimization failed</p>
-            {jobError && <p className="text-xs text-center text-red-500/80 max-w-48">{jobError}</p>}
+            {jobError && (() => {
+              // friendly_error_message() (backend) leads with a plain-
+              // language summary, then a blank line, then the raw
+              // exception text (allocator stats for an OOM, a traceback
+              // fragment otherwise) — split them so the summary reads as
+              // a normal sentence and the technical part is opt-in rather
+              // than filling the panel with a wall of text by default.
+              const [summary, ...rest] = jobError.split('\n\n')
+              const detail = rest.join('\n\n')
+              return (
+                <div className="max-w-64 text-center">
+                  <p className="text-xs text-red-500/80 whitespace-pre-wrap">{summary}</p>
+                  {detail && (
+                    <details className="mt-2 text-left">
+                      <summary className="text-[10px] text-red-500/60 cursor-pointer">Show details</summary>
+                      <pre className="mt-1 text-[10px] text-red-500/60 whitespace-pre-wrap break-words max-h-32 overflow-y-auto">{detail}</pre>
+                    </details>
+                  )}
+                </div>
+              )
+            })()}
+          </div>
+        ) : initMeshUrl ? (
+          <div data-testid="init-three-d-view" className="w-full h-full">
+            <ThreeDView coloredPlyUrl={initMeshUrl} className="w-full h-full" />
           </div>
         ) : stackSegments.length > 0 ? (
           <div data-testid="color-stack-preview" className="w-full h-full">
@@ -227,10 +268,6 @@ export const Preview3DPanel: React.FC = () => {
           <div className="w-full h-full flex flex-col items-center justify-center text-yellow-400 p-4" data-testid="no-filaments-warning">
             <AlertTriangle className="w-8 h-8 mb-2 opacity-70" />
             <p className="text-xs text-center">Add filaments to the Active Filaments list to generate a 3D preview</p>
-          </div>
-        ) : initState.status === 'ready' ? (
-          <div className="w-full h-full flex items-center justify-center text-gray-500 text-xs" data-testid="init-ready-no-preview">
-            Ready - press Run to start optimization
           </div>
         ) : (
           <div className="w-full h-full flex flex-col items-center justify-center text-gray-500" data-testid="preview-placeholder">

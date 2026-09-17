@@ -5,6 +5,7 @@ import uuid
 from fastapi import APIRouter, HTTPException
 from ..models import PruningSettings
 from ..services.optimization_service import get_optimization_service
+from ..helpers.pipeline_runner import friendly_error_message
 from ..config import config
 
 router = APIRouter()
@@ -168,7 +169,7 @@ async def start_pruning(settings: PruningSettings):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            svc.update_status(prune_job_id, "failed", error=str(e))
+            svc.update_status(prune_job_id, "failed", error=friendly_error_message(e))
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()

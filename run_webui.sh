@@ -6,18 +6,35 @@ cd "$SCRIPT_DIR"
 
 HOST="${WEBUI_HOST:-0.0.0.0}"
 PORT="${WEBUI_PORT:-8000}"
-BUILD_FRONTEND="${BUILD_FRONTEND:-true}"
+BUILD_FRONTEND="${BUILD_FRONTEND:-auto}"
 
 # ---------------------------------------------------------------------------
-# Build the frontend if the dist folder is missing (or forced)
+# Build the frontend, but only when it's actually out of date. BUILD_FRONTEND
+# used to default to "true", which ran a full `npm install && npm run build`
+# (tens of seconds) on every single start even when nothing in the frontend
+# had changed since the last build. "auto" (now the default) rebuilds only
+# when dist/ is missing or a source/config file is newer than the last
+# successful build's stamp; BUILD_FRONTEND=true still forces a rebuild every
+# time, and BUILD_FRONTEND=false always skips it.
 # ---------------------------------------------------------------------------
-FRONTEND_DIST="$SCRIPT_DIR/webui/frontend/dist"
+FRONTEND_DIR="$SCRIPT_DIR/webui/frontend"
+FRONTEND_DIST="$FRONTEND_DIR/dist"
+BUILD_STAMP="$FRONTEND_DIST/.build-stamp"
 
 should_build=false
 if [ "$BUILD_FRONTEND" = "true" ]; then
     should_build=true
-elif [ "$BUILD_FRONTEND" = "auto" ] && [ ! -d "$FRONTEND_DIST" ]; then
-    should_build=true
+elif [ "$BUILD_FRONTEND" = "false" ]; then
+    should_build=false
+else
+    if [ ! -f "$BUILD_STAMP" ]; then
+        should_build=true
+    elif find "$FRONTEND_DIR/src" "$FRONTEND_DIR/package.json" "$FRONTEND_DIR/package-lock.json" \
+              "$FRONTEND_DIR/vite.config.ts" "$FRONTEND_DIR/index.html" "$FRONTEND_DIR/tailwind.config.js" \
+              "$FRONTEND_DIR/postcss.config.js" "$FRONTEND_DIR/tsconfig.json" \
+              -newer "$BUILD_STAMP" 2>/dev/null | grep -q .; then
+        should_build=true
+    fi
 fi
 
 if [ "$should_build" = true ]; then
@@ -26,11 +43,15 @@ if [ "$should_build" = true ]; then
         echo "[webui] ERROR: npm not found. Install Node.js or set BUILD_FRONTEND=false."
         exit 1
     fi
-    cd "$SCRIPT_DIR/webui/frontend"
+    cd "$FRONTEND_DIR"
     npm install
     npm run build
+    mkdir -p "$FRONTEND_DIST"
+    touch "$BUILD_STAMP"
     cd "$SCRIPT_DIR"
     echo "[webui] Frontend built."
+else
+    echo "[webui] Frontend up to date, skipping build (set BUILD_FRONTEND=true to force)."
 fi
 
 # ---------------------------------------------------------------------------

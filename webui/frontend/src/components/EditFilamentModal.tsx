@@ -1,9 +1,11 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
+import { loadFilamentTypes } from '../services/filamentService'
 import { X, Pencil, Trash2 } from 'lucide-react'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from './ui/dialog'
 
 const DEFAULT_TYPES = ['PLA', 'PETG', 'ABS', 'TPU', 'ASA', 'Nylon', 'PC', 'PVB']
+const NEW_TYPE_SENTINEL = '__new_type__'
 
 export const EditFilamentModal: React.FC = () => {
   const editFilamentModalOpen = useAppStore((s) => s.editFilamentModalOpen)
@@ -19,6 +21,7 @@ export const EditFilamentModal: React.FC = () => {
   const [brand, setBrand] = React.useState('')
   const [name, setName] = React.useState('')
   const [filamentType, setFilamentType] = React.useState('PLA')
+  const [customType, setCustomType] = React.useState('')
   const [td, setTd] = React.useState(5.0)
   const [owned, setOwned] = React.useState(false)
   const [colorR, setColorR] = React.useState(128)
@@ -39,8 +42,12 @@ export const EditFilamentModal: React.FC = () => {
     setColorG(parseInt(hex.slice(2, 4), 16) || 0)
     setColorB(parseInt(hex.slice(4, 6), 16) || 0)
     setConfirmingDelete(false)
+    setCustomType('')
     setError(null)
   }, [editingFilament])
+
+  const isAddingCustomType = filamentType === NEW_TYPE_SENTINEL
+  const effectiveType = isAddingCustomType ? customType.trim() : filamentType
 
   const hexColor = `#${colorR.toString(16).padStart(2, '0')}${colorG.toString(16).padStart(2, '0')}${colorB.toString(16).padStart(2, '0')}`
 
@@ -57,6 +64,7 @@ export const EditFilamentModal: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!editingFilament || !brand || !name) return
+    if (isAddingCustomType && !effectiveType) return
     setError(null)
 
     const updated = {
@@ -66,7 +74,7 @@ export const EditFilamentModal: React.FC = () => {
       td,
       owned,
       uuid: editingFilament.uuid,
-      filament_type: filamentType,
+      filament_type: effectiveType,
       source: editingFilament.source || 'user',
     }
 
@@ -94,6 +102,7 @@ export const EditFilamentModal: React.FC = () => {
         }).catch(() => {})
       }
 
+      if (isAddingCustomType) await loadFilamentTypes()
       await refreshFilaments()
       close()
     } catch (err) {
@@ -182,11 +191,25 @@ export const EditFilamentModal: React.FC = () => {
                 value={filamentType}
                 onChange={(e) => setFilamentType(e.target.value)}
                 className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-gray-200 focus:outline-none focus:border-blue-500"
+                data-testid="edit-filament-type"
               >
                 {allTypes.map((t) => (
                   <option key={t} value={t}>{t}</option>
                 ))}
+                <option value={NEW_TYPE_SENTINEL}>+ Add new category…</option>
               </select>
+              {isAddingCustomType && (
+                <input
+                  type="text"
+                  value={customType}
+                  onChange={(e) => setCustomType(e.target.value)}
+                  required
+                  autoFocus
+                  placeholder="New category name"
+                  className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-gray-200 focus:outline-none focus:border-blue-500 mt-1"
+                  data-testid="edit-filament-custom-type"
+                />
+              )}
             </div>
             <div className="flex flex-col gap-1">
               <label className="text-xs text-gray-400">Transmission Distance (TD)</label>

@@ -25,6 +25,7 @@ export const FilamentLibrary: React.FC = () => {
   const setImportModalOpen = useAppStore((s) => s.setImportModalOpen)
   const customLibraryLoaded = useAppStore((s) => s.customLibraryLoaded)
   const setCustomLibraryLoaded = useAppStore((s) => s.setCustomLibraryLoaded)
+  const pushToast = useAppStore((s) => s.pushToast)
 
   useFilamentLoader()
 
@@ -71,8 +72,9 @@ export const FilamentLibrary: React.FC = () => {
       URL.revokeObjectURL(url)
     } catch (e) {
       console.error('Failed to export filament library:', e)
+      pushToast(`Failed to export filament library: ${e instanceof Error ? e.message : String(e)}`)
     }
-  }, [])
+  }, [pushToast])
 
   const brandGroups: BrandGroup[] = React.useMemo(() => {
     const groups: Record<string, Filament[]> = {}

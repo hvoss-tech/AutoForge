@@ -4,22 +4,31 @@ import { useAppStore } from '../store/appStore'
 import type { Filament } from '../types'
 import { getOverlapDisabledIndices } from '../lib/colorStack'
 
+// Mirrors api/preview.py's INIT_JOB_SENTINEL — tells the backend "there's
+// no completed job yet, render against the post-upload auto-preview state
+// instead" when POSTing a slider edit.
+const INIT_JOB_SENTINEL = '__init__'
+
 export const ColorSliders: React.FC = () => {
   const colorSliders = useAppStore((s) => s.colorSliders)
   const sliderLayerRange = useAppStore((s) => s.sliderLayerRange)
   const updateSlider = useAppStore((s) => s.updateSlider)
+  const addActiveFilament = useAppStore((s) => s.addActiveFilament)
   const filaments = useAppStore((s) => s.filaments)
   const currentJob = useAppStore((s) => s.currentJob)
+  const initState = useAppStore((s) => s.initState)
   const activeFilaments = useAppStore((s) => s.activeFilaments)
   const lastRenderedSlidersRef = useRef(JSON.stringify(colorSliders))
   const [isRendering, setIsRendering] = React.useState(false)
 
   // Slider edits only make sense once there's a discretized solution to
-  // recolor — gate on an actual completed job rather than the (separate,
-  // pre-run) init-preview state, which may never run at all if a job was
-  // started directly via the API.
-  const hasResult = currentJob?.status === 'completed'
-  const jobId = currentJob?.job_id
+  // recolor — either a completed job, or (now that api/init.py actually
+  // runs the heightmap-init algorithm instead of a no-op stub) the
+  // pre-run auto-preview: its height map is real, so a slider edit can be
+  // rendered against it exactly like a completed job's, letting the user
+  // assign colors manually before ever running the real optimizer.
+  const hasResult = currentJob?.status === 'completed' || initState.status === 'ready'
+  const jobId = currentJob?.status === 'completed' ? currentJob.job_id : INIT_JOB_SENTINEL
 
   const triggerPreviewRender = useDebouncedCallback(async (sliders: typeof colorSliders, filaments: Filament[], jobId: string | undefined) => {
     setIsRendering(true)
@@ -69,6 +78,13 @@ export const ColorSliders: React.FC = () => {
     e.preventDefault()
     try {
       const filament: Filament = JSON.parse(e.dataTransfer.getData('application/json'))
+      // A filament dragged in from the library may not be active yet — a
+      // slider referencing a filament_uuid outside active_filaments looks
+      // fine here (this panel falls back to the full library for display)
+      // but is invisible to the optimizer, which only ever sees
+      // active_filaments, so the assignment silently wouldn't survive the
+      // next run.
+      addActiveFilament(filament)
       updateSlider(index, { filament_uuid: filament.uuid, enabled: true, td: filament.td })
     } catch {
       // ignore

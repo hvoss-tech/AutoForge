@@ -19,47 +19,55 @@ _EXPORT_FILES = [
 ]
 
 
-def _job_path(job_id: str, filename: str) -> str:
-    return os.path.join(config.checkpoints_path, job_id, filename)
+def _job_path(job_id: str, filename: str) -> str | None:
+    """Resolve a job's output file, refusing to escape checkpoints_path.
+
+    Mirrors the traversal guard in ``services/image_service.py``. ``job_id``
+    is attacker-controlled (a raw URL path segment), and unlike that
+    service this module previously joined it straight into the filesystem
+    path with no check.
+    """
+    checkpoints = os.path.realpath(config.checkpoints_path)
+    resolved = os.path.realpath(os.path.join(checkpoints, job_id, filename))
+    if not resolved.startswith(checkpoints + os.sep):
+        return None
+    return resolved
+
+
+def _resolve_or_404(job_id: str, filename: str, not_found_msg: str) -> str:
+    path = _job_path(job_id, filename)
+    if path is None or not os.path.exists(path):
+        raise HTTPException(404, not_found_msg)
+    return path
 
 
 @router.get("/stl/{job_id}")
 async def download_stl(job_id: str):
-    path = _job_path(job_id, "final_model.stl")
-    if not os.path.exists(path):
-        raise HTTPException(404, "STL not found")
+    path = _resolve_or_404(job_id, "final_model.stl", "STL not found")
     return FileResponse(path, filename=f"{job_id}.stl")
 
 
 @router.get("/preview/{job_id}")
 async def download_preview(job_id: str):
-    path = _job_path(job_id, "final_model.png")
-    if not os.path.exists(path):
-        raise HTTPException(404, "Preview not found")
+    path = _resolve_or_404(job_id, "final_model.png", "Preview not found")
     return FileResponse(path, filename=f"{job_id}_preview.png")
 
 
 @router.get("/instructions/{job_id}")
 async def download_instructions(job_id: str):
-    path = _job_path(job_id, "swap_instructions.txt")
-    if not os.path.exists(path):
-        raise HTTPException(404, "Instructions not found")
+    path = _resolve_or_404(job_id, "swap_instructions.txt", "Instructions not found")
     return FileResponse(path, filename=f"{job_id}_instructions.txt")
 
 
 @router.get("/project/{job_id}")
 async def download_project(job_id: str):
-    path = _job_path(job_id, "project_file.hfp")
-    if not os.path.exists(path):
-        raise HTTPException(404, "Project file not found")
+    path = _resolve_or_404(job_id, "project_file.hfp", "Project file not found")
     return FileResponse(path, filename=f"{job_id}_project.hfp")
 
 
 @router.get("/colored-ply/{job_id}")
 async def download_colored_ply(job_id: str):
-    path = _job_path(job_id, "final_model_colored.ply")
-    if not os.path.exists(path):
-        raise HTTPException(404, "Colored PLY not found")
+    path = _resolve_or_404(job_id, "final_model_colored.ply", "Colored PLY not found")
     return FileResponse(path, filename=f"{job_id}_colored.ply")
 
 
@@ -73,8 +81,9 @@ async def export_project(job_id: str):
     if not job or job.status != "completed":
         raise HTTPException(400, "No completed optimization result to export")
 
-    job_dir = os.path.join(config.checkpoints_path, job_id)
-    if not os.path.isdir(job_dir):
+    checkpoints = os.path.realpath(config.checkpoints_path)
+    job_dir = os.path.realpath(os.path.join(checkpoints, job_id))
+    if not job_dir.startswith(checkpoints + os.sep) or not os.path.isdir(job_dir):
         raise HTTPException(404, "Job output folder not found")
 
     buffer = io.BytesIO()

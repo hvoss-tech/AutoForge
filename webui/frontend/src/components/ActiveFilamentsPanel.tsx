@@ -7,26 +7,47 @@ export const ActiveFilamentsPanel: React.FC = () => {
   const removeActiveFilament = useAppStore((s) => s.removeActiveFilament)
   const inputImage = useAppStore((s) => s.inputImage)
   const runInit = useAppStore((s) => s.runInit)
+  const setEditingFilament = useAppStore((s) => s.setEditingFilament)
+  const setEditFilamentModalOpen = useAppStore((s) => s.setEditFilamentModalOpen)
 
   const handleRemove = (uuid: string) => {
     removeActiveFilament(uuid)
   }
 
-  // Trigger init on the rising edge of "we have both an image and at least
-  // one active filament" — not on the filament count alone. Previously
-  // gated on `activeFilaments.length === 1`, which (a) only ever fired for
-  // the very first filament, never a later one added while the count was
+  const handleDoubleClick = (f: (typeof activeFilaments)[number]) => {
+    setEditingFilament(f)
+    setEditFilamentModalOpen(true)
+  }
+
+  const handleDragStart = (f: (typeof activeFilaments)[number]) => (e: React.DragEvent) => {
+    e.dataTransfer.setData('application/json', JSON.stringify(f))
+    e.dataTransfer.effectAllowed = 'copy'
+  }
+
+  // Trigger the auto-preview (heightmap init) whenever we have at least one
+  // active filament and the *current* input image hasn't been init'd yet —
+  // not just on the false->true rising edge of "ready". Previously gated
+  // on `activeFilaments.length === 1`, which (a) only ever fired for the
+  // very first filament, never a later one added while the count was
   // already >= 1, and (b) fired a *second*, redundant `runInit()` (racing
   // InputImagePanel's own direct call and failing with "Already
   // initializing") whenever an image finished uploading while exactly one
-  // filament happened to already be active.
-  const readyBeforeRef = React.useRef(activeFilaments.length > 0 && !!inputImage)
+  // filament happened to already be active. It also never re-fired when
+  // the user replaced an already-uploaded image while filaments were
+  // already active (readyNow stayed true across the whole swap), leaving
+  // the 3D view showing the *previous* image's heightmap.
+  //
+  // Keying off the image (not a plain before/after boolean) also means
+  // toggling filaments on the same image never triggers a wasted rerun:
+  // heightmap init doesn't depend on which filaments are active, only on
+  // the photo.
+  const lastInitImageRef = React.useRef<string | null>(null)
   React.useEffect(() => {
-    const readyNow = activeFilaments.length > 0 && !!inputImage
-    if (readyNow && !readyBeforeRef.current) {
+    const ready = activeFilaments.length > 0 && !!inputImage
+    if (ready && inputImage !== lastInitImageRef.current) {
+      lastInitImageRef.current = inputImage
       runInit()
     }
-    readyBeforeRef.current = readyNow
   }, [activeFilaments.length, inputImage, runInit])
 
   return (
@@ -46,8 +67,12 @@ export const ActiveFilamentsPanel: React.FC = () => {
           {activeFilaments.map((f) => (
             <div
               key={f.uuid}
-              className="flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-gray-800 border-b border-gray-800/50"
+              draggable
+              onDragStart={handleDragStart(f)}
+              onDoubleClick={() => handleDoubleClick(f)}
+              className="flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-gray-800 border-b border-gray-800/50 cursor-grab active:cursor-grabbing"
               data-testid={`active-filament-${f.uuid}`}
+              title="Double-click to edit · drag onto a slider to assign"
             >
               <button
                 onClick={() => handleRemove(f.uuid)}
