@@ -260,7 +260,7 @@ test.describe('Pipeline E2E Tests', () => {
     const toggle = page.locator('[data-testid^="toggle-filament-"]').first()
     await toggle.waitFor({ state: 'visible', timeout: 10000 })
     await toggle.click()
-    await expect(page.locator('[data-testid="active-filaments-list"]')).toBeVisible()
+    await expect(page.locator('[data-testid="active-filaments-summary"]')).not.toHaveAttribute('data-count', '0')
 
     // Use a large-ish iteration count so there's a real window to pause
     // within before the job would naturally complete.

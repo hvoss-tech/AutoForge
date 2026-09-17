@@ -72,6 +72,27 @@ export interface ParsedMesh {
   positions: Float32Array
   colors: Float32Array | null
   indices: Uint32Array
+  /** Cheap identity of the geometry (see `hashFloats`). */
+  positionsHash: number
+}
+
+/** FNV-1a over the raw bits of a Float32Array.
+ *
+ * Used to tell "the same mesh, recolored" from "a different mesh": the 3D
+ * view reuses the geometry already on the GPU in the first case and only
+ * re-uploads colors, which is what keeps slider edits instant. Vertex count
+ * alone isn't enough to tell them apart — pruning rewrites every height on
+ * an unchanged grid, so the count (and the byte length) match while the
+ * shape is completely different. Over a few hundred thousand values this
+ * costs well under a millisecond, and it runs in the parser's worker. */
+export function hashFloats(values: Float32Array): number {
+  const words = new Uint32Array(values.buffer, values.byteOffset, values.length)
+  let hash = 0x811c9dc5
+  for (let i = 0; i < words.length; i++) {
+    hash ^= words[i]
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return hash >>> 0
 }
 
 export function parseColoredMesh(buffer: ArrayBuffer): ParsedMesh {
@@ -114,5 +135,5 @@ export function parseColoredMesh(buffer: ArrayBuffer): ParsedMesh {
     }
   }
 
-  return { positions, colors, indices }
+  return { positions, colors, indices, positionsHash: hashFloats(positions) }
 }

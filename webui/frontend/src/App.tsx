@@ -1,57 +1,94 @@
-import React, { useEffect } from 'react'
+import React, { useEffect, useRef } from 'react'
+import { ChevronsRight, History, X } from 'lucide-react'
 import { TopBar } from './components/TopBar'
 import { FilamentLibrary } from './components/FilamentLibrary'
 import { InputImagePanel } from './components/InputImagePanel'
 import { Preview3DPanel } from './components/Preview3DPanel'
 import { ColorCore } from './components/ColorCore'
-import { ColorSliders } from './components/ColorSliders'
+import { BottomPanel } from './components/BottomPanel'
+import { HistoryDrawer } from './components/HistoryDrawer'
+import { ConfirmDialog } from './components/ConfirmDialog'
 import { StatusBar } from './components/StatusBar'
 import { SettingsModal } from './components/SettingsModal'
 import { NewFilamentModal } from './components/NewFilamentModal'
 import { ImportModal } from './components/ImportModal'
+import { TutorialModal } from './components/TutorialModal'
 import { ToastContainer } from './components/ToastContainer'
+import { ResizeHandle } from './components/ui/resize-handle'
 import { useAppStore } from './store/appStore'
 import { useJobWebSocket } from './hooks/useJobWebSocket'
+import { useAutoPreviewInit } from './hooks/useAutoPreviewInit'
+import { useElementHeight, usePersistentState } from './hooks/usePersistentState'
 import { historyShortcut } from './lib/history'
+import { clampSize } from './lib/layout'
+import { onUiCommand } from './lib/uiEvents'
+
+const SIDEBAR_DEFAULT = 330
+const SIDEBAR_MIN = 240
+const SIDEBAR_MAX = 560
+const BOTTOM_DEFAULT = 240
+// Tab bar, overview strip, column header and two rows stay visible.
+const BOTTOM_MIN = 140
+const VIEWER_MIN = 180
+
+/** Shown after a reload picked the previous session back up. */
+const SessionBanner: React.FC = () => {
+  const dismiss = useAppStore((s) => s.dismissSessionRestored)
+  const startNewProject = useAppStore((s) => s.startNewProject)
+  const requestConfirm = useAppStore((s) => s.requestConfirm)
+  const hasResult = useAppStore((s) => s.currentJob?.status === 'completed')
+  const hasLayers = useAppStore((s) => s.colorSliders.length > 0)
+  const restored = ['the image', ...(hasLayers ? ['color layers'] : []), ...(hasResult ? ['result'] : [])]
+  const restoredText = restored.length > 1 ? `${restored.slice(0, -1).join(', ')} and ${restored[restored.length - 1]}` : restored[0]
+
+  const handleNew = async () => {
+    const ok = await requestConfirm({
+      title: 'Start a new project?',
+      message: 'The image, color layers and result are cleared. Settings and active filaments stay.\nYou can get everything back with Undo.',
+      confirmLabel: 'Start new project',
+    })
+    if (ok) startNewProject()
+  }
+
+  return (
+    <div className="flex items-center gap-2 mx-2 mt-2 px-3 py-1.5 rounded bg-blue-600/10 border border-blue-600/30 text-xs text-gray-200" data-testid="session-restored-banner">
+      <History className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />
+      <span className="flex-1">Picked up where you left off: {restoredText} from your last session.</span>
+      <button onClick={handleNew} className="px-2 py-0.5 rounded border border-gray-600 hover:bg-gray-700" data-testid="start-new-project-btn">
+        Start new project
+      </button>
+      <button onClick={dismiss} className="p-0.5 rounded text-gray-400 hover:text-gray-100 hover:bg-gray-700" aria-label="Dismiss" data-testid="session-restored-dismiss">
+        <X className="w-3.5 h-3.5" />
+      </button>
+    </div>
+  )
+}
 
 const App: React.FC = () => {
   const loadProjectState = useAppStore((s) => s.loadProjectState)
   const loadActiveFilaments = useAppStore((s) => s.loadActiveFilaments)
   const loadCurrentJob = useAppStore((s) => s.loadCurrentJob)
+  const restoreSessionImage = useAppStore((s) => s.restoreSessionImage)
   const currentJob = useAppStore((s) => s.currentJob)
-  const colorSliders = useAppStore((s) => s.colorSliders)
-  const sliderLayerRange = useAppStore((s) => s.sliderLayerRange)
-  const settings = useAppStore((s) => s.settings)
+  const sessionRestored = useAppStore((s) => s.sessionRestored)
 
-  // From layer × layer height, not the stored depth_mm: that copy goes stale
-  // when the layer height changes, and the built-in default columns never
-  // matched it (layer 27 claimed 2.24mm at 0.04mm layers).
-  const layerHeight = settings.layer_height || 0.04
-  const enabledDepths = colorSliders.filter((s) => s.enabled && s.layer > 0).map((s) => s.layer * layerHeight)
-  // Both current and total measure from the true build-plate Z=0, matching
-  // the actual mesh's top surface (background_height + print layers, see
-  // helpers/colored_mesh.py's top_z) — even with zero color layers placed,
-  // the physical mesh is still background_height tall.
-  const currentMeshHeight = (settings.background_height || 0) + (enabledDepths.length > 0 ? Math.max(...enabledDepths) : 0)
-  // sliderLayerRange.max is the *print-layer* count of the last real
-  // optimizer/pruner result (or a hardcoded 75 placeholder before any
-  // result exists — it's never derived from live settings). Two bugs this
-  // fixes: (1) the total was missing background_height entirely, even
-  // though the actual mesh's top surface is height_map + background_height
-  // (see helpers/colored_mesh.py's top_z) — every displayed total was short
-  // by exactly that much; (2) before a job completes (or after the user
-  // changes Max Layers in Settings without re-running), the total kept
-  // showing that stale 75-layer placeholder instead of what the *next* run
-  // would actually produce.
-  const jobHasResult = currentJob?.status === 'completed'
-  const totalMeshLayers = jobHasResult ? sliderLayerRange.max : (settings.max_layers || sliderLayerRange.max)
-  const totalMeshHeight = (settings.background_height || 0) + totalMeshLayers * (settings.layer_height || 0.04)
+  const [sidebarWidth, setSidebarWidth] = usePersistentState<number>('autoforge-sidebar-width', SIDEBAR_DEFAULT)
+  const [sidebarCollapsed, setSidebarCollapsed] = usePersistentState<boolean>('autoforge-sidebar-collapsed', false)
+  const [bottomHeight, setBottomHeight] = usePersistentState<number>('autoforge-bottom-panel-height', BOTTOM_DEFAULT)
+  const mainRef = useRef<HTMLElement>(null)
+  const mainHeight = useElementHeight(mainRef)
+  // Up to 70% of the column, and never squeezing the image/3D row below its minimum.
+  const bottomMax = mainHeight ? Math.max(BOTTOM_MIN, Math.min(mainHeight * 0.7, mainHeight - VIEWER_MIN)) : 10000
+  const effectiveBottom = clampSize(bottomHeight, BOTTOM_MIN, bottomMax)
 
   // Connect to optimization WebSocket when a job is active
   const activeJobId = currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
     ? currentJob.job_id
     : null
   useJobWebSocket(activeJobId)
+  useAutoPreviewInit()
+
+  useEffect(() => onUiCommand('focus-library', () => setSidebarCollapsed(false)), [setSidebarCollapsed])
 
   useEffect(() => {
     const loadInitial = async () => {
@@ -67,9 +104,11 @@ const App: React.FC = () => {
           await new Promise(r => setTimeout(r, 1000))
         }
       }
+      // After the job is known: whether the image needs a new preview depends on it.
+      await restoreSessionImage()
     }
     loadInitial()
-  }, [loadProjectState, loadActiveFilaments, loadCurrentJob])
+  }, [loadProjectState, loadActiveFilaments, loadCurrentJob, restoreSessionImage])
 
   // Last-resort safety net: an uncaught exception or unhandled promise
   // rejection anywhere in the app used to just vanish into the browser
@@ -92,9 +131,14 @@ const App: React.FC = () => {
     }
   }, [])
 
-  // Keyboard shortcuts for undo/redo
+  // Keyboard shortcuts: undo/redo, and Ctrl+S to save the project
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 's') {
+        e.preventDefault()
+        useAppStore.getState().saveProjectToFile()
+        return
+      }
       const action = historyShortcut(e)
       if (!action) return
       e.preventDefault()
@@ -110,16 +154,49 @@ const App: React.FC = () => {
       <TopBar />
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        <aside style={{ width: 330, backgroundColor: 'var(--bg-sidebar)', borderRight: '1px solid var(--border)', overflow: 'hidden' }}>
-          <FilamentLibrary />
-        </aside>
+        {sidebarCollapsed ? (
+          <aside className="flex-shrink-0 flex flex-col items-center py-2 w-9" style={{ backgroundColor: 'var(--bg-sidebar)', borderRight: '1px solid var(--border)' }} data-testid="sidebar-collapsed">
+            <button
+              onClick={() => setSidebarCollapsed(false)}
+              className="p-1.5 rounded text-gray-300 hover:text-gray-100 hover:bg-gray-700"
+              title="Show the filament library"
+              aria-label="Show the filament library"
+              data-testid="sidebar-expand-btn"
+            >
+              <ChevronsRight className="w-4 h-4" />
+            </button>
+            <span className="mt-2 text-[11px] text-gray-400 [writing-mode:vertical-rl] rotate-180 select-none">Filaments</span>
+          </aside>
+        ) : (
+          <>
+            <aside
+              style={{ width: clampSize(sidebarWidth, SIDEBAR_MIN, SIDEBAR_MAX), backgroundColor: 'var(--bg-sidebar)', overflow: 'hidden', flexShrink: 0 }}
+              data-testid="sidebar"
+            >
+              <FilamentLibrary onCollapse={() => setSidebarCollapsed(true)} />
+            </aside>
+            <div style={{ borderRight: '1px solid var(--border)' }} className="flex">
+              <ResizeHandle
+                direction="column"
+                value={clampSize(sidebarWidth, SIDEBAR_MIN, SIDEBAR_MAX)}
+                min={SIDEBAR_MIN}
+                max={SIDEBAR_MAX}
+                onChange={setSidebarWidth}
+                onReset={() => setSidebarWidth(SIDEBAR_DEFAULT)}
+                label="Filament library width"
+                data-testid="sidebar-resizer"
+              />
+            </div>
+          </>
+        )}
 
-        <main style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-          <div style={{ flex: 1, display: 'flex', gap: 8, padding: 8, minHeight: 0 }}>
+        <main ref={mainRef} style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          {sessionRestored && <SessionBanner />}
+          <div style={{ flex: 1, display: 'flex', gap: 8, padding: '8px 8px 0', minHeight: 0 }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <InputImagePanel />
             </div>
-            <div style={{ width: 80, flexShrink: 0, display: 'flex' }}>
+            <div style={{ width: 88, flexShrink: 0, display: 'flex' }}>
               <ColorCore />
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -127,12 +204,20 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          <div style={{ textAlign: 'center', color: '#00ff55', fontSize: 18, fontWeight: 500, padding: '2px 0' }} data-testid="mesh-height-label">
-            Mesh Height: {currentMeshHeight.toFixed(2)}/{totalMeshHeight.toFixed(2)}mm
-          </div>
+          <ResizeHandle
+            direction="row"
+            value={effectiveBottom}
+            min={BOTTOM_MIN}
+            max={bottomMax}
+            onChange={setBottomHeight}
+            onReset={() => setBottomHeight(BOTTOM_DEFAULT)}
+            invert
+            label="Color layers panel height"
+            data-testid="bottom-panel-resizer"
+          />
 
-          <div style={{ height: 223, flexShrink: 0, minWidth: 0, overflow: 'hidden', borderTop: '1px solid var(--border)' }}>
-            <ColorSliders />
+          <div style={{ height: effectiveBottom, flexShrink: 0, minWidth: 0, overflow: 'hidden', borderTop: '1px solid var(--border)' }} data-testid="bottom-panel-container">
+            <BottomPanel />
           </div>
         </main>
       </div>
@@ -142,6 +227,9 @@ const App: React.FC = () => {
       <SettingsModal />
       <NewFilamentModal />
       <ImportModal />
+      <HistoryDrawer />
+      <ConfirmDialog />
+      <TutorialModal />
       <ToastContainer />
     </div>
   )

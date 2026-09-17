@@ -23,7 +23,8 @@ from ..models import OptimizationSettings
 from ..services.filament_service import get_filament_service
 from ..helpers.pipeline_runner import build_init_preview, friendly_error_message
 from ..helpers.colored_mesh import generate_colored_preview_mesh
-from ..helpers.sliders import derive_layer_range_from_result
+from ..helpers.gpu_memory import release_pipeline_result
+from ..helpers.sliders import derive_base_from_result, derive_layer_range_from_result
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -79,7 +80,10 @@ def _run_init_sync(input_image_path: str, filament_dicts: list[dict], settings_d
         alpha_mask=alpha_np,
     )
     os.makedirs(_init_dir(), exist_ok=True)
-    mesh.export(_mesh_path(), encoding="binary")
+    # Temp file + rename, so the 3D view never downloads a half-written mesh.
+    tmp_mesh = f"{_mesh_path()}.{os.getpid()}.{threading.get_ident()}.tmp.ply"
+    mesh.export(tmp_mesh, encoding="binary")
+    os.replace(tmp_mesh, _mesh_path())
 
     # Flat PNG kept too — /api/init/preview predates the 3D mesh and other
     # code (e.g. a text-only client) may still just want an image.
@@ -89,7 +93,12 @@ def _run_init_sync(input_image_path: str, filament_dicts: list[dict], settings_d
 
     range_info = derive_layer_range_from_result(result) or {"min_layer": 0, "max_layer": int(args.max_layers)}
 
-    return {"result": result, "preview_b64": preview_b64, "range": range_info}
+    return {
+        "result": result,
+        "preview_b64": preview_b64,
+        "range": range_info,
+        "base": derive_base_from_result(result),
+    }
 
 
 @router.post("/run")
@@ -100,6 +109,12 @@ async def run_init(settings: OptimizationSettings):
         if _state["status"] == "initializing":
             raise HTTPException(400, "Already initializing")
         _state = {"status": "initializing", "preview_image": None, "error": None}
+        superseded, _pipeline_result = _pipeline_result, None
+
+    # The previous image's init optimizer is dead the moment this one starts
+    # — and releasing it *before* building the new one halves the peak, which
+    # is what OOM'd when switching between images on a nearly-full GPU.
+    release_pipeline_result(superseded)
 
     filament_svc = get_filament_service()
     active = filament_svc.get_active()
@@ -141,13 +156,20 @@ async def run_init(settings: OptimizationSettings):
 
     with _lock:
         _pipeline_result = built["result"]
-        _state = {"status": "ready", "preview_image": built["preview_b64"], "error": None, "range": built["range"]}
+        _state = {
+            "status": "ready",
+            "preview_image": built["preview_b64"],
+            "error": None,
+            "range": built["range"],
+            "base": built["base"],
+        }
 
     return {
         "status": "ready",
         "preview_image": built["preview_b64"],
         "min_layer": built["range"]["min_layer"],
         "max_layer": built["range"]["max_layer"],
+        "base": built["base"],
     }
 
 
@@ -158,7 +180,15 @@ async def init_status():
         # already "ready" (a reload, another tab) doesn't have to ask
         # /api/sliders/from-optimizer — which answers for the latest
         # *completed job*, not for this preview.
-        return {"status": _state["status"], "error": _state.get("error"), **(_state.get("range") or {})}
+        return {
+            "status": _state["status"],
+            "error": _state.get("error"),
+            # The resolved base color travels with it for the same reason:
+            # with auto_background_color on, the color actually used is
+            # picked by the pipeline, not by anything the client sent.
+            "base": _state.get("base"),
+            **(_state.get("range") or {}),
+        }
 
 
 @router.get("/preview")
@@ -179,9 +209,30 @@ async def init_mesh():
     return FileResponse(path, media_type="application/octet-stream")
 
 
+@router.post("/reset")
+async def reset_init():
+    """Forget the current auto-preview.
+
+    Uploading a different image used to leave this state at "ready" with the
+    *previous* image's mesh still on disk, so the 3D view kept serving it
+    (``GET /api/init/mesh``) until the new init finished — the old picture
+    shown as the new image's heightmap preview. Clearing it up front means
+    the panel shows "building the preview" instead of something wrong, and
+    the old optimizer's device memory is handed back at the same time.
+    """
+    reset_init_state()
+    return {"status": "idle"}
+
+
 def reset_init_state():
-    """Test-only: clear module-level state between isolated test runs."""
+    """Drop the auto-preview: its state, its mesh file and its GPU memory."""
     global _state, _pipeline_result
     with _lock:
+        superseded, _pipeline_result = _pipeline_result, None
         _state = {"status": "idle", "preview_image": None, "error": None}
-        _pipeline_result = None
+    release_pipeline_result(superseded)
+    try:
+        os.remove(_mesh_path())
+    except OSError:
+        # Never written, already gone, or not ours to delete — all fine.
+        pass

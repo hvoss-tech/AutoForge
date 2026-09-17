@@ -35,7 +35,9 @@ export const ToastContainer: React.FC = () => {
   // but inert the entire time a modal is open.
   return createPortal(
     <div
-      style={{ position: 'fixed', top: 12, right: 12, zIndex: 10000, display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 380, pointerEvents: 'auto' }}
+      // Bottom-right, above the status bar: at the top they covered Run,
+      // Pruning and Settings.
+      style={{ position: 'fixed', bottom: 'calc(var(--statusbar-height) + 12px)', right: 12, zIndex: 10000, display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 380, pointerEvents: 'auto' }}
       data-testid="toast-container"
     >
       {toasts.map((toast) => {

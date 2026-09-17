@@ -314,7 +314,15 @@ def test_init_status_reports_layer_range(client, monkeypatch):
     from autoforge.webui.api import init as init_api
 
     monkeypatch.setattr(init_api, "_state", {"status": "ready", "preview_image": None, "error": None, "range": {"min_layer": 2, "max_layer": 30}})
-    assert client.get("/api/init/status").json() == {"status": "ready", "error": None, "min_layer": 2, "max_layer": 30}
+    assert client.get("/api/init/status").json() == {
+        "status": "ready",
+        "error": None,
+        # No base recorded in this hand-built state; the client falls back to
+        # its own settings (see test_init_status_reports_resolved_base).
+        "base": None,
+        "min_layer": 2,
+        "max_layer": 30,
+    }
 
 
 
@@ -350,3 +358,104 @@ def test_invalid_persisted_settings_do_not_break_loading(client):
     resp = client.get("/api/project/state")
     assert resp.status_code == 200
     assert resp.json()["settings"]["max_layers"] == 75
+
+
+# --- Usability rework ---------------------------------------------------------------
+
+
+def test_current_preview_prefers_the_slider_edited_image(client):
+    import os
+    from autoforge.webui.config import config
+
+    job_dir = os.path.join(config.checkpoints_path, "imgjob")
+    os.makedirs(job_dir, exist_ok=True)
+    with open(os.path.join(job_dir, "final_model.png"), "wb") as f:
+        f.write(b"original")
+    assert client.get("/api/outputs/current-preview/imgjob").content == b"original"
+
+    with open(os.path.join(job_dir, "edited_model.png"), "wb") as f:
+        f.write(b"edited")
+    assert client.get("/api/outputs/current-preview/imgjob").content == b"edited"
+    # The download endpoint keeps serving the optimizer's own file.
+    assert client.get("/api/outputs/preview/imgjob").content == b"original"
+    assert client.get("/api/outputs/current-preview/../etc").status_code == 404
+
+
+def test_optimization_reports_phases(client, monkeypatch):
+    """The top bar shows "Preparing" / "Optimizing" / "Exporting results"
+    instead of a bare 0.0% that looked stuck."""
+    import time
+    from autoforge.webui.api import optimization as opt_api
+
+    seen = []
+    svc = get_optimization_service()
+    original_update = svc.update_status
+
+    def recording_update(job_id, status, **kwargs):
+        if "phase" in kwargs:
+            seen.append(kwargs["phase"])
+        return original_update(job_id, status, **kwargs)
+
+    monkeypatch.setattr(svc, "update_status", recording_update)
+
+    def fake_pipeline(**kwargs):
+        class Opt:
+            best_discrete_loss = 1.0
+        kwargs["progress_callback"](Opt(), 5)
+        return {"cancelled": False}
+
+    monkeypatch.setattr(opt_api, "_run_pipeline", fake_pipeline)
+    monkeypatch.setattr("autoforge.webui.helpers.pipeline_runner.export_results", lambda result: None)
+
+    import os
+    from autoforge.webui.config import config
+    os.makedirs(config.uploads_path, exist_ok=True)
+    with open(os.path.join(config.uploads_path, "p.png"), "wb") as f:
+        f.write(b"x")
+    client.put("/api/filaments/active", json=[{"uuid": "f", "name": "F", "td": 1.0}])
+    job_id = client.post("/api/optimize/start", json={"input_image": "p.png", "iterations": 10}).json()["job_id"]
+
+    deadline = time.time() + 10
+    while time.time() < deadline and client.get(f"/api/optimize/status/{job_id}").json()["status"] != "completed":
+        time.sleep(0.05)
+    status = client.get(f"/api/optimize/status/{job_id}").json()
+    assert status["status"] == "completed"
+    assert status["phase"] is None
+    assert seen[:3] == ["Preparing", "Optimizing", "Exporting results"]
+
+
+def test_slider_render_replaces_files_atomically(tmp_path, monkeypatch):
+    """Readers must never see a half-written edited mesh/image: the files
+    are written next to the target and renamed into place."""
+    import numpy as np
+    import torch
+    from autoforge.webui.helpers import slider_render
+
+    replaced = []
+    real_replace = slider_render.os.replace
+    monkeypatch.setattr(slider_render.os, "replace", lambda src, dst: (replaced.append((src, dst)), real_replace(src, dst)))
+
+    class Opt:
+        max_layers = 4
+
+        def get_discretized_solution(self, best=True):
+            return torch.zeros(4, dtype=torch.long), torch.full((6, 8), 3.0)
+
+    class Args:
+        layer_height = 0.04
+        background_height = 0.24
+        stl_output_size = 20
+
+    result = slider_render.render_with_sliders(
+        {"optimizer": Opt(), "args": Args(), "alpha": None, "background": torch.zeros(3)},
+        [{"enabled": True, "layer": 4, "td": 2.0, "filament_uuid": "f"}],
+        {"f": {"color": "#ff0000", "td": 2.0}},
+        str(tmp_path),
+        png_name="edited_model.png",
+        ply_name="edited_model_colored.ply",
+    )
+
+    assert result is not None
+    assert {dst.split("/")[-1] for _, dst in replaced} == {"edited_model.png", "edited_model_colored.ply"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["edited_model.png", "edited_model_colored.ply"]
+    assert np.fromfile(tmp_path / "edited_model.png", dtype=np.uint8)[:4].tobytes() == b"\x89PNG"

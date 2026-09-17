@@ -1,10 +1,55 @@
 """Generate colored PLY mesh from height map + color image for WebUI 3D preview."""
 
+import os
 from typing import Optional, Tuple
 
 import numpy as np
 import trimesh
 from trimesh import Trimesh
+
+# Longest grid side the preview mesh is built at. 0 disables decimation.
+#
+# The mesh has one vertex per grid point (times two, top and bottom) and
+# roughly four triangles per point, so it grows with the *area* of the height
+# map. At the default settings (stl_output_size=150, nozzle 0.4) the solved
+# grid is 750px on the long side: 845k vertices, 1.7M triangles, a 35MB PLY.
+#
+# Decimating to 384 was measured at ~70ms instead of ~325ms per slider
+# re-render and 8.9MB instead of 35.4MB — but it is *visible*: 384 happens to
+# land almost exactly on the processing resolution for default settings, so
+# the preview lost half its relief detail in each axis. On the client side
+# the full mesh costs only ~28ms to parse and ~50ms for normals (both now off
+# the main thread), so the detail was being traded for time nobody was
+# waiting on. Off by default; set AUTOFORGE_PREVIEW_MESH_MAX_DIM to trade
+# detail for latency at very large stl_output_size values.
+#
+# It only ever affects the *preview* mesh: the printable STL is generated
+# separately by OutputHelper.generate_stl at full resolution.
+_DEFAULT_MAX_GRID_DIM = 0
+
+
+def preview_mesh_max_dim() -> int:
+    """Grid cap for preview meshes, overridable with
+    ``AUTOFORGE_PREVIEW_MESH_MAX_DIM`` (0 or less disables decimation)."""
+    raw = os.environ.get("AUTOFORGE_PREVIEW_MESH_MAX_DIM")
+    if raw is None:
+        return _DEFAULT_MAX_GRID_DIM
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_MAX_GRID_DIM
+
+
+def downsample_grid_step(height: int, width: int, max_dim: int) -> int:
+    """Stride that brings ``max(height, width)`` to at most ``max_dim``.
+
+    Plain integer striding (rather than an interpolating resize) on purpose:
+    it keeps every sampled height and color an exact value from the real
+    solution, so the preview never shows a color that no layer actually has.
+    """
+    if max_dim <= 0:
+        return 1
+    return max(1, -(-max(height, width) // max_dim))
 
 
 def generate_colored_preview_mesh(
@@ -14,6 +59,7 @@ def generate_colored_preview_mesh(
     maximum_x_y_size: float,
     alpha_mask: Optional[np.ndarray] = None,
     background_color: Tuple[int, int, int] = (0, 0, 0),
+    max_grid_dim: Optional[int] = None,
 ) -> Trimesh:
     """Build a colored mesh from a height map + per-pixel RGB color image.
 
@@ -31,10 +77,32 @@ def generate_colored_preview_mesh(
         alpha_mask: Optional (H,W) bool/uint8 — True = valid. Pixels with
             alpha<128 are omitted.
         background_color: RGB tuple for bottom/side faces (0-255).
+        max_grid_dim: Longest grid side to build at; the inputs are strided
+            down to fit. Defaults to ``preview_mesh_max_dim()``; pass 0 to
+            build at full resolution.
 
     Returns:
         Trimesh with vertex_colors set.
     """
+    full_H, full_W = height_map.shape
+    step = downsample_grid_step(
+        full_H,
+        full_W,
+        preview_mesh_max_dim() if max_grid_dim is None else max_grid_dim,
+    )
+    rows = np.arange(full_H)
+    cols = np.arange(full_W)
+    if step > 1:
+        # The last row/column is kept as well as the strided ones, so the mesh
+        # still spans the full footprint instead of stopping short of the edge.
+        rows = np.unique(np.append(np.arange(0, full_H, step), full_H - 1))
+        cols = np.unique(np.append(np.arange(0, full_W, step), full_W - 1))
+        height_map = height_map[np.ix_(rows, cols)]
+        color_image = color_image[np.ix_(rows, cols)]
+        if alpha_mask is not None:
+            alpha = np.asarray(alpha_mask)
+            alpha_mask = alpha[np.ix_(rows, cols)] if alpha.ndim >= 2 else alpha
+
     H, W = height_map.shape
 
     valid_mask: np.ndarray = (
@@ -60,12 +128,16 @@ def generate_colored_preview_mesh(
     # both the top surface and the bottom surface. Side walls at the
     # silhouette boundary reuse these same indices — a boundary point's
     # "top" and "bottom" vertices are exactly the wall's top/bottom corners.
-    j, i = np.meshgrid(np.arange(W), np.arange(H))
-    x = j.astype(np.float32)
-    y = (H - 1 - i).astype(np.float32)
-    scale = maximum_x_y_size / max(W - 1, H - 1, 1)
-    x *= scale
-    y *= scale
+    # Positions come from the *original* pixel indices, not the strided ones:
+    # an evenly-strided grid with the final row/column appended has one
+    # narrower cell at each far edge, and numbering the samples 0..W-1 would
+    # stretch that cell to full width, skewing the footprint.
+    j, i = np.meshgrid(cols.astype(np.float32), rows.astype(np.float32))
+    x = j
+    y = (full_H - 1) - i
+    scale = maximum_x_y_size / max(full_W - 1, full_H - 1, 1)
+    x = x * scale
+    y = y * scale
 
     top_z = height_map.astype(np.float32) + background_height
     bottom_z = np.zeros_like(top_z)

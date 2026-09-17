@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import { test, expect } from '@playwright/test'
-import { byTestId, createFilament, openApp, resetBackend, setActive } from '../helpers'
+import { activeLibraryItem, byTestId, createFilament, openApp, resetBackend, setActive, showTab } from '../helpers'
 
 test.beforeEach(async ({ baseURL }) => {
   await resetBackend(baseURL!)
@@ -17,7 +17,7 @@ test.describe('Browsing', () => {
     const types: string[] = await (await request.get('/api/filaments/types')).json()
     for (const t of types) await expect(byTestId(page, `tab-${t}`)).toBeVisible()
 
-    await byTestId(page, 'tab-PLA').click()
+    await showTab(page, 'PLA')
     await expect(libraryItem(page, pla.uuid)).toBeVisible()
     await expect(libraryItem(page, petg.uuid)).toHaveCount(0)
 
@@ -74,14 +74,15 @@ test.describe('Active filaments', () => {
     await openApp(page)
 
     await byTestId(page, `toggle-filament-${f.uuid}`).click()
-    await expect(byTestId(page, `active-filament-${f.uuid}`)).toBeVisible()
+    await expect(activeLibraryItem(page, f.uuid)).toBeVisible()
     await expect.poll(async () => (await (await request.get('/api/filaments/active')).json()).map((x: any) => x.uuid)).toContain(f.uuid)
 
     await page.reload()
-    await expect(byTestId(page, `active-filament-${f.uuid}`)).toBeVisible()
+    await expect(activeLibraryItem(page, f.uuid)).toBeVisible()
+    await expect(byTestId(page, 'active-filaments-summary')).toHaveAttribute('data-count', '1')
 
-    await byTestId(page, `remove-filament-${f.uuid}`).click()
-    await expect(byTestId(page, `active-filament-${f.uuid}`)).toHaveCount(0)
+    await byTestId(page, `toggle-filament-${f.uuid}`).click()
+    await expect(activeLibraryItem(page, f.uuid)).toHaveCount(0)
     await expect.poll(async () => (await (await request.get('/api/filaments/active')).json()).length).toBe(0)
   })
 
@@ -94,7 +95,7 @@ test.describe('Active filaments', () => {
 test.describe('Creating filaments', () => {
   test('a new filament of another type switches to that tab so it is visible', async ({ page }) => {
     await openApp(page)
-    await byTestId(page, 'tab-PLA').click()
+    await showTab(page, 'PLA')
 
     await byTestId(page, 'new-filament-btn').click()
     await byTestId(page, 'new-filament-brand').fill('E2E Maker')
@@ -106,7 +107,7 @@ test.describe('Creating filaments', () => {
     await expect(byTestId(page, 'tab-label')).toContainText('PETG')
     await expect(page.locator('[data-testid="filament-list"]').getByText('E2E Silk Teal')).toBeVisible()
     // And the PLA tab doesn't suddenly contain it.
-    await byTestId(page, 'tab-PLA').click()
+    await showTab(page, 'PLA')
     await expect(page.locator('[data-testid="filament-list"]').getByText('E2E Silk Teal')).toHaveCount(0)
   })
 
@@ -152,15 +153,17 @@ test.describe('Editing filaments', () => {
     const petg = await createFilament(request, { filament_type: 'PETG', name: 'E2E Other Type' })
     await setActive(request, [pla])
     await openApp(page)
-    await byTestId(page, 'tab-PLA').click()
+    await showTab(page, 'PLA')
 
     await libraryItem(page, pla.uuid).dblclick()
     await byTestId(page, 'edit-filament-name').fill('E2E After')
-    await page.getByRole('button', { name: 'Save Changes' }).click()
+    await byTestId(page, 'save-filament-btn').click()
 
     await expect(byTestId(page, 'edit-filament-modal')).toHaveCount(0)
     await expect(libraryItem(page, pla.uuid)).toContainText('E2E After')
-    await expect(byTestId(page, `active-filament-${pla.uuid}`)).toContainText('E2E After')
+    await byTestId(page, 'active-only-toggle').click()
+    await expect(activeLibraryItem(page, pla.uuid)).toContainText('E2E After')
+    await byTestId(page, 'active-only-toggle').click()
     // Editing used to reload every type into the current tab.
     await expect(libraryItem(page, petg.uuid)).toHaveCount(0)
     const active = await (await request.get('/api/filaments/active')).json()
@@ -176,9 +179,9 @@ test.describe('Editing filaments', () => {
     await openApp(page)
     await expect(byTestId(page, 'td-input-0')).toHaveValue('2')
 
-    await byTestId(page, `active-filament-${f.uuid}`).dblclick()
+    await activeLibraryItem(page, f.uuid).dblclick()
     await byTestId(page, 'edit-filament-td').fill('4.5')
-    await page.getByRole('button', { name: 'Save Changes' }).click()
+    await byTestId(page, 'save-filament-btn').click()
 
     await expect(byTestId(page, 'td-input-0')).toHaveValue('4.5')
   })
@@ -195,7 +198,7 @@ test.describe('Editing filaments', () => {
     await byTestId(page, 'delete-filament-btn').click()
 
     await expect(libraryItem(page, f.uuid)).toHaveCount(0)
-    await expect(byTestId(page, `active-filament-${f.uuid}`)).toHaveCount(0)
+    await expect(byTestId(page, 'active-filaments-summary')).toHaveAttribute('data-count', '0')
     const all = await (await request.get('/api/filaments')).json()
     expect(all.some((x: any) => x.uuid === f.uuid)).toBe(false)
   })
@@ -229,7 +232,7 @@ test.describe('Import and export', () => {
     const file = testInfo.outputPath('replace.csv')
     fs.writeFileSync(file, csv(['E2E Import,PLA,#654321,E2E Replacement,1,False,']))
     await openApp(page)
-    await byTestId(page, 'tab-PLA').click()
+    await showTab(page, 'PLA')
     await byTestId(page, 'import-btn').click()
     await byTestId(page, 'file-input').setInputFiles(file)
 

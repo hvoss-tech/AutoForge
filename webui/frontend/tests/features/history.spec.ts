@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import { test, expect, type Page } from '@playwright/test'
-import { byTestId, createFilament, historyLabels, openApp, resetBackend, typeInto, waitForSnapshot } from '../helpers'
+import { activeLibraryItem, byTestId, createFilament, historyLabels, openApp, resetBackend, typeInto, waitForSnapshot } from '../helpers'
 
 test.beforeEach(async ({ baseURL }) => {
   await resetBackend(baseURL!)
@@ -15,8 +15,8 @@ async function makeSteps(page: Page, values = ['1', '2', '3']) {
   }
 }
 
-const undoBtn = (page: Page) => page.getByRole('button', { name: '↶ Undo' })
-const redoBtn = (page: Page) => page.getByRole('button', { name: '↷ Redo' })
+const undoBtn = (page: Page) => byTestId(page, 'undo-btn')
+const redoBtn = (page: Page) => byTestId(page, 'redo-btn')
 const td0 = (page: Page) => byTestId(page, 'td-input-0')
 
 test('Undo/Redo buttons step backwards and forwards in order', async ({ page }) => {
@@ -128,7 +128,7 @@ test('undo restores the active filament list on the server as well', async ({ pa
   await waitForSnapshot(page)
 
   await undoBtn(page).click()
-  await expect(byTestId(page, `active-filament-${b.uuid}`)).toHaveCount(0)
+  await expect(activeLibraryItem(page, b.uuid)).toHaveCount(0)
   await expect.poll(async () => (await (await request.get('/api/filaments/active')).json()).map((f: any) => f.uuid)).toEqual([a.uuid])
 })
 
@@ -139,7 +139,7 @@ test('an edit made right before reloading is not lost', async ({ page }) => {
   // No wait for the 500ms debounce.
   await page.reload()
   await expect(td0(page)).toHaveValue('6.5')
-  expect((await historyLabels(page)).at(-1)).toBe('▶Color slider edit')
+  expect((await historyLabels(page)).at(-1)).toBe('▶Changed TD of band 1 to 6.5')
 })
 
 test('undo is persisted: a reload shows the undone state', async ({ page }) => {
@@ -152,25 +152,54 @@ test('undo is persisted: a reload shows the undone state', async ({ page }) => {
   await expect(td0(page)).toHaveValue('2')
 })
 
-test('History panel: jump to a step, marker follows, Clear keeps the current state', async ({ page }) => {
+test('History drawer: jump to a step, marker follows, Clear keeps the current state', async ({ page }) => {
   await openApp(page)
   await makeSteps(page)
   await byTestId(page, 'history-open-btn').click()
+  await expect(byTestId(page, 'history-drawer')).toBeVisible()
   const entries = page.locator('[data-testid^="history-entry-"]')
   const count = await entries.count()
   await expect(entries.nth(count - 1)).toHaveAttribute('data-current', 'true')
+  // Labels say what changed (they used to all read "Color slider edit").
+  await expect(entries.nth(count - 1)).toContainText('Changed TD of band 1 to 3')
 
+  // The drawer stays open while jumping around.
   await entries.nth(count - 3).click()
   await expect(td0(page)).toHaveValue('1')
-  await byTestId(page, 'history-open-btn').click()
-  await expect(page.locator('[data-testid^="history-entry-"]').nth(count - 3)).toHaveAttribute('data-current', 'true')
+  await expect(entries.nth(count - 3)).toHaveAttribute('data-current', 'true')
+  // Newer steps remain listed (redo) until a new edit.
+  await expect(entries).toHaveCount(count)
 
-  page.once('dialog', (d) => d.accept())
   await byTestId(page, 'history-clear-btn').click()
+  await expect(byTestId(page, 'confirm-dialog')).toContainText('Clear history?')
+  await byTestId(page, 'confirm-ok').click()
   await expect(page.locator('[data-testid^="history-entry-"]')).toHaveCount(1)
   await expect(td0(page)).toHaveValue('1')
   await expect(undoBtn(page)).toBeDisabled()
   expect((await (await page.request.get('/api/state/history')).json()).length).toBe(1)
+
+  await page.keyboard.press('Escape')
+  await expect(byTestId(page, 'history-drawer')).toHaveCount(0)
+})
+
+test('undo and redo say what they did', async ({ page }) => {
+  await openApp(page)
+  await makeSteps(page, ['1', '2'])
+  await undoBtn(page).click()
+  await expect(byTestId(page, 'toast-info')).toHaveText('Undid: Changed TD of band 1 to 2')
+  await redoBtn(page).click()
+  await expect(byTestId(page, 'toast-info').last()).toHaveText('Redid: Changed TD of band 1 to 2')
+  await expect(undoBtn(page)).toHaveAttribute('title', 'Undo: Changed TD of band 1 to 2 (Ctrl+Z)')
+})
+
+test('adding several filaments quickly is one step naming all of them', async ({ page, request }) => {
+  const a = await createFilament(request, { name: 'E2E Multi A' })
+  const b = await createFilament(request, { name: 'E2E Multi B' })
+  await openApp(page)
+  await byTestId(page, `toggle-filament-${a.uuid}`).click()
+  await byTestId(page, `toggle-filament-${b.uuid}`).click()
+  await waitForSnapshot(page)
+  expect((await historyLabels(page)).at(-1)).toBe('▶Added E2E Multi A, E2E Multi B')
 })
 
 test.describe('Project files', () => {
@@ -191,7 +220,7 @@ test.describe('Project files', () => {
     expect(saved.activeFilaments.map((f: any) => f.uuid)).toEqual([a.uuid])
 
     // Change everything, then load the file back.
-    await byTestId(page, `remove-filament-${a.uuid}`).click()
+    await byTestId(page, `toggle-filament-${a.uuid}`).click()
     await byTestId(page, `toggle-filament-${b.uuid}`).click()
     await typeInto(page, 'td-input-0', '1')
     await typeInto(page, 'global-layer-height', '0.04')
@@ -201,8 +230,8 @@ test.describe('Project files', () => {
 
     await expect(td0(page)).toHaveValue('4.2')
     await expect(byTestId(page, 'global-layer-height')).toHaveValue('0.12')
-    await expect(byTestId(page, `active-filament-${a.uuid}`)).toBeVisible()
-    await expect(byTestId(page, `active-filament-${b.uuid}`)).toHaveCount(0)
+    await expect(activeLibraryItem(page, a.uuid)).toBeVisible()
+    await expect(activeLibraryItem(page, b.uuid)).toHaveCount(0)
     await expect.poll(async () => (await (await request.get('/api/filaments/active')).json()).map((f: any) => f.uuid)).toEqual([a.uuid])
   })
 
@@ -212,7 +241,7 @@ test.describe('Project files', () => {
     fs.writeFileSync(file, JSON.stringify({ version: 1, activeFilaments: [foreign] }))
     await openApp(page)
     await byTestId(page, 'file-menu-load-input').setInputFiles(file)
-    await expect(byTestId(page, 'active-filament-e2e-foreign-uuid')).toBeVisible()
+    await expect(activeLibraryItem(page, 'e2e-foreign-uuid')).toBeVisible()
     const library = await (await request.get('/api/filaments')).json()
     expect(library.some((f: any) => f.uuid === 'e2e-foreign-uuid')).toBe(true)
   })

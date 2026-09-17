@@ -62,13 +62,19 @@ def test_progress_callback_does_not_unpause(svc):
 
     # A progress callback firing while paused must NOT flip the job back to
     # "running" — that is what made the UI toggle back to the Pause button.
+    # Its payload is dropped too: the report describes work that finished
+    # before the pause, and applying it made a paused job look like it was
+    # still advancing (see test_a_paused_job_stops_advancing).
     svc.update_status("pg-001", "running", progress=42.0)
     job = svc.get_job("pg-001")
     assert job.status == "paused"
-    assert job.progress == 42.0
+    assert job.progress == 0.0
 
     svc.resume("pg-001")
     assert svc.get_job("pg-001").status == "running"
+    # Reports land again once it is actually running.
+    svc.update_status("pg-001", "running", progress=42.0)
+    assert svc.get_job("pg-001").progress == 42.0
 
 
 def test_cancel_event(svc):

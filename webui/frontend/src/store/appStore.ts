@@ -1,8 +1,20 @@
 import { create } from 'zustand'
 import type { Filament, ColorSliderConfig, OptimizationSettings, JobStatus, ProjectState, PruningSettings, InitState, Snapshot } from '../types'
 import { jobStatusFromControlResponse } from '../lib/jobControl'
-import { resolveRestoredJob } from '../lib/history'
+import {
+  acceptsPreviewUpdate,
+  describeSettingsChange,
+  describeSliderEdit,
+  mergeHistoryLabels,
+  resolveRestoredJob,
+  restoredImage,
+} from '../lib/history'
 import { describeApiError } from '../lib/apiError'
+import * as bandOps from '../lib/bandOps'
+import { readStoredRunInputs, storeRunInputs, type RunInputs } from '../lib/staleResult'
+import { appendLossPoint, type LossPoint } from '../lib/lossHistory'
+import type { PruningCounts } from '../lib/pruning'
+import { projectFileName, projectFingerprint, projectNameFromFile } from '../lib/project'
 
 // Module-level undo stack — NOT in Zustand store to avoid infinite loops via subscribe
 const UNDO_STACK: Snapshot[] = []
@@ -27,7 +39,47 @@ function snapshotToHistoryEntry(s: Snapshot): HistoryEntry {
 
 let pruningPollTimer: ReturnType<typeof setTimeout> | null = null
 
+// POST /api/init/run requests from this page still waiting for an answer.
+// While one is out, the server's init status describes the *previous* image
+// until the new init actually starts, so status polls must not act on it.
+let initRequestsInFlight = 0
+export function isInitRequestInFlight(): boolean {
+  return initRequestsInFlight > 0
+}
+
 export type ToastLevel = 'error' | 'warning' | 'info'
+
+export type InitOutcome = 'ready' | 'busy' | 'error'
+
+/** GET /api/sliders/base — see derive_base_from_result (helpers/sliders.py). */
+export interface ResolvedBase {
+  color: string
+  height_mm: number
+  layers: number
+  filament_uuid: string
+  auto: boolean
+}
+
+const TUTORIAL_SEEN_KEY = 'autoforge-tutorial-seen'
+
+export function hasSeenTutorial(): boolean {
+  return readStorage(TUTORIAL_SEEN_KEY) === '1'
+}
+
+export function markTutorialSeen(): void {
+  writeStorage(TUTORIAL_SEEN_KEY, '1')
+}
+
+export interface ConfirmRequest {
+  id: number
+  title: string
+  message: string
+  confirmLabel: string
+  danger?: boolean
+}
+
+let confirmResolver: ((ok: boolean) => void) | null = null
+let nextConfirmId = 1
 
 export interface Toast {
   id: number
@@ -46,6 +98,15 @@ let nextToastId = 1
 // clicked Run, for a run that may be from a completely unrelated session.
 export function shouldRestoreJobOnLoad(status: string): boolean {
   return status === 'running' || status === 'paused' || status === 'completed'
+}
+
+// Has this tab ever shown a job of its own? See acceptsPreviewUpdate().
+let hasTrackedJob = false
+export function markJobTracked(): void {
+  hasTrackedJob = true
+}
+export function acceptsPreviewFor(jobId: string | undefined, currentJobId: string | undefined): boolean {
+  return acceptsPreviewUpdate(jobId, currentJobId, hasTrackedJob)
 }
 
 async function refreshCurrentJob(jobId: string): Promise<void> {
@@ -82,18 +143,62 @@ export function durableInputImageUrl(inputImage: string | null, settings: Optimi
   return inputImage
 }
 
-// 10 columns before anything has been run — 4 pre-populated (so a first-time
-// user sees something to drag filaments onto) plus 6 empty slots to grow
-// into, rather than the full ~15-40 columns a real optimizer/pruner result
-// can produce. Once a job actually completes, `applySliders` replaces this
-// wholesale with however many bands the result really has.
-const defaultSliders: ColorSliderConfig[] = [
-  { td: 2.0, layer: 8, depth_mm: 0.32, filament_uuid: '', enabled: true },
-  { td: 3.0, layer: 13, depth_mm: 0.52, filament_uuid: '', enabled: true },
-  { td: 8.0, layer: 20, depth_mm: 0.8, filament_uuid: '', enabled: true },
-  { td: 5.0, layer: 27, depth_mm: 1.08, filament_uuid: '', enabled: true },
-  ...Array.from({ length: 6 }, () => ({ td: 5.0, layer: 0, depth_mm: 0.0, filament_uuid: '', enabled: false })),
-]
+
+function readStorage(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function writeStorage(key: string, value: string | null) {
+  try {
+    if (value === null) localStorage.removeItem(key)
+    else localStorage.setItem(key, value)
+  } catch {
+    // not remembered — fine
+  }
+}
+
+const PROJECT_NAME_KEY = 'autoforge-project-name'
+const SAVED_FINGERPRINT_KEY = 'autoforge-saved-project-fingerprint'
+const AUTO_SAVE_LIBRARY_KEY = 'autoforge-library-auto-save'
+
+/** Filament edits are written as you make them unless this was turned off.
+ * On by default: the library is a list of the filaments you own, not a
+ * document you compose — losing an edit by closing the dialog is never what
+ * anyone wanted. */
+export function readAutoSaveLibrary(): boolean {
+  return readStorage(AUTO_SAVE_LIBRARY_KEY) !== '0'
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+/** Fingerprint of everything a saved project file holds (see saveProjectToFile). */
+export function currentProjectFingerprint(state: Pick<AppState, 'projectName' | 'inputImage' | 'settings' | 'colorSliders' | 'activeFilaments'>): string {
+  return projectFingerprint({
+    name: state.projectName,
+    inputImage: durableInputImageUrl(state.inputImage, state.settings),
+    settings: state.settings,
+    colorSliders: state.colorSliders,
+    activeFilamentUuids: state.activeFilaments.map((f) => f.uuid),
+  })
+}
+
+// A fresh project starts without color layers. Four pre-positioned but
+// unassigned "Empty" columns used to suggest something was already set up;
+// the layers panel now explains how to get bands (run, or drag a filament).
+const defaultSliders: ColorSliderConfig[] = []
 
 const THEME_STORAGE_KEY = 'autoforge-theme'
 
@@ -121,7 +226,7 @@ function applyTheme(theme: 'dark' | 'light') {
 const initialTheme = readStoredTheme()
 applyTheme(initialTheme)
 
-const defaultSettings: OptimizationSettings = {
+export const defaultSettings: OptimizationSettings = {
   input_image: '',
   csv_file: '',
   json_file: '',
@@ -171,6 +276,12 @@ const defaultPruningSettings: PruningSettings = {
   pruning_max_colors: 100,
   pruning_max_swaps: 100,
   pruning_max_layer: 75,
+  auto_repeat: false,
+  max_passes: 25,
+  seed_search: true,
+  seed_search_count: 200,
+  fine_tune_height: true,
+  fine_tune_steps: 50,
 }
 
 interface AppState {
@@ -203,6 +314,38 @@ interface AppState {
   editingFilament: Filament | null
   theme: 'dark' | 'light'
   toasts: Toast[]
+  /** The user changed sliders by hand since the last optimizer/pruner stack
+   * arrived — a new run would replace those edits. */
+  slidersEditedByHand: boolean
+  confirmRequest: ConfirmRequest | null
+  historyOpen: boolean
+  bottomTab: 'layers' | 'plan'
+  imageView: 'original' | 'result' | 'split' | 'compare'
+  /** The band selected in the layer list / color core (a colorSliders index). */
+  selectedBand: number | null
+  /** The band under the pointer in either of them. */
+  hoveredBand: number | null
+  /** The image, layers and result were picked up from the previous session. */
+  sessionRestored: boolean
+  /** A restored image that already has its preview — no heightmap init needed. */
+  initSkipImage: string | null
+  /** Settings and active filaments each run started with, by job id. */
+  runInputsByJob: Record<string, RunInputs>
+  lossHistory: LossPoint[]
+  lossJobId: string | null
+  /** Result counts when the last pruning started, for a before/after summary. */
+  pruningBaseline: PruningCounts | null
+  projectName: string
+  /** Fingerprint of the project as last saved to a file (null: never saved). */
+  savedProjectFingerprint: string | null
+  /** The base/background slab as the pipeline actually built it — with
+   * `auto_background_color` on, the color used is picked from the active
+   * filaments by the backend, so settings alone can't describe it. */
+  resolvedBase: ResolvedBase | null
+  /** The tutorial overlay (first visit, or the ? button in the top bar). */
+  tutorialOpen: boolean
+  /** Write filament edits to the library as they're made. */
+  autoSaveLibrary: boolean
 
   setFilaments: (filaments: Filament[]) => void
   setFilamentTypes: (types: string[]) => void
@@ -210,7 +353,24 @@ interface AppState {
   setActiveFilaments: (filaments: Filament[]) => void
   addActiveFilament: (filament: Filament) => void
   removeActiveFilament: (uuid: string) => void
-  setSliders: (sliders: ColorSliderConfig[]) => void
+  setSliders: (sliders: ColorSliderConfig[], label?: string) => void
+  addBand: (filament?: Filament) => void
+  removeBand: (index: number) => void
+  requestConfirm: (request: Omit<ConfirmRequest, 'id'>) => Promise<boolean>
+  resolveConfirm: (ok: boolean) => void
+  setHistoryOpen: (open: boolean) => void
+  setBottomTab: (tab: 'layers' | 'plan') => void
+  setImageView: (view: 'original' | 'result' | 'split' | 'compare') => void
+  setSelectedBand: (index: number | null) => void
+  setHoveredBand: (index: number | null) => void
+  moveBand: (from: number, to: number) => void
+  insertBandAbove: (index: number) => boolean
+  sortBandsByLayer: () => void
+  restoreSessionImage: () => Promise<void>
+  dismissSessionRestored: () => void
+  startNewProject: () => void
+  setProjectName: (name: string) => void
+  saveProjectToFile: () => void
   applySliders: (sliders: ColorSliderConfig[], range?: { min: number; max: number }) => void
   updateSlider: (index: number, updates: Partial<ColorSliderConfig>) => void
   setSettings: (settings: OptimizationSettings) => void
@@ -246,11 +406,19 @@ interface AppState {
   pausePruning: (jobId: string) => Promise<void>
   resumePruning: (jobId: string) => Promise<void>
   cancelPruning: (jobId: string) => Promise<void>
-  runInit: () => Promise<void>
+  /** Builds the auto-preview. 'busy' means another init was already
+   * running, which is a benign race and worth retrying — unlike 'error'. */
+  runInit: () => Promise<InitOutcome>
   loadProjectState: () => Promise<void>
   loadActiveFilaments: () => Promise<void>
   loadCurrentJob: () => Promise<void>
-  loadProjectFromFile: (data: unknown) => Promise<void>
+  loadProjectFromFile: (data: unknown, fileName?: string) => Promise<void>
+  loadBaseColor: () => Promise<void>
+  setResolvedBase: (base: ResolvedBase | null) => void
+  setBaseFilament: (filament: Filament) => void
+  setTutorialOpen: (open: boolean) => void
+  setAutoSaveLibrary: (on: boolean) => void
+  applyUploadedImage: (filename: string, displayUrl: string) => Promise<void>
 
   // Undo/redo
   historyLength: number
@@ -296,6 +464,182 @@ export const useAppStore = create<AppState>((set, get) => ({
   historyIndex: -1,
   historyEntries: [],
   toasts: [],
+  slidersEditedByHand: false,
+  confirmRequest: null,
+  historyOpen: false,
+  bottomTab: 'layers',
+  imageView: 'original',
+  selectedBand: null,
+  hoveredBand: null,
+  sessionRestored: false,
+  initSkipImage: null,
+  runInputsByJob: readStoredRunInputs(),
+  lossHistory: [],
+  lossJobId: null,
+  pruningBaseline: null,
+  projectName: readStorage(PROJECT_NAME_KEY) ?? '',
+  savedProjectFingerprint: readStorage(SAVED_FINGERPRINT_KEY),
+  resolvedBase: null,
+  // First visit opens it by itself; after that it's the ? button's job.
+  tutorialOpen: !hasSeenTutorial(),
+  autoSaveLibrary: readAutoSaveLibrary(),
+
+  requestConfirm: (request) => {
+    // Only one at a time: a newer request cancels an unanswered older one.
+    confirmResolver?.(false)
+    return new Promise<boolean>((resolve) => {
+      confirmResolver = resolve
+      set({ confirmRequest: { ...request, id: nextConfirmId++ } })
+    })
+  },
+  resolveConfirm: (ok) => {
+    const resolve = confirmResolver
+    confirmResolver = null
+    set({ confirmRequest: null })
+    resolve?.(ok)
+  },
+  setHistoryOpen: (open) => set({ historyOpen: open }),
+  setBottomTab: (tab) => set({ bottomTab: tab }),
+  setImageView: (view) => set({ imageView: view }),
+  setSelectedBand: (index) => set({ selectedBand: index }),
+  setHoveredBand: (index) => set({ hoveredBand: index }),
+
+  moveBand: (from, to) => {
+    const { colorSliders, settings } = get()
+    const edit = bandOps.moveBand(colorSliders, from, to, settings.layer_height || 0.04)
+    set({ colorSliders: edit.sliders, slidersEditedByHand: true, selectedBand: edit.index, hoveredBand: null })
+    queueCaptureSnapshot(`Moved band ${from + 1} to position ${edit.index + 1}`)
+  },
+  insertBandAbove: (index) => {
+    const { colorSliders, settings, sliderLayerRange } = get()
+    const edit = bandOps.insertBandAbove(
+      colorSliders,
+      index,
+      { filament_uuid: '', td: 5 },
+      sliderLayerRange.max || settings.max_layers || 75,
+      settings.layer_height || 0.04,
+    )
+    if (!edit) return false
+    set({ colorSliders: edit.sliders, slidersEditedByHand: true, selectedBand: edit.index, hoveredBand: null })
+    queueCaptureSnapshot(`Inserted a band above band ${index + 1}`)
+    return true
+  },
+  sortBandsByLayer: () => {
+    const { colorSliders, selectedBand } = get()
+    const edit = bandOps.sortBandsByLayer(colorSliders, selectedBand ?? 0)
+    set({ colorSliders: edit.sliders, selectedBand: selectedBand === null ? null : edit.index, hoveredBand: null })
+    queueCaptureSnapshot('Sorted bands by layer')
+  },
+
+  restoreSessionImage: async () => {
+    const { settings, inputImage, currentJob } = get()
+    if (inputImage || !settings.input_image) return
+    const url = `/uploads/${settings.input_image}`
+    let exists = false
+    try {
+      exists = (await fetch(url, { method: 'HEAD' })).ok
+    } catch (_) {}
+    if (get().inputImage) return
+    if (!exists) {
+      // The uploaded file is gone (uploads folder cleared): start without it
+      // rather than pointing Run at a missing file.
+      set((state) => ({ settings: { ...state.settings, input_image: '' } }))
+      return
+    }
+    // A restored result, or a preview the server still holds, doesn't need
+    // the (slow, GPU) heightmap init again just because the page reloaded.
+    let skipInit = !!currentJob
+    if (!skipInit) {
+      try {
+        const status = await (await fetch('/api/init/status')).json()
+        skipInit = status.status === 'ready' || status.status === 'initializing'
+      } catch (_) {}
+    }
+    if (get().inputImage) return
+    set({ inputImage: url, sessionRestored: true, initSkipImage: skipInit ? url : null })
+  },
+  dismissSessionRestored: () => set({ sessionRestored: false }),
+  startNewProject: () => {
+    if (pruningPollTimer) clearTimeout(pruningPollTimer)
+    set((state) => ({
+      inputImage: null,
+      settings: { ...state.settings, input_image: '' },
+      colorSliders: [],
+      currentJob: null,
+      stlFile: null,
+      previewImage: null,
+      initState: { status: 'idle', preview_image: null },
+      initSkipImage: null,
+      hasRenderedInitPreview: false,
+      pruningJob: null,
+      pruningBaseline: null,
+      resolvedBase: null,
+      sessionRestored: false,
+      slidersEditedByHand: false,
+      selectedBand: null,
+      hoveredBand: null,
+      imageView: 'original',
+      lossHistory: [],
+      lossJobId: null,
+      projectName: '',
+      savedProjectFingerprint: null,
+    }))
+    writeStorage(PROJECT_NAME_KEY, null)
+    writeStorage(SAVED_FINGERPRINT_KEY, null)
+    // The server still holds the previous image's auto-preview (mesh file,
+    // "ready" status and its optimizer's GPU memory); without this the 3D
+    // panel would serve that mesh again the moment a new image is added.
+    fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
+    queueCaptureSnapshot('Started a new project')
+  },
+  setProjectName: (name) => {
+    set({ projectName: name })
+    writeStorage(PROJECT_NAME_KEY, name || null)
+  },
+  saveProjectToFile: () => {
+    flushPendingSnapshot()
+    const state = get()
+    const data = {
+      version: 1,
+      name: state.projectName,
+      savedAt: new Date().toISOString(),
+      colorSliders: state.colorSliders,
+      settings: state.settings,
+      activeFilaments: state.activeFilaments,
+      // A blob: URL only works in this tab; store the durable server path.
+      inputImage: durableInputImageUrl(state.inputImage, state.settings),
+    }
+    downloadBlob(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }), projectFileName(state.projectName))
+    const fingerprint = currentProjectFingerprint(state)
+    set({ savedProjectFingerprint: fingerprint })
+    writeStorage(SAVED_FINGERPRINT_KEY, fingerprint)
+  },
+
+  addBand: (filament) => {
+    set((state) => {
+      const top = Math.max(0, ...state.colorSliders.filter((c) => c.enabled).map((c) => c.layer))
+      const layer = Math.min(state.sliderLayerRange.max || 75, top + 5) || 5
+      const lh = state.settings.layer_height || 0.04
+      const band: ColorSliderConfig = {
+        td: filament?.td ?? 5,
+        layer,
+        depth_mm: parseFloat((layer * lh).toFixed(2)),
+        filament_uuid: filament?.uuid ?? '',
+        enabled: true,
+      }
+      // Reuse a disabled, never-positioned column before growing the list.
+      const free = state.colorSliders.findIndex((c) => !c.enabled && c.layer === 0)
+      const colorSliders = [...state.colorSliders]
+      if (free >= 0) colorSliders[free] = band
+      else colorSliders.push(band)
+      return { colorSliders, slidersEditedByHand: true, selectedBand: free >= 0 ? free : colorSliders.length - 1 }
+    })
+    queueCaptureSnapshot(filament ? `Added a band of ${filament.name}` : 'Added a band')
+  },
+  removeBand: (index) => {
+    set((state) => ({ colorSliders: state.colorSliders.filter((_, i) => i !== index), slidersEditedByHand: true, selectedBand: null, hoveredBand: null }))
+    queueCaptureSnapshot(`Removed band ${index + 1}`)
+  },
 
   pushToast: (message, level = 'error') => {
     const id = nextToastId++
@@ -314,7 +658,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setFilamentTypes: (types) => set({ filamentTypes: types }),
   setFilamentBrands: (brands) => set({ filamentBrands: brands }),
   setActiveFilaments: (filaments) => { set({ activeFilaments: filaments }); queueCaptureSnapshot('Active filaments changed') },
-  setSliders: (sliders) => { set({ colorSliders: sliders }); queueCaptureSnapshot('Color slider edit') },
+  setSliders: (sliders, label) => { set({ colorSliders: sliders, slidersEditedByHand: true }); queueCaptureSnapshot(label ?? 'Edited color layers') },
   applySliders: (sliders, range) => {
     set((state) => {
       // The optimizer/pruner can legitimately produce more or fewer bands
@@ -327,6 +671,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const merged = sliders.map((s, i) => ({ ...(state.colorSliders[i] ?? {}), ...s }))
       return {
         colorSliders: merged,
+        slidersEditedByHand: false,
         ...(range && Number.isFinite(range.min) && Number.isFinite(range.max)
           ? { sliderLayerRange: { min: range.min, max: range.max } }
           : {}),
@@ -354,9 +699,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       console.error('Failed to add active filament:', e)
       get().pushToast(`Failed to add "${filament.name}" to active filaments — it may not be saved on the server.`)
     }
-    queueCaptureSnapshot('Added filament')
+    queueCaptureSnapshot(`Added ${filament.name}`)
   },
   removeActiveFilament: async (uuid) => {
+    const removedName = get().activeFilaments.find((f) => f.uuid === uuid)?.name ?? 'filament'
     set((state) => ({
       activeFilaments: state.activeFilaments.filter((f) => f.uuid !== uuid),
     }))
@@ -366,7 +712,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       console.error('Failed to remove active filament:', e)
       get().pushToast('Failed to remove active filament on the server — it may reappear after a reload.')
     }
-    queueCaptureSnapshot('Removed filament')
+    queueCaptureSnapshot(`Removed ${removedName}`)
   },
 
   updateSlider: (index, updates) => {
@@ -378,18 +724,27 @@ export const useAppStore = create<AppState>((set, get) => ({
         const layer = updates.layer !== undefined ? updates.layer : newSliders[index].layer
         newSliders[index].depth_mm = parseFloat((layer * lh).toFixed(2))
       }
-      return { colorSliders: newSliders }
+      return { colorSliders: newSliders, slidersEditedByHand: true }
     })
-    queueCaptureSnapshot('Color slider edit')
+    const filamentName = updates.filament_uuid
+      ? [...get().activeFilaments, ...get().filaments].find((f) => f.uuid === updates.filament_uuid)?.name
+      : undefined
+    queueCaptureSnapshot(describeSliderEdit(index, updates, filamentName))
   },
 
   setSettings: (settings) => {
+    const before = get().settings
     set({ settings })
-    queueCaptureSnapshot('Settings changed')
+    queueCaptureSnapshot(describeSettingsChange(before as unknown as Record<string, unknown>, settings as unknown as Record<string, unknown>))
   },
   setCurrentJob: (job) => {
     const prevStatus = get().currentJob?.status
+    if (job) markJobTracked()
     set({ currentJob: job });
+    if (job && (job.status === 'running' || job.status === 'paused') && job.loss !== null && job.loss !== undefined) {
+      const { lossJobId, lossHistory } = get()
+      set({ lossHistory: appendLossPoint(lossJobId === job.job_id ? lossHistory : [], job.iteration, job.loss), lossJobId: job.job_id })
+    }
     // When the job completes, mark the STL as available for the 3D preview
     if (job && job.status === 'completed') {
       set({ stlFile: job.job_id })
@@ -398,6 +753,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     // a state you can return to); started/failed/cancelled change nothing
     // the user can restore.
     if (job && job.status === 'completed' && prevStatus !== 'completed') {
+      // The run is what resolves the base color (auto-selection happens
+      // inside the pipeline), so pick it up now that there's a result.
+      get().loadBaseColor()
       queueCaptureSnapshot('Optimization completed')
     }
   },
@@ -445,14 +803,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!response.ok) return
       const job: JobStatus = await response.json()
       if (!shouldRestoreJobOnLoad(job.status)) return
+      markJobTracked()
       set({ currentJob: job })
-      if (job.status === 'completed') set({ stlFile: job.job_id })
+      if (job.status === 'completed') {
+        set({ stlFile: job.job_id })
+        get().loadBaseColor()
+      }
     } catch {
       // No jobs yet, or backend unreachable — start with none
     }
   },
 
-  loadProjectFromFile: async (data) => {
+  loadProjectFromFile: async (data, fileName) => {
     if (!data || typeof data !== 'object') throw new Error('Invalid project file')
     const parsed = data as Partial<{
       colorSliders: ColorSliderConfig[]
@@ -500,11 +862,90 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (parsed.settings) get().setSettings({ ...state.settings, ...parsed.settings })
     if (Array.isArray(parsed.colorSliders)) get().setSliders(parsed.colorSliders)
     if (parsed.inputImage !== undefined) get().setInputImage(parsed.inputImage)
+    get().setProjectName(projectNameFromFile((data as { name?: unknown }).name, fileName ?? ''))
+    const fingerprint = currentProjectFingerprint(get())
+    set({ savedProjectFingerprint: fingerprint, sessionRestored: false, selectedBand: null })
+    writeStorage(SAVED_FINGERPRINT_KEY, fingerprint)
+  },
+
+  setResolvedBase: (base) => set({ resolvedBase: base }),
+
+  loadBaseColor: async () => {
+    try {
+      const response = await fetch('/api/sliders/base')
+      if (!response.ok) return
+      const data = await response.json()
+      if (data && data.base) set({ resolvedBase: data.base as ResolvedBase })
+    } catch (_) {
+      // The base row falls back to `settings.background_color`.
+    }
+  },
+
+  setBaseFilament: (filament) => {
+    // Picking the base by hand turns auto-selection off — otherwise the next
+    // run would quietly overwrite the choice with the closest match again.
+    const { settings, activeFilaments } = get()
+    if (!activeFilaments.some((f) => f.uuid === filament.uuid)) get().addActiveFilament(filament)
+    set({
+      resolvedBase: {
+        color: filament.color,
+        height_mm: settings.background_height,
+        layers: Math.round((settings.background_height || 0) / (settings.layer_height || 0.04)),
+        filament_uuid: filament.uuid,
+        auto: false,
+      },
+    })
+    get().setSettings({ ...settings, background_color: filament.color, auto_background_color: false })
+  },
+
+  setTutorialOpen: (open) => {
+    if (!open) markTutorialSeen()
+    set({ tutorialOpen: open })
+  },
+
+  setAutoSaveLibrary: (on) => {
+    writeStorage(AUTO_SAVE_LIBRARY_KEY, on ? '1' : '0')
+    set({ autoSaveLibrary: on })
+  },
+
+  applyUploadedImage: async (filename, displayUrl) => {
+    // A new photo invalidates everything derived from the old one. Leaving
+    // any of it in place is what made the 3D panel show the previous image:
+    // `stlFile`/`currentJob` kept the old result's mesh on screen, and the
+    // backend kept serving the old auto-preview mesh (its state was still
+    // "ready") until the new heightmap init finished.
+    if (pruningPollTimer) clearTimeout(pruningPollTimer)
+    // Before the store changes, not after: setting `inputImage` is what makes
+    // useAutoPreviewInit start the new heightmap init, and a reset landing
+    // after that had started would wipe the init it had just kicked off.
+    await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
+    const settings = { ...get().settings, input_image: filename }
+    set({
+      settings,
+      inputImage: displayUrl,
+      initState: { status: 'idle', preview_image: null },
+      initSkipImage: null,
+      hasRenderedInitPreview: false,
+      previewImage: null,
+      currentJob: null,
+      stlFile: null,
+      pruningJob: null,
+      pruningBaseline: null,
+      resolvedBase: null,
+      lossHistory: [],
+      lossJobId: null,
+      imageView: 'original',
+      sessionRestored: false,
+      selectedBand: null,
+      hoveredBand: null,
+    })
+    queueCaptureSnapshot('Input image changed')
   },
 
   runInit: async () => {
     const state = get()
     set({ initState: { status: 'initializing', preview_image: null } })
+    initRequestsInFlight += 1
     try {
       // /api/init/run used to take no body at all and read a settings
       // singleton the rest of the app never writes to (POST /api/optimize/
@@ -523,21 +964,26 @@ export const useAppStore = create<AppState>((set, get) => ({
         // ActiveFilamentsPanel's effect) — not worth alarming the user
         // about; anything else (including an OOM from heightmap init,
         // which runs real GPU work) is not.
-        if (!detail.includes('Already initializing')) {
-          get().pushToast(`Failed to prepare preview: ${detail}`)
-        }
-        return
+        if (detail.includes('Already initializing')) return 'busy'
+        get().pushToast(`Failed to prepare preview: ${detail}`)
+        return 'error'
       }
       const result = await response.json()
       set({ initState: { status: 'ready', preview_image: result.preview_image ?? null } })
       if (Number.isFinite(result.min_layer) && Number.isFinite(result.max_layer)) {
         set({ sliderLayerRange: { min: result.min_layer, max: result.max_layer } })
       }
+      // Which filament the pipeline chose for the base is only known here.
+      if (result.base) set({ resolvedBase: result.base as ResolvedBase })
       get().bumpPreviewVersion()
+      return 'ready'
     } catch (e) {
       console.error('[store] Failed to run init:', e)
       set({ initState: { status: 'idle', preview_image: null } })
       get().pushToast(`Failed to prepare preview: ${e instanceof Error ? e.message : String(e)}`)
+      return 'error'
+    } finally {
+      initRequestsInFlight -= 1
     }
   },
 
@@ -552,8 +998,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       throw new Error(describeApiError(await response.json().catch(() => null), response.status))
     }
     const data = await response.json()
+    markJobTracked()
     if (pruningPollTimer) clearTimeout(pruningPollTimer)
-    set({ currentJob: { ...data, total_iterations: data.total_iterations || 0, progress: 0, iteration: 0, loss: null, error: null, started_at: new Date().toISOString(), completed_at: null, preview_image: null }, stlFile: null, pruningJob: null })
+    const runInputsByJob = storeRunInputs(get().runInputsByJob, data.job_id, {
+      settings: { ...state.settings },
+      filamentUuids: state.activeFilaments.map((f) => f.uuid),
+    })
+    set({ runInputsByJob, lossHistory: [], lossJobId: data.job_id, pruningBaseline: null })
+    set({ currentJob: { ...data, total_iterations: data.total_iterations || 0, progress: 0, iteration: 0, loss: null, error: null, started_at: new Date().toISOString(), completed_at: null, preview_image: null, phase: 'Preparing' }, stlFile: null, pruningJob: null, previewImage: null, imageView: 'original' })
     return data.job_id
   },
 
@@ -626,7 +1078,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (res.ok) {
           const job = await res.json()
           set({ pruningJob: job })
-          if (job.status === 'completed') queueCaptureSnapshot('Pruning completed')
+          if (job.status === 'completed') {
+            get().loadBaseColor()
+            queueCaptureSnapshot('Pruning completed')
+          }
           if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') return
         }
       } catch {
@@ -674,13 +1129,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       // type exactly, including nested fields like depth_mm and
       // filament_uuid — so this can be applied directly.
       if (data.color_sliders && data.color_sliders.length > 0) set({ colorSliders: data.color_sliders })
-      // `settings` restores on every load so options survive a reload, but
-      // `input_image` is deliberately excluded: a fresh webui start should
-      // always show the "upload an image" prompt rather than silently
-      // resuming whatever image a previous session (possibly days old) last
-      // uploaded. The user has to explicitly upload (or load a saved
-      // project) before Run is enabled again.
-      if (data.settings) set({ settings: { ...data.settings, input_image: '' } })
+      // Settings restore including `input_image`; the image itself is shown
+      // again by restoreSessionImage() once the job is known. Blanking it
+      // here used to leave a half-restored page: the previous result, layers
+      // and "Done" on screen, but an empty image panel saying "Upload".
+      if (data.settings) set({ settings: data.settings })
     } catch {
       // Use defaults
     }
@@ -768,12 +1221,17 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   undo: () => runHistoryExclusive(async () => {
     flushPendingSnapshot()
-    if (UNDO_INDEX > 0) await applySnapshot(UNDO_INDEX - 1)
+    if (UNDO_INDEX <= 0) return
+    const undone = UNDO_STACK[UNDO_INDEX].label
+    await applySnapshot(UNDO_INDEX - 1)
+    get().pushToast(`Undid: ${undone}`, 'info')
   }),
 
   redo: () => runHistoryExclusive(async () => {
     flushPendingSnapshot()
-    if (UNDO_INDEX < UNDO_STACK.length - 1) await applySnapshot(UNDO_INDEX + 1)
+    if (UNDO_INDEX >= UNDO_STACK.length - 1) return
+    await applySnapshot(UNDO_INDEX + 1)
+    get().pushToast(`Redid: ${UNDO_STACK[UNDO_INDEX].label}`, 'info')
   }),
 }))
 // Debounced snapshot queue — safe from infinite loops because captureSnapshot
@@ -784,7 +1242,7 @@ let snapshotTimer: ReturnType<typeof setTimeout> | null = null
 let pendingLabel: string | undefined
 
 function queueCaptureSnapshot(label?: string) {
-  if (label) pendingLabel = label
+  if (label) pendingLabel = mergeHistoryLabels(pendingLabel, label)
   if (snapshotTimer) clearTimeout(snapshotTimer)
   snapshotTimer = setTimeout(() => {
     snapshotTimer = null
@@ -865,15 +1323,47 @@ async function applySnapshot(index: number) {
     jobUpdate = job?.status === 'completed' ? { currentJob: job, stlFile: job.job_id } : { currentJob: null, stlFile: null }
   }
 
+  // A step without an uploaded image (e.g. "Started a new project") has no
+  // image to show, whatever the snapshot's inputImage field says.
+  const { url: restoredImageUrl, changed: imageChanged } = restoredImage(target, {
+    inputImage: store.inputImage,
+    inputFile: store.settings.input_image,
+  })
+
+  // Landing on a different image means the server's auto-preview belongs to
+  // the wrong photo — and it is still marked "ready", so the status poll
+  // would hand the 3D panel the previous image's heightmap. Dropped before
+  // the store changes, because that is what starts the new init.
+  if (imageChanged) await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
+
   useAppStore.setState((prev) => ({
     activeFilaments: target.activeFilaments ?? prev.activeFilaments,
     colorSliders: target.colorSliders ?? prev.colorSliders,
     settings: target.settings ?? prev.settings,
-    inputImage: target.inputImage ?? prev.inputImage,
+    inputImage: restoredImageUrl,
     ...(target.sliderLayerRange ? { sliderLayerRange: target.sliderLayerRange } : {}),
     ...jobUpdate,
+    // Everything below is *derived from the image*, so stepping to a
+    // snapshot of a different one has to drop it. Keeping it is what made
+    // History show one project's picture with another's layers: the live
+    // preview PNG stayed on screen, and `initState: ready` kept the 3D panel
+    // pointed at /api/init/mesh — which still held the previous image's
+    // heightmap until a new init finished.
+    ...(imageChanged
+      ? {
+          previewImage: null,
+          initState: { status: 'idle' as const, preview_image: null },
+          initSkipImage: null,
+          hasRenderedInitPreview: false,
+          resolvedBase: null,
+          imageView: 'original' as const,
+        }
+      : {}),
+    selectedBand: null,
+    hoveredBand: null,
   }))
   useAppStore.getState().bumpPreviewVersion()
+  if (jobUpdate.currentJob) useAppStore.getState().loadBaseColor()
   persistProjectState(useAppStore.getState())
 }
 

@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { expect, type APIRequestContext, type Page } from '@playwright/test'
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
 import { cleanupTestFilaments, resetProjectState } from './reset-state'
 
 export const FIXTURE_IMAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'cat_128x72.png')
@@ -22,6 +22,15 @@ export const FAST_SETTINGS = {
 export async function resetBackend(baseURL: string) {
   await resetProjectState(baseURL)
   await cleanupTestFilaments(baseURL)
+  // The auto-preview's heightmap init with the default 16 rounds can take
+  // over a minute on the test image; one round keeps the suite fast and
+  // deterministic. (Default values themselves are covered in autoforge.spec.)
+  const state = await (await fetch(`${baseURL}/api/project/state`)).json()
+  await fetch(`${baseURL}/api/project/state`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...state, settings: { ...state.settings, num_init_rounds: 1 } }),
+  })
 }
 
 export interface TestFilament {
@@ -80,6 +89,23 @@ export async function presetSettings(request: APIRequestContext, overrides: Reco
 
 export const byTestId = (page: Page, id: string) => page.locator(`[data-testid="${id}"]`)
 
+/** Active filaments are the checked rows of the library (there's no separate
+ * Active Filaments list any more). */
+export const activeLibraryItems = (page: Page) => page.locator('[data-testid="filament-list"] [data-testid^="filament-"][data-active="true"]')
+export const activeLibraryItem = (page: Page, uuid: string) => page.locator(`[data-testid="filament-${uuid}"][data-active="true"]`)
+
+/** Picks a filament for a band through the swatch picker. */
+export async function pickFilament(page: Page, bandIndex: number, uuid: string) {
+  await byTestId(page, `filament-select-${bandIndex}`).click()
+  await byTestId(page, `filament-option-${uuid}`).click()
+}
+
+/** The type tabs only exist when the library has more than one type. */
+export async function showTab(page: Page, type: string) {
+  const tab = byTestId(page, `tab-${type}`)
+  if (await tab.count()) await tab.click()
+}
+
 /** Page loaded and the library populated. */
 export async function openApp(page: Page) {
   await page.goto('/')
@@ -92,8 +118,11 @@ export async function uploadImage(page: Page, file = FIXTURE_IMAGE) {
   await expect(byTestId(page, 'input-image')).toBeVisible()
 }
 
-/** Upload + wait for the auto-preview (heightmap init) to finish. */
+/** Upload + wait for the auto-preview (heightmap init) to finish. Even at
+ * num_init_rounds=1 that's real GPU work and can take ~30s under load, well
+ * past Playwright's default 30s per-test budget. */
 export async function uploadAndWaitForPreview(page: Page) {
+  test.setTimeout(120_000)
   await uploadImage(page)
   await expect(byTestId(page, 'init-three-d-view')).toBeVisible({ timeout: 60000 })
 }

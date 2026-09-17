@@ -1059,14 +1059,29 @@ class FilamentOptimizer:
         min_layers_allowed: int,
         max_layers_allowed: int,
         search_seed: bool = True,
+        seed_search_count: int = 200,
+        fine_tune_height: bool = True,
+        pre_fine_tune_height: bool = False,
+        fine_tune_steps: int = 50,
         fast_pruning: bool = False,
         fast_pruning_percent: float = 0.20,
         pruning_batch_size: int = 0,
         cancel_event: Optional[threading.Event] = None,
         pause_event: Optional[threading.Event] = None,
     ) -> bool:
-        """Run the pruning pipeline (color -> swap -> layer -> swap-position
-        -> spike removal).
+        """Run the pruning pipeline (optional seed search and height polish
+        -> color -> swap -> layer -> swap-position -> spike removal).
+
+        ``search_seed``/``seed_search_count`` look for a better *material*
+        discretization of the solution already found (the Gumbel draw is
+        seeded, so a different seed can read the same logits into a visibly
+        better set of per-layer colors). ``fine_tune_height``/
+        ``fine_tune_steps`` polish the per-cluster height offsets. Both run
+        before pruning, because every pruning phase is a greedy search scored
+        against the current solution — handing them a better starting point
+        improves everything downstream — and both are strictly
+        non-worsening: they keep their result only if the real discrete loss
+        went down (see ``rng_seed_search`` and ``polish_height_offsets``).
 
         ``cancel_event``/``pause_event`` are only checked *between* phases,
         not inside them — the phases themselves (prune_num_colors etc.) are
@@ -1090,6 +1105,12 @@ class FilamentOptimizer:
             _compute_loss_for_heightmap,
         )
 
+        # How many times this result has been pruned. Pruning is a greedy
+        # search, so running it again on the same limits keeps finding
+        # improvements — but a few steps are one-off trades that must not be
+        # repeated (see post_remove_spikes).
+        self._prune_runs = getattr(self, "_prune_runs", 0) + 1
+
         def _wait_if_paused() -> bool:
             """Blocks while paused. Returns True if cancelled (while paused
             or otherwise)."""
@@ -1100,18 +1121,54 @@ class FilamentOptimizer:
                     time.sleep(0.1)
             return cancel_event is not None and cancel_event.is_set()
 
-        if search_seed:
-            self.rng_seed_search(self.best_discrete_loss, 200, autoset_seed=True)
+        _guarded = self._run_non_worsening
+        _measure = self.solution_loss
+        _current_counts = self.solution_counts
 
-        # Post-pruning spike cleanup
-        # if getattr(self.args, "spike_removal", False):
-        #    self.post_remove_spikes()
-
-        # Calculate and Print current loss
+        # Measure where we actually stand *before* anything else. This is
+        # also what the seed search compares against: it used to be handed
+        # `self.best_discrete_loss`, which was measured during training at the
+        # *processing* resolution, while everything here scores at the full
+        # output resolution — so "never regress below start_loss" was
+        # comparing against a number from a different image size.
         dg, dh = self.get_discretized_solution(best=True)
-        if dh is not None:
-            current_loss = _compute_loss_for_heightmap(self, dg)
+        current_loss = (
+            _compute_loss_for_heightmap(self, dg) if dh is not None else None
+        )
+        if current_loss is not None:
             print(f"Pre-prune discrete loss: {current_loss:.4f}")
+
+        if search_seed and current_loss is not None:
+            self._current_prune_phase = "Searching color seeds"
+            _guarded(
+                "Seed search",
+                lambda: self.rng_seed_search(
+                    current_loss,
+                    seed_search_count,
+                    autoset_seed=True,
+                    progress_callback=self._prune_phase_progress,
+                ),
+                forced=False,
+            )
+            seed_loss = _measure()
+            if seed_loss is not None and seed_loss < current_loss:
+                print(f"Seed search: loss {current_loss:.4f} -> {seed_loss:.4f}")
+                current_loss = seed_loss
+            else:
+                print("Seed search: no better seed found; keeping the current one")
+
+        if _wait_if_paused():
+            return False
+
+        # Off by default because the CLI already runs its own (longer)
+        # fine-tune before calling this; the webui turns it on, which is what
+        # export_results used to do unconditionally.
+        if pre_fine_tune_height and fine_tune_height:
+            self._current_prune_phase = "Fine-tuning height"
+            self.polish_height_offsets(
+                num_steps=fine_tune_steps,
+                progress_callback=self._prune_phase_progress,
+            )
 
         # clear pytorch and system cache to reduce vram usage
         empty_cache(self.device)
@@ -1142,68 +1199,99 @@ class FilamentOptimizer:
             return False
 
         self._current_prune_phase = "Reducing colors"
-        prune_num_colors(
-            self,
-            max_colors_allowed,
-            self.vis_tau,
-            None,
-            fast=fast_pruning,
-            chunking_percent=fast_pruning_percent,
-            pruning_batch_size=pruning_batch_size,
-            preview_callback=_prune_callback,
+        _guarded(
+            "Reducing colors",
+            lambda: prune_num_colors(
+                self,
+                max_colors_allowed,
+                self.vis_tau,
+                None,
+                fast=fast_pruning,
+                chunking_percent=fast_pruning_percent,
+                pruning_batch_size=pruning_batch_size,
+                preview_callback=_prune_callback,
+            ),
+            forced=_current_counts()[0] > max_colors_allowed,
         )
 
         if _wait_if_paused():
             return False
 
         self._current_prune_phase = "Reducing swaps"
-        prune_num_swaps(
-            self,
-            max_swaps_allowed,
-            self.vis_tau,
-            None,
-            fast=fast_pruning,
-            chunking_percent=fast_pruning_percent,
-            pruning_batch_size=pruning_batch_size,
-            preview_callback=_prune_callback,
+        _guarded(
+            "Reducing swaps",
+            lambda: prune_num_swaps(
+                self,
+                max_swaps_allowed,
+                self.vis_tau,
+                None,
+                fast=fast_pruning,
+                chunking_percent=fast_pruning_percent,
+                pruning_batch_size=pruning_batch_size,
+                preview_callback=_prune_callback,
+            ),
+            forced=_current_counts()[1] > max_swaps_allowed,
         )
 
         if _wait_if_paused():
             return False
 
         self._current_prune_phase = "Reducing layers"
-        prune_redundant_layers(
-            self,
-            None,
-            min_layers_allowed,
-            max_layers_allowed,
-            fast=fast_pruning,
-            chunking_percent=fast_pruning_percent,
-            preview_callback=_prune_callback,
+        _guarded(
+            "Reducing layers",
+            lambda: prune_redundant_layers(
+                self,
+                None,
+                min_layers_allowed,
+                max_layers_allowed,
+                fast=fast_pruning,
+                chunking_percent=fast_pruning_percent,
+                preview_callback=_prune_callback,
+            ),
+            forced=int(self.max_layers) > max_layers_allowed,
         )
 
         if _wait_if_paused():
             return False
 
         self._current_prune_phase = "Optimising swap positions"
-        optimise_swap_positions(
-            self,
-            preview_callback=_prune_callback,
+        # Never forced: this phase only moves swap boundaries around, it never
+        # removes one, so there is no limit it could be catching up with.
+        _guarded(
+            "Optimising swap positions",
+            lambda: optimise_swap_positions(
+                self,
+                preview_callback=_prune_callback,
+            ),
+            forced=False,
         )
 
         if _wait_if_paused():
             return False
 
-        self._current_prune_phase = "Fine-tuning height"
-        self.fine_tune_height_offsets(num_steps=50)
-        _prune_callback(self, 95)
+        # A second height polish, now that the layer stack has been reduced —
+        # the offsets that were best for 75 layers are rarely best for 20.
+        # Spikes are cleaned up by post_remove_spikes just below, which is
+        # the ordering polish_height_offsets applies for the pre-pruning
+        # pass; here it already falls out of the phase order.
+        if fine_tune_height:
+            self._current_prune_phase = "Fine-tuning height"
+            self.fine_tune_height_offsets(
+                num_steps=fine_tune_steps,
+                progress_callback=self._prune_phase_progress,
+            )
+            _prune_callback(self, 95)
 
         if _wait_if_paused():
             return False
 
         if getattr(self.args, "spike_removal", False):
             self._current_prune_phase = "Removing spikes"
-            self.post_remove_spikes()
+            # Only the first prune of this result may trade accuracy for
+            # printability; see post_remove_spikes. Without this, pruning the
+            # same result again re-applied that trade every time, which is
+            # what made repeated pruning visibly worse instead of better.
+            self.post_remove_spikes(allow_regression=self._prune_runs <= 1)
         self._current_prune_phase = None
         # Calculate and Print current loss
         dg, dh = self.get_discretized_solution(best=True)
@@ -1212,7 +1300,200 @@ class FilamentOptimizer:
             print(f"Post-prune discrete loss: {current_loss:.4f}")
         return True
 
-    def post_remove_spikes(self):
+    # Making "a phase never makes the result worse" actually true.
+    #
+    # Every pruning phase already refuses candidates that don't improve — but
+    # each scores with its own fast path (`get_best_discretized_image` with
+    # custom logits, `composite_image_disc` with a shared thickness prefix,
+    # ...), and those don't agree to the last decimal with
+    # `_compute_loss_for_heightmap`, which is what the result is finally judged
+    # by. A phase could therefore accept a change its own metric called an
+    # improvement while the real one got slightly worse — measured on a repeat
+    # prune with every limit already satisfied: `prune_num_swaps` 71.60 ->
+    # 72.66, `optimise_swap_positions` 71.98 -> 72.07.
+    #
+    # Rather than rewriting every tuned inner loop to share one scorer, each
+    # phase runs as a transaction against the real metric and is rolled back if
+    # it comes out worse. A phase that is *required* to reduce something the
+    # solution still exceeds is exempt — trading accuracy for a printable
+    # colour/swap/layer count is precisely its job — so this only ever protects
+    # against reductions nobody asked for.
+    PHASE_LOSS_EPS = 1e-6
+
+    def solution_loss(self) -> Optional[float]:
+        """The discrete loss of the current best solution, by the same measure
+        the finished result is reported with. None if there's no solution."""
+        from autoforge.Helper.PruningHelper import _compute_loss_for_heightmap
+
+        disc_global, disc_height = self.get_discretized_solution(best=True)
+        if disc_global is None or disc_height is None:
+            return None
+        return _compute_loss_for_heightmap(self, disc_global)
+
+    def solution_counts(self) -> tuple[int, int, int]:
+        """``(colors, swaps, layers)`` of the current solution, in the same
+        terms the pruning limits are expressed in."""
+        from autoforge.Helper.PruningHelper import find_color_bands
+
+        disc_global, _disc_height = self.get_discretized_solution(best=True)
+        if disc_global is None:
+            return (0, 0, int(self.max_layers))
+        return (
+            int(torch.unique(disc_global).numel()),
+            max(0, len(find_color_bands(disc_global)) - 1),
+            int(self.max_layers),
+        )
+
+    def solution_snapshot(self) -> dict:
+        """Everything a pruning phase can change, cloned."""
+        return {
+            "best_params": {
+                k: (v.detach().clone() if isinstance(v, torch.Tensor) else v)
+                for k, v in self.best_params.items()
+            },
+            "pixel_height_logits": self.pixel_height_logits,
+            "max_layers": self.max_layers,
+            "best_seed": self.best_seed,
+        }
+
+    def restore_solution_snapshot(self, snapshot: dict) -> None:
+        # prune_redundant_layers replaces best_params wholesale and moves
+        # max_layers with it, so the two have to go back together or
+        # global_logits no longer matches the layer count.
+        self.best_params = snapshot["best_params"]
+        self.pixel_height_logits = snapshot["pixel_height_logits"]
+        self.max_layers = snapshot["max_layers"]
+        self.best_seed = snapshot["best_seed"]
+
+    def _run_non_worsening(self, name: str, run, *, forced: bool) -> bool:
+        """Run a pruning phase, rolling it back if it made things worse.
+
+        ``forced`` marks a phase that still has a limit to meet, where a loss
+        increase is the intended trade. Returns True if the phase's work was
+        kept.
+        """
+        if forced:
+            run()
+            return True
+        before = self.solution_loss()
+        if before is None:
+            run()
+            return True
+        snapshot = self.solution_snapshot()
+        run()
+        after = self.solution_loss()
+        if after is not None and after > before + self.PHASE_LOSS_EPS:
+            self.restore_solution_snapshot(snapshot)
+            print(
+                f"{name}: loss {before:.4f} -> {after:.4f} | "
+                f"reverted (nothing was over its limit, so this phase had to improve or hold)"
+            )
+            return False
+        return True
+
+    def _prune_phase_progress(self, percent: float, loss: Optional[float] = None) -> None:
+        """Report progress *within* the current pruning phase, as a plain
+        0-100 fraction of that phase's own work, plus the best loss it has
+        reached so far.
+
+        The pruning phases that predate this report a stage-relative,
+        non-monotonic number instead (see ``prune``'s ``_prune_callback`` and
+        the webui's mapping of it), which is why the pre-pruning searches get
+        their own straightforward channel. They also need the loss: neither
+        changes the color/swap/layer counts at all, so the loss is the only
+        place their progress is visible.
+        """
+        callback = self.preview_callback
+        if callback is None:
+            return
+        phase = getattr(self, "_current_prune_phase", None)
+        for kwargs in ({"phase": phase, "loss": loss}, {"phase": phase}, {}):
+            try:
+                callback(self, float(percent), **kwargs)
+                return
+            except TypeError:
+                # Older callbacks accept fewer keywords; fall back in turn.
+                continue
+            except Exception:
+                return
+
+    def polish_height_offsets(
+        self, num_steps: int = 50, progress_callback=None
+    ) -> bool:
+        """Fine-tune the height offsets, then clean up the spikes that move
+        may have introduced, and keep the pair only if the result is better.
+
+        ``fine_tune_height_offsets`` already reverts when it doesn't improve,
+        but on its own that isn't enough here: it optimizes the *height map*,
+        and a lower loss can still come with fresh single-pixel towers that
+        print badly. Spike removal is therefore run immediately afterwards and
+        the two are judged together — if the combined result is worse than
+        where we started, both are rolled back.
+
+        Returns True if the polished height was kept.
+        """
+        from autoforge.Helper.PruningHelper import _compute_loss_for_heightmap
+
+        dg_before, dh_before = self.get_discretized_solution(best=True)
+        if dh_before is None:
+            return False
+        pre_loss = _compute_loss_for_heightmap(self, dg_before)
+
+        snapshot = {
+            "height_offsets": self.best_params["height_offsets"].detach().clone(),
+            "pixel_height_logits": self.best_params["pixel_height_logits"].detach().clone(),
+        }
+        live_logits = self.pixel_height_logits
+        # fine_tune_height_offsets writes this when it improves; a revert has
+        # to put it back, or later code that compares against it (the CLI's
+        # no-pruning rng_seed_search) is measuring a solution we discarded.
+        best_discrete_loss = self.best_discrete_loss
+
+        improved = self.fine_tune_height_offsets(
+            num_steps=num_steps, progress_callback=progress_callback
+        )
+        if improved and getattr(self.args, "spike_removal", False):
+            # allow_regression=True on purpose: this spike pass is not judged
+            # on its own, the combined result below is what decides.
+            self.post_remove_spikes(allow_regression=True)
+
+        dg_after, dh_after = self.get_discretized_solution(best=True)
+        post_loss = (
+            _compute_loss_for_heightmap(self, dg_after) if dh_after is not None else float("inf")
+        )
+        kept = post_loss <= pre_loss
+        if not kept:
+            self.best_params["height_offsets"] = snapshot["height_offsets"]
+            self.best_params["pixel_height_logits"] = snapshot["pixel_height_logits"]
+            self.pixel_height_logits = live_logits
+            self.best_discrete_loss = best_discrete_loss
+        print(
+            f"Height polish: loss {pre_loss:.4f} -> {post_loss:.4f} | "
+            f"{'kept' if kept else 'reverted (no improvement once spikes were cleaned up)'}"
+        )
+        return kept
+
+    def post_remove_spikes(self, allow_regression: bool = True):
+        """Smooth isolated tall pixels out of the final height map.
+
+        Spike removal is about *printability*, not accuracy: single-pixel
+        towers print badly however good they look in the loss. So the first
+        pass is allowed to cost a little quality — that is the whole point of
+        it — and ``allow_regression=True`` (the default, and what the CLI
+        uses) keeps that behaviour.
+
+        Repeat passes are a different matter. Pruning the same result again
+        re-ran this unconditionally, and on a detailed image it reliably
+        *raises* the loss (1015.32 -> 1016.01 on the benchmark image, every
+        single run), so each extra pass paid the same accuracy cost again
+        while the spikes it removes were already gone. With
+        ``allow_regression=False`` the cleaned map is kept only if it does not
+        make the result worse, which is what lets repeated pruning converge
+        instead of drifting downwards. Mirrors ``fine_tune_height_offsets``,
+        which has always reverted on no improvement.
+
+        Returns True if the cleaned height map was kept.
+        """
         from autoforge.Helper.PruningHelper import (
             remove_height_spikes,
             _compute_loss_for_heightmap,
@@ -1220,6 +1501,8 @@ class FilamentOptimizer:
 
         dg_post, dh_post = self.get_discretized_solution(best=True)
         if dh_post is not None:
+            original_logits = self.best_params["pixel_height_logits"]
+            original_self_logits = self.pixel_height_logits
             pre_loss = _compute_loss_for_heightmap(self, dg_post)
 
             # Work on continuous height map to avoid discretization and numpy round-trips.
@@ -1245,8 +1528,22 @@ class FilamentOptimizer:
             self.pixel_height_logits = cleaned_logits.to(self.device)
             dg_post, dh_post = self.get_discretized_solution(best=True)
             post_loss = _compute_loss_for_heightmap(self, dg_post)
+            kept = allow_regression or post_loss <= pre_loss
+            if not kept:
+                self.best_params["pixel_height_logits"] = original_logits
+                self.pixel_height_logits = original_self_logits
+            note = (
+                # Either the first prune of this result, or a step that is
+                # judged together with what follows it (polish_height_offsets).
+                "kept despite the higher loss — spikes are a printability problem, not a loss problem"
+                if kept and allow_regression and post_loss > pre_loss
+                else "kept"
+                if kept
+                else "reverted (a repeat pass must not make the result worse)"
+            )
             print(
-                f"Spike removal: loss {pre_loss:.4f} -> {post_loss:.4f} | spikes fixed {spikes}"
+                f"Spike removal: loss {pre_loss:.4f} -> {post_loss:.4f} | "
+                f"spikes fixed {spikes} | {note}"
             )
             try:
                 with open(
@@ -1254,13 +1551,17 @@ class FilamentOptimizer:
                     "a",
                 ) as f:
                     f.write(
-                        f"post_prune,threshold_layers={self.args.spike_threshold_layers},spikes={spikes},loss_before={pre_loss:.6f},loss_after={post_loss:.6f}\n"
+                        f"post_prune,threshold_layers={self.args.spike_threshold_layers},"
+                        f"spikes={spikes},loss_before={pre_loss:.6f},loss_after={post_loss:.6f},"
+                        f"kept={int(kept)}\n"
                     )
             except Exception:
                 pass
+            return kept
+        return False
 
     def fine_tune_height_offsets(
-        self, num_steps: int = 50, lr: float = 0.007
+        self, num_steps: int = 50, lr: float = 0.007, progress_callback=None
     ) -> bool:
         """
         Post-hoc refinement of ``height_offsets`` with the material
@@ -1308,7 +1609,9 @@ class FilamentOptimizer:
             ft_offsets = orig_offsets.clone().requires_grad_(True)
             ft_optimizer = CAdamW([ft_offsets], lr=lr)
             tbar = tqdm(range(num_steps), desc="Fine-tuning height", leave=True)
-            for _ in tbar:
+            for step_idx in tbar:
+                if progress_callback is not None:
+                    progress_callback(100.0 * step_idx / max(num_steps, 1), best_loss)
                 ft_optimizer.zero_grad()
 
                 effective_logits = self._apply_height_offset(pixel_logits, ft_offsets)
@@ -1417,18 +1720,33 @@ class FilamentOptimizer:
                 self.best_step = self.num_steps_done
 
     def rng_seed_search(
-        self, start_loss: float, num_seeds: int, autoset_seed: bool = False
+        self,
+        start_loss: float,
+        num_seeds: int,
+        autoset_seed: bool = False,
+        progress_callback=None,
     ):
         """
         Search for the best seed for the best discrete solution.
 
+        The material assignment is read out of the logits with a *seeded*
+        Gumbel draw, so a different seed can turn the same solution into a
+        visibly better set of per-layer colors at no cost to anything else.
+        The winner is re-scored through the exact composite path before being
+        accepted, so this can only ever improve on ``start_loss``.
+
         Args:
-            start_loss (float): Initial loss value.
+            start_loss (float): Loss to beat. Pass a freshly measured
+                full-resolution discrete loss — a number from a different
+                resolution makes the "never regress" check meaningless.
             num_seeds (int): Number of seeds to search.
             autoset_seed (bool, optional): Whether to automatically set the seed. Defaults to False.
+            progress_callback (callable, optional): Called with 0-100 as the
+                search works through the seeds.
 
         Returns:
-            int: Best seed found.
+            tuple[int | None, float]: Best seed found (None if none beat
+            ``start_loss``) and its loss.
         """
         # Only the material-selection RNG seed varies across candidates here
         # - the height map (best_params["pixel_height_logits"]/"height_offsets")
@@ -1456,6 +1774,8 @@ class FilamentOptimizer:
             shared_eff = _make_shared_eff_thick(self)
             tbar = tqdm(range(0, num_seeds, seed_batch_size), desc="Searching for new best seed")
             for batch_start in tbar:
+                if progress_callback is not None:
+                    progress_callback(100.0 * batch_start / max(num_seeds, 1), best_loss)
                 batch_seeds = all_seeds[batch_start : batch_start + seed_batch_size]
                 seeds_t = torch.as_tensor(batch_seeds, device=global_logits.device, dtype=torch.int64)
                 cols_b, tds_b = _material_select_batched_seeds(

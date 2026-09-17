@@ -1,7 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { Minus, Plus } from 'lucide-react'
 import { useAppStore } from '../store/appStore'
 import type { Filament } from '../types'
 import { filterActiveHandles } from '../lib/colorStack'
+import { getPlanBands } from '../lib/printPlan'
 
 interface HandleData {
   storeIndex: number
@@ -32,6 +35,19 @@ function lerpColor(c1: string, c2: string, t: number): string {
   return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`
 }
 
+/** Black or white, whichever reads better on this background (the label
+ * was always white, unreadable on beige/white filaments). */
+function readableTextColor(hex: string): string {
+  const n = parseInt(hex.replace('#', ''), 16)
+  if (Number.isNaN(n)) return '#ffffff'
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255
+  return 0.299 * r + 0.587 * g + 0.114 * b > 150 ? '#111111' : '#ffffff'
+}
+
+const MIN_LABEL_SPACING = 16
+const MIN_ZOOM = 1
+const MAX_ZOOM = 8
+
 function hexColorsEqual(c1: string, c2: string): boolean {
   return c1.toLowerCase() === c2.toLowerCase()
 }
@@ -42,23 +58,50 @@ export const ColorCore: React.FC = () => {
   const filaments = useAppStore((s) => s.filaments)
   const updateSlider = useAppStore((s) => s.updateSlider)
   const addActiveFilament = useAppStore((s) => s.addActiveFilament)
+  const activeFilaments = useAppStore((s) => s.activeFilaments)
+  const settings = useAppStore((s) => s.settings)
+  const selectedBand = useAppStore((s) => s.selectedBand)
+  const hoveredBand = useAppStore((s) => s.hoveredBand)
+  const setSelectedBand = useAppStore((s) => s.setSelectedBand)
+  const setHoveredBand = useAppStore((s) => s.setHoveredBand)
+  const setBottomTab = useAppStore((s) => s.setBottomTab)
+  // The scrolling viewport (data-testid="color-core"); `contentRef` is the
+  // stack inside it, taller than the viewport when zoomed in.
   const containerRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
+  const handleRefs = useRef(new Map<number, HTMLDivElement>())
   const [focusedHandle, setFocusedHandle] = useState<number | null>(null)
   const [draggingHandle, setDraggingHandle] = useState<number | null>(null)
-  const [containerHeight, setContainerHeight] = useState(300)
+  const [hoveredHandle, setHoveredHandle] = useState<number | null>(null)
+  const [viewportHeight, setViewportHeight] = useState(300)
+  const [zoom, setZoom] = useState(1)
+  const containerHeight = viewportHeight * zoom
 
   useEffect(() => {
     if (!containerRef.current) return
     const updateHeight = () => {
       if (containerRef.current) {
-        setContainerHeight(containerRef.current.clientHeight)
+        setViewportHeight(containerRef.current.clientHeight)
       }
     }
     updateHeight()
     const observer = new ResizeObserver(updateHeight)
     observer.observe(containerRef.current)
     return () => observer.disconnect()
+  }, [])
+
+  // Ctrl+wheel zooms the column (plain wheel scrolls it once zoomed in).
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return
+      e.preventDefault()
+      setZoom((z) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, e.deltaY < 0 ? z * 1.25 : z / 1.25)))
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
   }, [])
 
   const getFilamentColor = useCallback(
@@ -181,22 +224,73 @@ export const ColorCore: React.FC = () => {
     [handles, containerHeight],
   )
 
+  /** Pointing at a handle selects its band everywhere (row, strip, 3D). */
+  const selectHandle = useCallback(
+    (handleIndex: number) => {
+      setFocusedHandle(handleIndex)
+      const handle = handles[handleIndex]
+      if (handle) {
+        setSelectedBand(handle.storeIndex)
+        setBottomTab('layers')
+      }
+    },
+    [handles, setSelectedBand, setBottomTab],
+  )
+
   const handleMouseDown = useCallback(
     (handleIndex: number) => (e: React.MouseEvent) => {
       e.preventDefault()
-      setFocusedHandle(handleIndex)
+      handleRefs.current.get(handleIndex)?.focus({ preventScroll: true })
+      selectHandle(handleIndex)
       setDraggingHandle(handleIndex)
     },
-    [],
+    [selectHandle],
   )
 
   const handleTouchStart = useCallback(
-    (handleIndex: number) => (e: React.TouchEvent) => {
-      setFocusedHandle(handleIndex)
+    (handleIndex: number) => () => {
+      selectHandle(handleIndex)
       setDraggingHandle(handleIndex)
     },
-    [],
+    [selectHandle],
   )
+
+  /** Arrow keys move a handle one layer (Shift: five), within the same
+   * bounds as dragging it. */
+  const handleKeyDown = useCallback(
+    (handleIndex: number) => (e: React.KeyboardEvent) => {
+      const step = e.key === 'ArrowUp' ? 1 : e.key === 'ArrowDown' ? -1 : e.key === 'PageUp' ? 5 : e.key === 'PageDown' ? -5 : 0
+      if (!step) return
+      e.preventDefault()
+      const handle = handles[handleIndex]
+      if (!handle) return
+      const min = handleIndex > 0 ? handles[handleIndex - 1].value : 1
+      const max = handleIndex < handles.length - 1 ? handles[handleIndex + 1].value : sliderLayerRange.max
+      const next = Math.max(min, Math.min(max, handle.value + step * (e.shiftKey ? 5 : 1)))
+      if (next !== handle.value) updateSlider(handle.storeIndex, { layer: next })
+    },
+    [handles, sliderLayerRange.max, updateSlider],
+  )
+
+  // Tooltip content per band: filament, layer range, TD.
+  const bandInfo = useMemo(() => {
+    const byUuid = new Map<string, Filament>()
+    for (const f of [...filaments, ...activeFilaments]) byUuid.set(f.uuid, f)
+    const info = new Map<number, { name: string; start: number; end: number; td: number }>()
+    for (const b of getPlanBands(colorSliders, [], settings)) {
+      const f = byUuid.get(b.filamentUuid)
+      info.set(b.storeIndex, { name: f ? `${f.brand ? `${f.brand} · ` : ''}${f.name}` : 'Unassigned', start: b.startLayer, end: b.endLayer, td: b.td })
+    }
+    return info
+  }, [colorSliders, filaments, activeFilaments, settings])
+
+  // Keep the selected handle visible when zoomed in.
+  useEffect(() => {
+    if (selectedBand === null || zoom === 1 || draggingHandle !== null) return
+    const idx = handles.findIndex((h) => h.storeIndex === selectedBand)
+    handleRefs.current.get(idx)?.scrollIntoView({ block: 'nearest' })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedBand, zoom])
 
   useEffect(() => {
     if (draggingHandle === null) return
@@ -221,8 +315,8 @@ export const ColorCore: React.FC = () => {
     const maxLayer = nextHandle ? nextHandle.layer : sliderLayerRange.max
 
     const handleMove = (clientY: number) => {
-      if (!containerRef.current) return
-      const rect = containerRef.current.getBoundingClientRect()
+      if (!contentRef.current) return
+      const rect = contentRef.current.getBoundingClientRect()
       const relativeY = clientY - rect.top
       const currentMaxLayer = activeSliders[activeSliders.length - 1].layer
       const segmentHeight = rect.height / currentMaxLayer
@@ -266,14 +360,20 @@ export const ColorCore: React.FC = () => {
       try {
         const filament: Filament = JSON.parse(e.dataTransfer.getData('application/json'))
         const firstDisabled = colorSliders.findIndex((s) => !s.enabled)
-        const targetIndex = firstDisabled >= 0 ? firstDisabled : colorSliders.length - 1
         addActiveFilament(filament)
-        updateSlider(targetIndex, { filament_uuid: filament.uuid, enabled: true, td: filament.td, layer: 10 })
+        if (firstDisabled >= 0) {
+          const top = Math.max(0, ...colorSliders.filter((s) => s.enabled).map((s) => s.layer))
+          updateSlider(firstDisabled, { filament_uuid: filament.uuid, enabled: true, td: filament.td, layer: Math.min(sliderLayerRange.max, top + 5) || 5 })
+        } else {
+          // No free column (e.g. a fresh project): add a band instead of
+          // overwriting the last one (or crashing on an empty stack).
+          useAppStore.getState().addBand(filament)
+        }
       } catch {
         // ignore
       }
     },
-    [colorSliders, updateSlider, addActiveFilament],
+    [colorSliders, updateSlider, addActiveFilament, sliderLayerRange.max],
   )
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -282,6 +382,22 @@ export const ColorCore: React.FC = () => {
   }, [])
 
   const maxLayer = handles.length > 0 ? handles[handles.length - 1].value : 0
+
+  // Hover shows the tooltip; so do keyboard focus and dragging.
+  const tipIndex = draggingHandle ?? hoveredHandle ?? focusedHandle
+  const tipHandle = tipIndex !== null ? handles[tipIndex] : undefined
+  // A band hidden under a later one on the same layer owns no layers of its own.
+  const tipInfo = tipHandle
+    ? bandInfo.get(tipHandle.storeIndex) ?? {
+        name: [...filaments, ...activeFilaments].find((f) => f.uuid === tipHandle.filamentUuid)?.name ?? 'Unassigned',
+        start: tipHandle.value,
+        end: tipHandle.value,
+        td: tipHandle.td,
+      }
+    : undefined
+  const tipRect = tipIndex !== null ? handleRefs.current.get(tipIndex)?.getBoundingClientRect() : undefined
+
+  const zoomButton = 'p-0.5 rounded text-gray-400 hover:text-gray-100 hover:bg-gray-700 disabled:opacity-30 disabled:hover:bg-transparent'
 
   return (
     <div
@@ -296,15 +412,28 @@ export const ColorCore: React.FC = () => {
         flexDirection: 'column',
       }}
     >
+      {handles.length > 0 && (
+        <div className="flex items-center justify-between px-0.5 border-b border-gray-700 flex-shrink-0" title="Zoom the color column (Ctrl+scroll)">
+          <button onClick={() => setZoom((z) => Math.max(MIN_ZOOM, z / 1.5))} disabled={zoom <= MIN_ZOOM} className={zoomButton} aria-label="Zoom out the color column" data-testid="color-core-zoom-out">
+            <Minus className="w-3 h-3" />
+          </button>
+          <button onClick={() => setZoom(1)} className="text-[10px] text-gray-400 tabular-nums hover:text-gray-100" title="Reset zoom" data-testid="color-core-zoom-level">
+            {zoom.toFixed(zoom < 10 && zoom % 1 ? 1 : 0)}×
+          </button>
+          <button onClick={() => setZoom((z) => Math.min(MAX_ZOOM, z * 1.5))} disabled={zoom >= MAX_ZOOM} className={zoomButton} aria-label="Zoom in the color column" data-testid="color-core-zoom-in">
+            <Plus className="w-3 h-3" />
+          </button>
+        </div>
+      )}
       <div
         ref={containerRef}
-        className="flex-1 relative flex overflow-hidden"
+        className={`flex-1 relative ${zoom > 1 ? 'overflow-y-auto overflow-x-hidden' : 'overflow-hidden'}`}
         data-testid="color-core"
         onDrop={handleDrop}
         onDragOver={handleDragOver}
       >
         {handles.length > 0 ? (
-          <>
+          <div ref={contentRef} className="relative flex" style={{ height: containerHeight }}>
             {/* Handles (arrowheads on the left) */}
             <div className="relative w-14 flex-shrink-0 z-20" data-testid="color-core-handles">
               {/* Slider rail */}
@@ -312,29 +441,64 @@ export const ColorCore: React.FC = () => {
               {handles.map((handle, idx) => {
                 const yPos = layerToY(handle.value)
                 const isFocused = focusedHandle === idx
+                const isLinked = handle.storeIndex === selectedBand || handle.storeIndex === hoveredBand
                 const isOverlapDisabled = overlapDisabled.has(handle.storeIndex)
+                // With many bands the layer numbers overlapped into an
+                // unreadable pile; show a number only where there's room,
+                // or for the handle being hovered/dragged.
+                const neighbors = [handles[idx - 1], handles[idx + 1]].filter(Boolean).map((h) => Math.abs(layerToY(h.value) - yPos))
+                const roomForLabel = neighbors.every((d) => d >= MIN_LABEL_SPACING)
+                const showLabel = roomForLabel || isFocused || isLinked || hoveredHandle === idx || draggingHandle === idx
+                const info = bandInfo.get(handle.storeIndex)
 
                 return (
                   <div
                     key={handle.storeIndex}
-                    className="absolute left-0 flex items-center cursor-grab active:cursor-grabbing select-none"
-                    style={{ top: `${yPos}px`, transform: 'translateY(-50%)', opacity: isOverlapDisabled ? 0.45 : 1 }}
+                    ref={(el) => {
+                      if (el) handleRefs.current.set(idx, el)
+                      else handleRefs.current.delete(idx)
+                    }}
+                    role="slider"
+                    tabIndex={0}
+                    aria-label={`Band ${handle.storeIndex + 1}${info ? `, ${info.name}` : ''}: top layer`}
+                    aria-valuenow={handle.value}
+                    aria-valuemin={1}
+                    aria-valuemax={sliderLayerRange.max}
+                    className="absolute left-0 flex items-center cursor-grab active:cursor-grabbing select-none outline-none"
+                    style={{ top: `${yPos}px`, transform: 'translateY(-50%)', opacity: isOverlapDisabled ? 0.45 : 1, zIndex: (showLabel && !roomForLabel) || isLinked ? 30 : undefined }}
                     onMouseDown={handleMouseDown(idx)}
+                    onMouseEnter={() => {
+                      setHoveredHandle(idx)
+                      setHoveredBand(handle.storeIndex)
+                    }}
+                    onMouseLeave={() => {
+                      setHoveredHandle((h) => (h === idx ? null : h))
+                      setHoveredBand(null)
+                    }}
+                    onFocus={() => selectHandle(idx)}
+                    onBlur={() => setFocusedHandle((h) => (h === idx ? null : h))}
+                    onKeyDown={handleKeyDown(idx)}
                     onTouchStart={handleTouchStart(idx)}
                     data-testid={`color-core-handle-${idx}`}
                     data-layer={handle.value}
+                    data-selected={handle.storeIndex === selectedBand || undefined}
                     data-overlap-disabled={isOverlapDisabled || undefined}
-                    title={isOverlapDisabled ? 'This filament is covered by another slider on the same layer' : undefined}
                   >
+                    {/* The border and outline keep white and black handles
+                        visible against both the dark panel and the track. */}
                     <div
-                      className={`flex items-center pl-1 pr-0.5 py-0.5 rounded-l text-xs font-mono font-bold shadow transition-all ${
-                        isFocused ? 'ring-2 ring-white ring-offset-1 ring-offset-gray-800' : ''
+                      className={`flex items-center pl-1 pr-0.5 py-0.5 rounded-l text-xs font-mono font-bold shadow transition-all border border-black/50 outline outline-1 outline-white/25 ${
+                        isFocused ? 'ring-2 ring-white ring-offset-1 ring-offset-gray-800' : isLinked ? 'ring-2 ring-cyan-400' : ''
                       }`}
                       style={{ backgroundColor: handle.color }}
                     >
-                      <span className="text-white text-[10px] leading-none">{handle.value}</span>
+                      {showLabel && (
+                        <span className="text-[10px] leading-none pr-0.5" style={{ color: readableTextColor(handle.color) }} data-testid={`color-core-label-${idx}`}>
+                          {handle.value}
+                        </span>
+                      )}
                       <svg width="12" height="14" viewBox="0 0 12 14" className="flex-shrink-0">
-                        <polygon points="12,7 0,0 0,14" fill="white" />
+                        <polygon points="12,7 0,0 0,14" fill={readableTextColor(handle.color)} />
                       </svg>
                     </div>
                   </div>
@@ -420,13 +584,32 @@ export const ColorCore: React.FC = () => {
                 )
               })}
             </svg>
-          </>
+          </div>
         ) : (
-          <div className="flex-1 flex items-center justify-center text-gray-500 text-xs" data-testid="color-core-empty">
-            Drag filaments here to assign colors
+          <div className="h-full flex items-center justify-center text-center px-1.5 text-[11px] leading-snug text-gray-400" data-testid="color-core-empty">
+            Drag a filament here to add a color layer
           </div>
         )}
       </div>
+
+      {tipHandle && tipInfo && tipRect &&
+        createPortal(
+          <div
+            className="fixed z-[70] pointer-events-none px-2 py-1 rounded border border-gray-700 bg-gray-900/95 shadow-lg text-[11px] text-gray-200 whitespace-nowrap"
+            style={{ left: tipRect.right + 8, top: tipRect.top + tipRect.height / 2, transform: 'translateY(-50%)' }}
+            data-testid="color-core-tooltip"
+          >
+            <div className="flex items-center gap-1.5 font-medium text-gray-100">
+              <span className="w-2.5 h-2.5 rounded-full border border-gray-600" style={{ backgroundColor: tipHandle.color }} />
+              {tipInfo.name}
+            </div>
+            <div className="text-gray-400">
+              {tipInfo.start === tipInfo.end ? `Layer ${tipInfo.end}` : `Layers ${tipInfo.start}–${tipInfo.end}`} · TD {tipInfo.td}
+              {overlapDisabled.has(tipHandle.storeIndex) ? ' · hidden by a later band on the same layer' : ' · drag or use ↑/↓'}
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   )
 }

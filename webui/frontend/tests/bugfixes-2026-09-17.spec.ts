@@ -20,7 +20,7 @@ test.beforeEach(async ({ page, baseURL }) => {
 
 async function activateLibraryFilaments(page: Page, count: number) {
   const toggles = page.locator('[data-testid="filament-list"] [data-testid^="toggle-filament-"]')
-  const active = page.locator('[data-testid="active-filaments-list"] [data-testid^="active-filament-"]')
+  const active = page.locator('[data-testid="filament-list"] [data-testid^="filament-"][data-active="true"]')
   for (let i = 0; i < count; i++) {
     await toggles.nth(i).click()
     await expect(active).toHaveCount(i + 1)
@@ -41,7 +41,7 @@ test('undo restores the backend active-filament list, not just the UI', async ({
 
   await page.keyboard.press('Control+z')
 
-  await expect(page.locator('[data-testid="active-filaments-list"] [data-testid^="active-filament-"]')).toHaveCount(1)
+  await expect(page.locator('[data-testid="filament-list"] [data-testid^="filament-"][data-active="true"]')).toHaveCount(1)
   await expect.poll(() => backendActiveCount(page)).toBe(1)
 })
 
@@ -49,7 +49,7 @@ test('undo after a page reload keeps settings and filaments intact', async ({ pa
   await activateLibraryFilaments(page, 2)
 
   await page.reload()
-  const active = page.locator('[data-testid="active-filaments-list"] [data-testid^="active-filament-"]')
+  const active = page.locator('[data-testid="filament-list"] [data-testid^="filament-"][data-active="true"]')
   await expect(active).toHaveCount(2)
   const meshLabel = page.locator('[data-testid="mesh-height-label"]')
   const labelBefore = await meshLabel.textContent()

@@ -81,7 +81,7 @@ export const NewFilamentModal: React.FC = () => {
 
   return (
     <Dialog open={newFilamentModalOpen} onOpenChange={setNewFilamentModalOpen}>
-      <DialogContent data-testid="new-filament-modal">
+      <DialogContent className="p-0 gap-0 bg-gray-900 border-gray-700" data-testid="new-filament-modal">
         <div className="bg-gray-900 rounded-lg w-full flex flex-col">
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
           <DialogTitle className="text-sm font-semibold text-gray-200 flex items-center gap-2 leading-none tracking-normal">
@@ -94,7 +94,7 @@ export const NewFilamentModal: React.FC = () => {
           <button
             onClick={() => setNewFilamentModalOpen(false)}
             className="text-gray-400 hover:text-gray-200"
-            data-testid="close-new-filament"
+            aria-label="Close" data-testid="close-new-filament"
           >
             <X className="w-4 h-4" />
           </button>

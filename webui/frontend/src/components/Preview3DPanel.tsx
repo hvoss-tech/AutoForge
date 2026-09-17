@@ -1,9 +1,9 @@
 import React, { useEffect, useMemo, useRef } from 'react'
-import { useAppStore } from '../store/appStore'
+import { acceptsPreviewFor, isInitRequestInFlight, useAppStore } from '../store/appStore'
 import { Box, Loader2, AlertTriangle } from 'lucide-react'
 import { ThreeDView } from './ThreeDView'
-import { ResultsHistory } from './ResultsHistory'
 import { getStackHandles, getStackSegments, filterActiveHandles } from '../lib/colorStack'
+import { getPlanBands } from '../lib/printPlan'
 
 export const Preview3DPanel: React.FC = () => {
   const previewImage = useAppStore((s) => s.previewImage)
@@ -25,6 +25,17 @@ export const Preview3DPanel: React.FC = () => {
   const colorSliders = useAppStore((s) => s.colorSliders)
   const filaments = useAppStore((s) => s.filaments)
   const colorSlidersRef = useRef(colorSliders)
+  const settings = useAppStore((s) => s.settings)
+  const selectedBand = useAppStore((s) => s.selectedBand)
+  const hoveredBand = useAppStore((s) => s.hoveredBand)
+
+  // The band under the pointer (else the selected one) is outlined in 3D.
+  const focusBand = hoveredBand ?? selectedBand
+  const highlight = useMemo(() => {
+    if (focusBand === null) return null
+    const band = getPlanBands(colorSliders, [], settings).find((b) => b.storeIndex === focusBand)
+    return band ? { startMm: band.startHeightMm, endMm: band.endHeightMm, startLayer: band.startLayer, endLayer: band.endLayer } : null
+  }, [focusBand, colorSliders, settings])
 
   // Before any optimization result exists, show what the currently-assigned
   // slider colors would look like as a simple stacked-layer preview instead
@@ -72,14 +83,13 @@ export const Preview3DPanel: React.FC = () => {
           const data = JSON.parse(event.data)
           if (data.type === 'preview_update' && data.image) {
             // This channel is shared by every connected browser tab, with no
-            // per-connection subscription. Only drop the message when this
-            // tab is actively tracking a *different* job — that's the
-            // harmful case (another job's colors overwrite the one you're
-            // watching). A tab with no job in focus still accepts updates:
-            // jobs started outside this tab's own Run button (via the API,
-            // or picked up from history) have no other way to be noticed.
-            const activeJobId = useAppStore.getState().currentJob?.job_id
-            if (activeJobId && data.job_id !== activeJobId) return
+            // per-connection subscription, so each tab decides for itself
+            // whether an update is about the job it is showing
+            // (acceptsPreviewFor). "No current job" used to mean "accept
+            // everything", which let a pruning run's broadcast (sent under
+            // the *optimization* job's id) rewrite the color layers of a
+            // history step the user had just returned to.
+            if (!acceptsPreviewFor(data.job_id, useAppStore.getState().currentJob?.job_id)) return
 
             setPreviewImage(`data:image/png;base64,${data.image}`)
             // A completed job's colored PLY may have been regenerated
@@ -146,10 +156,20 @@ export const Preview3DPanel: React.FC = () => {
         const res = await fetch('/api/init/status')
         const data = await res.json()
         if (cancelled) return
-
-        if (data.status !== 'idle') {
-          setInitState({ status: data.status })
+        // A "ready" left over from the previous image used to flip a new
+        // upload straight back to ready: the old mesh stayed up and Run was
+        // enabled while the new preview was still being built.
+        if (isInitRequestInFlight()) {
+          lastStatus = null
+          return
         }
+
+        // Including "idle": after a new image (or a history step to one)
+        // resets the server's auto-preview, the store must stop claiming
+        // "ready" — that flag is what points the 3D panel at
+        // /api/init/mesh, which no longer has anything to serve.
+        setInitState({ status: data.status })
+        if (data.base) useAppStore.getState().setResolvedBase(data.base)
 
         // Only on the transition into "ready" — this used to refetch the
         // preview image and re-apply /api/sliders/from-optimizer every
@@ -208,20 +228,28 @@ export const Preview3DPanel: React.FC = () => {
       </div>
       <div className="flex-1 relative overflow-hidden">
         {stlFile ? (
-          <div data-testid="three-d-view" className="w-full h-full">
-            <ThreeDView coloredPlyUrl={coloredPlyUrl} className="w-full h-full" />
+          <div key="three-d-view" data-testid="three-d-view" className="w-full h-full">
+            <ThreeDView coloredPlyUrl={coloredPlyUrl} highlight={highlight} className="w-full h-full" />
           </div>
         ) : optimizationStarted && previewImage ? (
           <img
             src={previewImage}
-            alt="Preview"
+            alt="Live preview of the optimization"
             className="absolute inset-0 w-full h-full object-contain"
             data-testid="preview-image"
           />
+        ) : optimizationStarted ? (
+          // Previously fell through to the auto-preview's "Initializing
+          // heightmap…" message, which read as if nothing had started.
+          <div className="w-full h-full flex flex-col items-center justify-center text-gray-400 gap-2" data-testid="optimization-waiting">
+            <Loader2 className="w-6 h-6 animate-spin" />
+            <span className="text-sm text-gray-300">{currentJob?.phase === 'Preparing' || !currentJob?.phase ? 'Preparing the optimization…' : 'Optimizing…'}</span>
+            <span className="text-xs text-gray-400">A live preview appears here after the first iterations.</span>
+          </div>
         ) : jobFailed ? (
           <div className="w-full h-full flex flex-col items-center justify-center text-red-400 p-4 overflow-y-auto" data-testid="optimization-error">
             <AlertTriangle className="w-8 h-8 mb-2 opacity-70 flex-shrink-0" />
-            <p className="text-xs text-center mb-1">Optimization failed</p>
+            <p className="text-sm text-center mb-1">Optimization failed</p>
             {jobError && (() => {
               // friendly_error_message() (backend) leads with a plain-
               // language summary, then a blank line, then the raw
@@ -233,11 +261,11 @@ export const Preview3DPanel: React.FC = () => {
               const detail = rest.join('\n\n')
               return (
                 <div className="max-w-64 text-center">
-                  <p className="text-xs text-red-500/80 whitespace-pre-wrap">{summary}</p>
+                  <p className="text-xs text-red-500 whitespace-pre-wrap">{summary}</p>
                   {detail && (
                     <details className="mt-2 text-left">
-                      <summary className="text-[10px] text-red-500/60 cursor-pointer">Show details</summary>
-                      <pre className="mt-1 text-[10px] text-red-500/60 whitespace-pre-wrap break-words max-h-32 overflow-y-auto">{detail}</pre>
+                      <summary className="text-[11px] text-red-500/80 cursor-pointer">Show details</summary>
+                      <pre className="mt-1 text-[11px] text-red-500/80 whitespace-pre-wrap break-words max-h-32 overflow-y-auto">{detail}</pre>
                     </details>
                   )}
                 </div>
@@ -245,12 +273,12 @@ export const Preview3DPanel: React.FC = () => {
             })()}
           </div>
         ) : initMeshUrl ? (
-          <div data-testid="init-three-d-view" className="w-full h-full">
-            <ThreeDView coloredPlyUrl={initMeshUrl} className="w-full h-full" />
+          <div key="init-three-d-view" data-testid="init-three-d-view" className="w-full h-full">
+            <ThreeDView coloredPlyUrl={initMeshUrl} highlight={highlight} className="w-full h-full" />
           </div>
         ) : stackSegments.length > 0 ? (
-          <div data-testid="color-stack-preview" className="w-full h-full">
-            <ThreeDView stackSegments={stackSegments} className="w-full h-full" />
+          <div key="color-stack-preview" data-testid="color-stack-preview" className="w-full h-full">
+            <ThreeDView stackSegments={stackSegments} highlight={highlight} className="w-full h-full" />
           </div>
         ) : previewImage ? (
           <img
@@ -262,22 +290,21 @@ export const Preview3DPanel: React.FC = () => {
         ) : initState.status === 'initializing' ? (
           <div className="w-full h-full flex flex-col items-center justify-center text-gray-400" data-testid="init-loading">
             <Loader2 className="w-6 h-6 animate-spin mb-2" />
-            <span className="text-xs">Initializing heightmap...</span>
+            <span className="text-sm text-gray-300">Building the 3D preview…</span>
+            <span className="text-xs text-gray-400 mt-1">Working out the heights from your image</span>
           </div>
         ) : showNoFilamentsWarning ? (
           <div className="w-full h-full flex flex-col items-center justify-center text-yellow-400 p-4" data-testid="no-filaments-warning">
             <AlertTriangle className="w-8 h-8 mb-2 opacity-70" />
-            <p className="text-xs text-center">Add filaments to the Active Filaments list to generate a 3D preview</p>
+            <p className="text-sm text-center">Add filaments to see a 3D preview</p>
+            <p className="text-xs text-center text-gray-400 mt-1">Click + next to a filament in the library on the left.</p>
           </div>
         ) : (
           <div className="w-full h-full flex flex-col items-center justify-center text-gray-500" data-testid="preview-placeholder">
             <Box className="w-8 h-8 mb-2 opacity-50" />
-            <p className="text-xs">Upload an image to generate 3D preview</p>
+            <p className="text-sm text-gray-400">Upload an image to see a 3D preview</p>
           </div>
         )}
-        <div style={{ position: 'absolute', bottom: 8, right: 8, zIndex: 10 }} data-testid="results-history-anchor">
-          <ResultsHistory />
-        </div>
       </div>
     </div>
   )

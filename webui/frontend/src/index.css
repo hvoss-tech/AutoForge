@@ -5,6 +5,10 @@
    aliased to --gray-* below — re-themes automatically; no per-component
    className changes needed. */
 :root {
+  /* Fixed bar heights, shared by the bars and overlays that sit between them. */
+  --topbar-height: 48px;
+  --statusbar-height: 40px;
+
   --bg-main: #0f1c2a;
   --bg-panel: #162435;
   --bg-toolbar: #3f4d63;
@@ -196,4 +200,44 @@ body {
 .af-vertical-slider:disabled::-moz-range-thumb {
   background: #6b7280;
   cursor: not-allowed;
+}
+
+/* Light theme: status colors. The components use Tailwind's bright 300/400
+   shades (made for dark panels) and near-black 900/950 tints for alert
+   backgrounds; on light panels those were washed out or looked like dark
+   holes. Remapped here in one place instead of per component. */
+@layer utilities {
+  :root[data-theme="light"] .text-red-200,
+  :root[data-theme="light"] .text-red-300,
+  :root[data-theme="light"] .text-red-400 { color: rgb(185 28 28); }
+  :root[data-theme="light"] .text-green-300,
+  :root[data-theme="light"] .text-green-400,
+  :root[data-theme="light"] .text-emerald-500 { color: rgb(21 128 61); }
+  :root[data-theme="light"] .text-yellow-400,
+  :root[data-theme="light"] .text-yellow-500 { color: rgb(161 98 7); }
+  :root[data-theme="light"] .text-blue-300,
+  :root[data-theme="light"] .text-blue-400 { color: rgb(29 78 216); }
+  :root[data-theme="light"] .text-purple-400,
+  :root[data-theme="light"] .text-purple-500 { color: rgb(126 34 206); }
+  :root[data-theme="light"] .text-cyan-500 { color: rgb(14 116 144); }
+
+  :root[data-theme="light"] .bg-red-900\/30,
+  :root[data-theme="light"] .bg-red-900\/40,
+  :root[data-theme="light"] .bg-red-900\/50,
+  :root[data-theme="light"] .bg-red-900\/60,
+  :root[data-theme="light"] .bg-red-950,
+  :root[data-theme="light"] .bg-red-950\/95 { background-color: rgb(254 226 226); }
+  :root[data-theme="light"] .bg-green-900\/30 { background-color: rgb(220 252 231); }
+  :root[data-theme="light"] .bg-yellow-950\/95 { background-color: rgb(254 243 199); }
+  :root[data-theme="light"] .border-red-700 { border-color: rgb(252 165 165); }
+  :root[data-theme="light"] .border-yellow-700 { border-color: rgb(252 211 77); }
+}
+
+/* Minimum readable text size: several labels were 7–9px. */
+@layer base {
+  html { font-size: 16px; }
+  /* The app is a fixed full-window layout. Without this the document could
+     still scroll a few pixels (e.g. when a dialog returned focus to a button),
+     shifting the whole UI up and cutting off the top bar. */
+  html, body, #root { height: 100%; overflow: hidden; }
 }

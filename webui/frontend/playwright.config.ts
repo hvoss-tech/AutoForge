@@ -11,6 +11,8 @@ const baseURL = externalBaseURL || `http://127.0.0.1:${testPort}`
 
 export default defineConfig({
   testDir: './tests',
+  // *.test.mjs files are node:test unit tests (`npm run test:unit`), not Playwright specs.
+  testMatch: /.*\.spec\.ts$/,
   globalSetup: './tests/global-setup.ts',
   globalTeardown: './tests/global-teardown.ts',
   fullyParallel: false,
@@ -26,6 +28,14 @@ export default defineConfig({
   use: {
     baseURL,
     trace: 'on-first-retry',
+    // The first-run tutorial opens by itself over the whole app, which would
+    // block every test that just wants to click something. Start each
+    // context with it already marked as seen; the tutorial's own spec opts
+    // back out (test.use with an empty storageState) to test the first visit.
+    storageState: {
+      cookies: [],
+      origins: [{ origin: baseURL, localStorage: [{ name: 'autoforge-tutorial-seen', value: '1' }] }],
+    },
   },
   webServer: externalBaseURL
     ? undefined

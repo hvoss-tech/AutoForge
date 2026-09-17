@@ -50,7 +50,7 @@ test.describe('AutoForge WebUI - Application Shell', () => {
     // "Upload an input image first" run-disabled-reason too (now
     // consistently rendered since resetActiveFilaments actually clears
     // active filaments between tests) — scope to the panel's own heading.
-    await expect(page.getByRole('heading', { name: 'Input Image' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Image', exact: true })).toBeVisible()
   })
 
   test('3D preview panel is visible', async ({ page }) => {
@@ -98,8 +98,8 @@ test.describe('AutoForge WebUI - Application Shell', () => {
   test('color sliders are below image panels', async ({ page }) => {
     // See the "input image panel is visible" test above for why this can't
     // be a plain `text=Input Image` substring locator.
-    const inputImage = page.getByRole('heading', { name: 'Input Image' })
-    const sliders = page.locator('text=Color Sliders')
+    const inputImage = page.getByRole('heading', { name: 'Image', exact: true })
+    const sliders = page.locator('[data-testid="tab-color-layers"]')
 
     const inputBox = await inputImage.boundingBox()
     const slidersBox = await sliders.boundingBox()
@@ -120,8 +120,9 @@ test.describe('Filament Library Panel', () => {
     await expect(tabs.first()).toBeVisible()
   })
 
-  test('PLA tab is visible', async ({ page }) => {
-    await expect(page.locator('[data-testid="tab-PLA"]')).toBeVisible()
+  test('PLA is the type shown', async ({ page }) => {
+    // With a single type there's no tab row, just the label.
+    await expect(page.locator('[data-testid="tab-label"]')).toContainText('PLA')
   })
 
   test('clicking a tab changes active tab and filters the list', async ({ page, request }) => {
@@ -334,17 +335,20 @@ test.describe('3D Preview Panel', () => {
 
   test('placeholder is visible when no model', async ({ page }) => {
     await expect(page.locator('[data-testid="preview-placeholder"]')).toBeVisible()
-    await expect(page.locator('text=Upload an image to generate 3D preview')).toBeVisible()
+    await expect(page.locator('text=Upload an image to see a 3D preview')).toBeVisible()
   })
 
   test('results history control is present', async ({ page }) => {
-    await expect(page.locator('[data-testid="results-history-anchor"]')).toBeVisible()
+    // History moved from inside this panel to the top bar, next to Undo/Redo.
+    await expect(page.locator('[data-testid="history-open-btn"]')).toBeVisible()
   })
 })
 
 test.describe('Color Core Panel', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/')
+    // A fresh project has no color layers until the saved state loads.
+    await expect(page.locator('[data-testid="slider-column-0"]')).toBeVisible()
   })
 
   test('color core area is visible', async ({ page }) => {
@@ -357,7 +361,7 @@ test.describe('Color Core Panel', () => {
     }
     await page.waitForTimeout(200)
     await expect(page.locator('[data-testid="color-core-empty"]')).toBeVisible()
-    await expect(page.getByText('Drag filaments here to assign colors')).toBeVisible()
+    await expect(page.getByText('Drag a filament here to add a color layer')).toBeVisible()
   })
 
   test('color core handles container renders with active sliders', async ({ page }) => {
@@ -506,6 +510,8 @@ test.describe('Color Core Panel', () => {
 test.describe('Color Core and Color Sliders Synchronization', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/')
+    // A fresh project has no color layers until the saved state loads.
+    await expect(page.locator('[data-testid="slider-column-0"]')).toBeVisible()
   })
 
   test('handle count matches enabled slider count', async ({ page }) => {
@@ -563,9 +569,10 @@ test.describe('Color Core and Color Sliders Synchronization', () => {
     }
     activeLayers.sort((a, b) => a - b)
 
+    // The number label is hidden when handles sit too close to read; the
+    // handle's layer is always on data-layer (and in its tooltip).
     const handle0 = page.locator('[data-testid="color-core-handle-0"]')
-    const text = await handle0.textContent()
-    expect(text).toContain(String(activeLayers[0]))
+    await expect(handle0).toHaveAttribute('data-layer', String(activeLayers[0]))
   })
 
   test('disabling a slider removes its handle from color core', async ({ page }) => {
@@ -683,10 +690,12 @@ test.describe('Color Core and Color Sliders Synchronization', () => {
 test.describe('Color Sliders Panel', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/')
+    // A fresh project has no color layers until the saved state loads.
+    await expect(page.locator('[data-testid="slider-column-0"]')).toBeVisible()
   })
 
   test('panel header is visible', async ({ page }) => {
-    await expect(page.locator('text=Color Sliders')).toBeVisible()
+    await expect(page.locator('[data-testid="tab-color-layers"]')).toContainText('Color layers')
   })
 
   test('15 slider columns render', async ({ page }) => {
@@ -913,14 +922,19 @@ test.describe('Global Parameters Bar', () => {
   })
 
   test('base layers default is 6 (0.24mm background / 0.04mm layer height)', async ({ page }) => {
+    await expect(page.locator('[data-testid="base-converted"]')).toHaveText('= 6 layers')
+    await page.locator('[data-testid="base-unit-layers"]').click()
     await expect(page.locator('[data-testid="global-base-layers"]')).toHaveValue('6')
   })
 
   test('base layers is editable and drives background height', async ({ page }) => {
+    await page.locator('[data-testid="base-unit-layers"]').click()
     const baseLayers = page.locator('[data-testid="global-base-layers"]')
     await baseLayers.fill('12')
     await baseLayers.dispatchEvent('change')
     // 12 * 0.04mm default layer height = 0.48.
+    await expect(page.locator('[data-testid="base-converted"]')).toHaveText('= 0.48 mm')
+    await page.locator('[data-testid="base-unit-mm"]').click()
     await expect(page.locator('[data-testid="global-background-height"]')).toHaveValue('0.48')
   })
 
@@ -941,13 +955,13 @@ test.describe('Global Parameters Bar', () => {
     await backgroundHeight.fill('0.4')
     await backgroundHeight.dispatchEvent('change')
     // 0.4 / 0.04mm default layer height = 10.
-    await expect(page.locator('[data-testid="global-base-layers"]')).toHaveValue('10')
+    await expect(page.locator('[data-testid="base-converted"]')).toHaveText('= 10 layers')
 
     const layerHeight = page.locator('[data-testid="global-layer-height"]')
     await layerHeight.fill('0.2')
     await layerHeight.dispatchEvent('change')
     // 0.4 / 0.2 = 2.
-    await expect(page.locator('[data-testid="global-base-layers"]')).toHaveValue('2')
+    await expect(page.locator('[data-testid="base-converted"]')).toHaveText('= 2 layers')
   })
 
   test('background height stays exact when only layer height changes', async ({ page }) => {
@@ -994,70 +1008,39 @@ test.describe('Settings Modal', () => {
     await expect(page.locator('[data-testid="settings-modal"]')).not.toBeVisible()
   })
 
-  test('all 5 setting groups are visible', async ({ page }) => {
-    const groups = ['Optimization', 'Gumbel-Softmax', 'Layers', 'Output', 'Initialization']
-    for (const group of groups) {
-      await expect(page.locator(`[data-testid="settings-group-${group}"]`)).toBeVisible()
+  test('basic settings are shown; advanced ones are behind a toggle', async ({ page }) => {
+    for (const key of ['iterations', 'max_layers', 'layer_height', 'background_height', 'stl_output_size', 'background_color', 'auto_background_color', 'init_heightmap_method']) {
+      await expect(page.locator(`[data-testid="setting-${key}"]`)).toBeVisible()
     }
+    await expect(page.locator('[data-testid="setting-learning_rate"]')).toHaveCount(0)
   })
 
-  test('removed groups (I/O Settings, Pruning, FlatForge, Other) no longer exist', async ({ page }) => {
-    for (const group of ['I/O Settings', 'Pruning', 'FlatForge', 'Other']) {
-      await expect(page.locator(`[data-testid="settings-group-${group}"]`)).toHaveCount(0)
+  test('the advanced section can be expanded and collapsed again', async ({ page }) => {
+    const toggle = page.locator('[data-testid="settings-advanced-toggle"]')
+    await toggle.click()
+    await expect(page.locator('[data-testid="settings-advanced"]')).toBeVisible()
+    await toggle.click()
+    await expect(page.locator('[data-testid="settings-advanced"]')).toHaveCount(0)
+  })
+
+  test('advanced settings fields exist', async ({ page }) => {
+    await page.locator('[data-testid="settings-advanced-toggle"]').click()
+    for (const key of [
+      'learning_rate', 'warmup_fraction', 'learning_rate_warmup_fraction', 'early_stopping', 'discrete_check',
+      'init_tau', 'final_tau', 'min_layers', 'processing_reduction_factor', 'nozzle_diameter',
+      'num_init_rounds', 'num_init_cluster_layers',
+    ]) {
+      await expect(page.locator(`[data-testid="setting-${key}"]`)).toBeVisible()
     }
-  })
-
-  test('setting groups can be collapsed', async ({ page }) => {
-    await page.locator('[data-testid="settings-group-Optimization"]').click()
-    await page.waitForTimeout(100)
-  })
-
-  test('setting groups can be re-expanded', async ({ page }) => {
-    await page.locator('[data-testid="settings-group-Optimization"]').click()
-    await page.waitForTimeout(100)
-    await page.locator('[data-testid="settings-group-Optimization"]').click()
-    await page.waitForTimeout(100)
-  })
-
-  // Optimization
-  test('optimization settings fields exist', async ({ page }) => {
-    await expect(page.locator('[data-testid="setting-iterations"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-learning_rate"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-warmup_fraction"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-learning_rate_warmup_fraction"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-early_stopping"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-discrete_check"]')).toBeVisible()
     await expect(page.locator('[data-testid="setting-best_of"]')).toHaveCount(0)
   })
 
-  // Gumbel-Softmax
-  test('gumbel-softmax settings fields exist', async ({ page }) => {
-    await expect(page.locator('[data-testid="setting-init_tau"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-final_tau"]')).toBeVisible()
-  })
-
-  // Layers
-  test('layer settings fields exist', async ({ page }) => {
-    await expect(page.locator('[data-testid="setting-layer_height"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-max_layers"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-min_layers"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-background_height"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-background_color"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-auto_background_color"]')).toBeVisible()
-  })
-
-  // Output
-  test('output settings fields exist; STL output size is not one of them', async ({ page }) => {
-    await expect(page.locator('[data-testid="setting-processing_reduction_factor"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-nozzle_diameter"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-stl_output_size"]')).toHaveCount(0)
-  })
-
-  // Initialization
-  test('initialization settings fields exist', async ({ page }) => {
-    await expect(page.locator('[data-testid="setting-num_init_rounds"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-num_init_cluster_layers"]')).toBeVisible()
-    await expect(page.locator('[data-testid="setting-init_heightmap_method"]')).toBeVisible()
+  test('every field explains itself', async ({ page }) => {
+    // Basic fields show a help sentence; advanced ones an info tooltip.
+    await expect(page.locator('[data-testid="settings-modal"]')).toContainText('Upper limit of color layers above the base')
+    await page.locator('[data-testid="settings-advanced-toggle"]').click()
+    const info = page.locator('[data-testid="settings-advanced"] [aria-label]')
+    expect(await info.count()).toBeGreaterThanOrEqual(12)
   })
 
   // Removed fields (pruning, flatforge, other) no longer editable here
@@ -1074,6 +1057,11 @@ test.describe('Settings Modal', () => {
   })
 
   // Default values
+  test.describe('defaults', () => {
+    test.beforeEach(async ({ page }) => {
+      await page.locator('[data-testid="settings-advanced-toggle"]').click()
+    })
+
   test('iterations default is 6000', async ({ page }) => {
     await expect(page.locator('[data-testid="setting-iterations"]')).toHaveValue('6000')
   })
@@ -1113,6 +1101,7 @@ test.describe('Settings Modal', () => {
   test('num_init_rounds default is 16', async ({ page }) => {
     await expect(page.locator('[data-testid="setting-num_init_rounds"]')).toHaveValue('16')
   })
+  })
 
   // Modifying settings
   test('settings can be modified', async ({ page }) => {
@@ -1125,14 +1114,15 @@ test.describe('Settings Modal', () => {
     const methodSelect = page.locator('[data-testid="setting-init_heightmap_method"]')
     await expect(methodSelect).toBeVisible()
     await expect(methodSelect).toHaveValue('kmeans')
+    await expect(methodSelect.locator('option:checked')).toHaveText('Color clustering')
   })
 
   test('color picker renders for background color', async ({ page }) => {
     await expect(page.locator('[data-testid="setting-background_color"]')).toBeVisible()
   })
 
-  test('start button is visible in settings modal', async ({ page }) => {
-    await expect(page.locator('[data-testid="start-btn"]')).toBeVisible()
+  test('the settings dialog has no start button (Run lives in the top bar)', async ({ page }) => {
+    await expect(page.locator('[data-testid="start-btn"]')).toHaveCount(0)
   })
 })
 
@@ -1141,9 +1131,9 @@ test.describe('Optimization Workflow', () => {
     await page.goto('/')
   })
 
-  test('start button triggers optimization', async ({ page }) => {
-    await page.locator('[data-testid="settings-button"]').click()
-    await expect(page.locator('[data-testid="start-btn"]')).toBeVisible()
+  test('the workflow steps start at the image step', async ({ page }) => {
+    await expect(page.locator('[data-testid="workflow-step-image"]')).toHaveAttribute('data-state', 'current')
+    await expect(page.locator('[data-testid="workflow-step-run"]')).toHaveAttribute('data-state', 'upcoming')
   })
 
   test('top bar start button is visible', async ({ page }) => {
@@ -1440,8 +1430,11 @@ test.describe('Pruning Flow', () => {
     await expect(page.locator('[data-testid="pruning-modal"]')).toBeVisible()
     await page.locator('[data-testid="pruning-start-btn"]').click()
 
-    // Modal should close immediately; pruning progress should surface in the
-    // top bar (either running or already done on a tiny image).
+    // The dialog switches to a progress view and can be closed while pruning
+    // keeps running; progress also surfaces in the top bar (either running or
+    // already done on a tiny image).
+    await expect(page.locator('[data-testid="pruning-progress-view"]')).toBeVisible()
+    await page.locator('[data-testid="pruning-close-btn"]').click()
     await expect(page.locator('[data-testid="pruning-modal"]')).toHaveCount(0)
     await expect(
       page.locator('[data-testid="pruning-indicator"], [data-testid="pruning-done"]')
@@ -1549,7 +1542,17 @@ test.describe('Pruning Flow', () => {
     await page.goto('/')
     await page.locator('[data-testid="top-pruning-btn"]').click()
     await expect(page.locator('[data-testid="pruning-modal"]')).toBeVisible()
+    // The dialog now opens on the result's own counts (it no longer proposes
+    // a reduction of its own), so ask for a real cut — otherwise the
+    // reduction phases have nothing to do and the job finishes before
+    // Pause/Cancel can be clicked.
+    for (const [testId, value] of [['pruning-max-colors', '3'], ['pruning-max-swaps', '2'], ['pruning-max-layer', '18']]) {
+      const field = page.locator(`[data-testid="${testId}"]`)
+      await field.fill(value)
+      await field.dispatchEvent('change')
+    }
     await page.locator('[data-testid="pruning-start-btn"]').click()
+    await page.locator('[data-testid="pruning-close-btn"]').click()
     await expect(page.locator('[data-testid="pruning-modal"]')).toHaveCount(0)
 
     // Pause quickly, through the UI button, before it has a chance to finish.
@@ -1562,6 +1565,13 @@ test.describe('Pruning Flow', () => {
 
     // Progress must actually be frozen while paused, not just cosmetically
     // showing a pause icon while still advancing underneath.
+    //
+    // Read the *settled* paused state first: the UI polls the job once a
+    // second, so the poll right after the click can still be delivering a
+    // report the backend produced before the pause took effect. Comparing
+    // against that pre-pause reading measured the poll's latency, not
+    // whether the job kept moving.
+    await page.waitForTimeout(1500)
     const progressText = await page.locator('[data-testid="pruning-phase"]').textContent()
     await page.waitForTimeout(1500)
     const progressTextAfter = await page.locator('[data-testid="pruning-phase"]').textContent()
@@ -1960,29 +1970,35 @@ test.describe('Edge Cases and Boundary Tests', () => {
     await expect(page.locator('[data-testid="app-version"]')).toHaveText(/^v\d+\.\d+\.\d+$/)
   })
 
-  test('filament library shows active tab in blue', async ({ page }) => {
+  test('filament library shows active tab in blue', async ({ page, request }) => {
+    // Tabs only appear once there's more than one type.
+    await request.post('/api/filaments', {
+      data: { brand: 'TabTest', name: 'Tab Test Blue', color: '#123123', td: 2.0, filament_type: 'PETG-TABTEST' },
+    })
     await page.goto('/')
     const activeTab = page.locator('[data-testid="tab-PLA"]')
     await expect(activeTab).toHaveClass(/bg-blue-600/)
   })
 
-  test('color core empty state text when all disabled', async ({ page }) => {
+  test('color core empty state text when all disabled', async ({ page, baseURL }) => {
+    await resetProjectState(baseURL!)
     await page.goto('/')
+    await expect(page.locator('[data-testid="toggle-3"]')).toBeVisible()
     // Disable all active sliders
     for (let i = 0; i < 4; i++) {
       await page.locator(`[data-testid="toggle-${i}"]`).click()
     }
     await page.waitForTimeout(200)
-    await expect(page.getByText('Drag filaments here')).toBeVisible()
+    await expect(page.getByText('Drag a filament here')).toBeVisible()
   })
 
   test('3D preview placeholder text', async ({ page }) => {
     await page.goto('/')
-    await expect(page.locator('text=Upload an image to generate 3D preview')).toBeVisible()
+    await expect(page.locator('text=Upload an image to see a 3D preview')).toBeVisible()
   })
 
   test('image drop zone placeholder text', async ({ page }) => {
     await page.goto('/')
-    await expect(page.locator('text=Drop image or click to upload')).toBeVisible()
+    await expect(page.locator('text=Drop an image here or click to upload')).toBeVisible()
   })
 })

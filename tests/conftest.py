@@ -11,6 +11,68 @@ if SRC_PATH not in sys.path:
     sys.path.insert(0, SRC_PATH)
 
 
+def _patch_httpx_app_kwarg() -> None:
+    """Let Starlette's TestClient work on httpx >= 0.28.
+
+    httpx 0.28 dropped the ``app=`` shortcut from ``Client.__init__``.
+    Starlette's TestClient (<= 0.27) still passes it — *alongside* the
+    ``transport=`` it builds itself, which is what actually routes requests
+    — so every webui API test died in the constructor with "Client.__init__()
+    got an unexpected keyword argument 'app'" before running a single line.
+    Dropping the now-ignored kwarg restores the whole suite without pinning
+    anyone to an old httpx; it is a no-op on versions that still accept it.
+    """
+    try:
+        import httpx
+        from starlette.testclient import TestClient  # noqa: F401  (import guard only)
+    except Exception:
+        return
+
+    import inspect
+
+    try:
+        if "app" in inspect.signature(httpx.Client.__init__).parameters:
+            return
+    except (TypeError, ValueError):
+        return
+
+    original = httpx.Client.__init__
+
+    def __init__(self, *args, app=None, **kwargs):
+        original(self, *args, **kwargs)
+
+    httpx.Client.__init__ = __init__
+
+
+_patch_httpx_app_kwarg()
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_rng():
+    """Give every test the same starting RNG state.
+
+    Several tests build their inputs with the *global* generators
+    (``torch.rand``, ``np.random.rand``) and assert on a tolerance —
+    ``test_different_inputs_give_positive_loss`` and
+    ``test_composite_cont_and_disc_consistency`` among them. Their inputs
+    therefore depend on how much random work every earlier test happened to
+    do, and with pytest-randomly shuffling the order that changes on each
+    run: the suite would fail on a different one of them each time and pass
+    when run in isolation. Seeding per test makes the whole suite reproducible
+    and those assertions mean what they say.
+    """
+    import random
+
+    import torch
+
+    random.seed(1234)
+    np.random.seed(1234)
+    torch.manual_seed(1234)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(1234)
+    yield
+
+
 @pytest.fixture
 def rng():
     return np.random.default_rng(42)

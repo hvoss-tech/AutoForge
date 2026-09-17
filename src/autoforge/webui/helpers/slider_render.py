@@ -16,6 +16,7 @@ mapping implied by the slider stack instead of the optimizer's learned
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Optional
 
 import cv2
@@ -34,6 +35,13 @@ _OPAC_O, _OPAC_A, _OPAC_K, _OPAC_B = (
     8.2597107e01,
     1.2547257e00,
 )
+
+
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
 
 
 def _dedupe_overlapping_layers(sliders: list[dict]) -> list[dict]:
@@ -207,7 +215,13 @@ def render_with_sliders(
 
     os.makedirs(output_dir, exist_ok=True)
     preview_path = os.path.join(output_dir, png_name)
-    cv2.imwrite(preview_path, comp_bgr)
+    # Written to a temp file and renamed into place: the 3D view / image panel
+    # fetch these files right after every edit, and reading one while it was
+    # being rewritten in place gave truncated or aborted responses.
+    if _ok:
+        _atomic_write_bytes(preview_path, buf.tobytes())
+    else:
+        cv2.imwrite(preview_path, comp_bgr)
 
     height_map_mm = disc_height_image.detach().cpu().numpy().astype(np.float32) * h
     color_image_np = np.ascontiguousarray(comp_np)
@@ -219,6 +233,8 @@ def render_with_sliders(
         alpha_mask=alpha,
     )
     ply_path = os.path.join(output_dir, ply_name)
-    colored_mesh.export(ply_path, encoding="binary")
+    tmp_ply = f"{ply_path}.{os.getpid()}.{threading.get_ident()}.tmp.ply"
+    colored_mesh.export(tmp_ply, encoding="binary")
+    os.replace(tmp_ply, ply_path)
 
     return {"image_b64": image_b64, "preview_png": preview_path, "colored_ply": ply_path}

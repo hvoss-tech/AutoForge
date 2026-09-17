@@ -77,12 +77,31 @@ export interface JobStatus {
   completed_at: string | null
   preview_image: string | null
   phase: string | null
+  /** Live counts of the solution while pruning runs (see models.JobStatus).
+   * Null until the job reports them — pruning is the only thing that does. */
+  result_colors?: number | null
+  result_swaps?: number | null
+  result_layers?: number | null
+  /** Which auto-repeat pruning pass is running, out of how many allowed. */
+  pruning_pass?: number | null
+  pruning_max_passes?: number | null
+  /** The loss pruning started from; `loss` carries the live value. */
+  pruning_start_loss?: number | null
 }
 
 export interface PruningSettings {
   pruning_max_colors: number
   pruning_max_swaps: number
   pruning_max_layer: number
+  /** Keep pruning until a pass stops finding an improvement. */
+  auto_repeat: boolean
+  max_passes: number
+  /** Look for a better material discretization before pruning. */
+  seed_search: boolean
+  seed_search_count: number
+  /** Polish the per-pixel heights before pruning. */
+  fine_tune_height: boolean
+  fine_tune_steps: number
 }
 
 export interface InitState {

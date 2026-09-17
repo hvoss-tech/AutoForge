@@ -53,7 +53,7 @@ export const FilamentSwatch: React.FC<FilamentSwatchProps> = ({
       {filament.td !== undefined && (
         <span
           className={`font-mono font-bold ${sizeStyle.text}`}
-          style={{ color: textColor, textShadow: `0 0 2px rgba(0,0,0,0.5)` }}
+          style={{ color: textColor }}
         >
           {filament.td}
         </span>

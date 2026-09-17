@@ -551,13 +551,27 @@ def export_results(
     post_opt_step = 0
     pruning_completed = True
 
-    # Restore full-resolution logits & target
-    optimizer.pixel_height_logits = torch.from_numpy(
-        pixel_height_logits_init
-    ).to(device)
-    optimizer.best_params["pixel_height_logits"] = torch.from_numpy(
-        pixel_height_logits_init
-    ).to(device)
+    # Restore full-resolution logits & target — but only the first time.
+    #
+    # Training runs at the *processing* resolution, so the first export has to
+    # swap in the full-resolution initial height map (the learned per-cluster
+    # offsets are re-applied on top of it) before anything is written out.
+    # Doing it again on a *second* export is destructive: by then the
+    # optimizer holds a full-resolution height map that pruning has already
+    # pruned, fine-tuned and de-spiked, and this threw all of that away and
+    # handed the next prune the untrained k-means init instead — measured
+    # jumping the discrete loss from 68.08 straight back to 99.96 before a
+    # single pruning phase had run. Every pass after the first then started
+    # from a worse solution than the one it was supposed to improve, which is
+    # what made repeated pruning steadily degrade the result.
+    if not getattr(optimizer, "_full_res_height_restored", False):
+        optimizer.pixel_height_logits = torch.from_numpy(
+            pixel_height_logits_init
+        ).to(device)
+        optimizer.best_params["pixel_height_logits"] = torch.from_numpy(
+            pixel_height_logits_init
+        ).to(device)
+        optimizer._full_res_height_restored = True
     optimizer.target = output_target
     optimizer.pixel_height_labels = torch.tensor(
         pixel_height_labels, dtype=torch.int32, device=device
@@ -569,25 +583,28 @@ def export_results(
         with safe_autocast(device):
             # ---- Pruning ----
             if args.perform_pruning:
-                # Same post-hoc height-offset fine-tune the CLI path
-                # (auto_forge._post_optimize_and_export) runs before pruning
-                # starts - pruning's own greedy search benefits from the
-                # best achievable height from its very first phase, not just
-                # at the end. See FilamentOptimizer.fine_tune_height_offsets.
-                optimizer.fine_tune_height_offsets(num_steps=50)
-
                 max_colors_for_pruning = args.pruning_max_colors
                 if args.flatforge:
                     max_colors_for_pruning = max(1, args.pruning_max_colors - 2)
                 else:
                     max_colors_for_pruning = max(1, args.pruning_max_colors - 1)
 
+                # The height-offset fine-tune and the seed search used to be
+                # hardcoded here (50 steps) and inside prune() (200 seeds).
+                # Both are now prune() phases so they report progress like
+                # every other one, and both are switchable with their own
+                # limits — they are the two steps that pay off most from being
+                # run longer, and the two a user may want to skip entirely.
                 pruning_completed = optimizer.prune(
                     max_colors_allowed=max_colors_for_pruning,
                     max_swaps_allowed=args.pruning_max_swaps,
                     min_layers_allowed=args.min_layers,
                     max_layers_allowed=args.pruning_max_layer,
-                    search_seed=True,
+                    search_seed=getattr(args, "prune_seed_search", True),
+                    seed_search_count=int(getattr(args, "prune_seed_search_count", 200)),
+                    fine_tune_height=getattr(args, "prune_fine_tune_height", True),
+                    pre_fine_tune_height=getattr(args, "prune_fine_tune_height", True),
+                    fine_tune_steps=int(getattr(args, "prune_fine_tune_steps", 50)),
                     fast_pruning=args.fast_pruning,
                     fast_pruning_percent=args.fast_pruning_percent,
                     cancel_event=cancel_event,

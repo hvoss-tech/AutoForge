@@ -27,6 +27,34 @@ async function fetchWithRetry(url: string, init: RequestInit, retries = 3): Prom
   throw lastErr
 }
 
+const EXAMPLE_CSV = [
+  'Brand,Type,Color,Name,TD,Owned,UUID',
+  'Bambu Lab,PLA,#000000,Black,0.6,True,',
+  'Bambu Lab,PLA,#ffffff,Jade White,5,True,',
+  'Polymaker,PETG,#1e90ff,Blue,3.2,False,',
+].join('\n')
+
+const EXAMPLE_JSON = JSON.stringify(
+  [
+    { brand: 'Bambu Lab', name: 'Black', color: '#000000', td: 0.6, filament_type: 'PLA', owned: true },
+    { brand: 'Polymaker', name: 'Blue', color: '#1e90ff', td: 3.2, filament_type: 'PETG', owned: false },
+  ],
+  null,
+  2,
+)
+
+function downloadExample(kind: 'csv' | 'json') {
+  const blob = new Blob([kind === 'csv' ? EXAMPLE_CSV : EXAMPLE_JSON], { type: kind === 'csv' ? 'text/csv' : 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `filaments-example.${kind}`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
 export const ImportModal: React.FC = () => {
   const importModalOpen = useAppStore((s) => s.importModalOpen)
   const setImportModalOpen = useAppStore((s) => s.setImportModalOpen)
@@ -127,7 +155,7 @@ export const ImportModal: React.FC = () => {
 
   return (
     <Dialog open={importModalOpen} onOpenChange={setImportModalOpen}>
-      <DialogContent data-testid="import-modal">
+      <DialogContent className="p-0 gap-0 bg-gray-900 border-gray-700" data-testid="import-modal">
         <div className="bg-gray-900 rounded-lg w-full flex flex-col">
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
           <DialogTitle className="text-sm font-semibold text-gray-200 flex items-center gap-2 leading-none tracking-normal">
@@ -139,7 +167,8 @@ export const ImportModal: React.FC = () => {
           </DialogDescription>
           <button
             onClick={handleClose}
-            className="text-gray-400 hover:text-gray-200"
+            className="p-1 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+            aria-label="Close import"
             data-testid="close-import"
           >
             <X className="w-4 h-4" />
@@ -151,13 +180,14 @@ export const ImportModal: React.FC = () => {
             onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
             onDragLeave={() => setDragOver(false)}
             onDrop={handleDrop}
-            className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+            onClick={() => fileInputRef.current?.click()}
+            className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors cursor-pointer ${
               dragOver ? 'border-blue-500 bg-blue-500/10' : 'border-gray-600 hover:border-gray-500'
             }`}
           >
             <Upload className="w-8 h-8 mx-auto mb-2 text-gray-400" />
             <p className="text-sm text-gray-300 mb-1">Drop a file here or click to browse</p>
-            <p className="text-xs text-gray-500">Supports JSON and CSV formats</p>
+            <p className="text-xs text-gray-400">CSV or JSON — you choose whether to add to or replace your library next</p>
             <input
               ref={fileInputRef}
               type="file"
@@ -168,7 +198,7 @@ export const ImportModal: React.FC = () => {
             />
             <button
               type="button"
-              onClick={() => fileInputRef.current?.click()}
+              onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click() }}
               className="mt-3 px-4 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-200"
             >
               Browse Files
@@ -176,20 +206,18 @@ export const ImportModal: React.FC = () => {
           </div>
 
           {!pending && (
-            <div className="flex gap-3">
-              <div className="flex-1 flex items-center gap-2 p-3 bg-gray-800 rounded">
-                <FileJson className="w-5 h-5 text-blue-400" />
-                <div>
-                  <p className="text-xs text-gray-200 font-medium">JSON</p>
-                  <p className="text-xs text-gray-500">AutoForge format</p>
-                </div>
+            // These used to look like clickable format buttons that did
+            // nothing; they now explain the format and give a sample file.
+            <div className="grid grid-cols-2 gap-3 text-xs" data-testid="import-formats">
+              <div className="p-3 bg-gray-800 rounded space-y-1.5">
+                <p className="flex items-center gap-1.5 text-gray-200 font-medium"><FileText className="w-4 h-4 text-green-500" /> CSV</p>
+                <p className="text-gray-400">Columns: <code className="text-gray-300">Brand, Type, Color, Name, TD, Owned</code> (UUID optional). Color as hex, e.g. #ff8800.</p>
+                <button type="button" onClick={() => downloadExample('csv')} className="text-cyan-500 hover:underline" data-testid="import-example-csv">Download example CSV</button>
               </div>
-              <div className="flex-1 flex items-center gap-2 p-3 bg-gray-800 rounded">
-                <FileText className="w-5 h-5 text-green-400" />
-                <div>
-                  <p className="text-xs text-gray-200 font-medium">CSV</p>
-                  <p className="text-xs text-gray-500">Spreadsheet format</p>
-                </div>
+              <div className="p-3 bg-gray-800 rounded space-y-1.5">
+                <p className="flex items-center gap-1.5 text-gray-200 font-medium"><FileJson className="w-4 h-4 text-blue-400" /> JSON</p>
+                <p className="text-gray-400">A list of filaments as saved by <span className="text-gray-300">Save</span> in the library: brand, name, color, td, filament_type, owned.</p>
+                <button type="button" onClick={() => downloadExample('json')} className="text-cyan-500 hover:underline" data-testid="import-example-json">Download example JSON</button>
               </div>
             </div>
           )}
@@ -208,7 +236,7 @@ export const ImportModal: React.FC = () => {
                   data-testid="import-mode-merge"
                 >
                   Add to Library
-                  <span className="block text-[10px] font-normal opacity-80">Updates any same-named filament, keeps the rest</span>
+                  <span className="block text-[11px] font-normal opacity-90">Updates any same-named filament, keeps the rest</span>
                 </button>
                 <button
                   type="button"
@@ -218,7 +246,7 @@ export const ImportModal: React.FC = () => {
                   data-testid="import-mode-replace"
                 >
                   Replace Entire Library
-                  <span className="block text-[10px] font-normal opacity-80">{existingCount === null ? 'Removes all current filaments' : `Removes all ${existingCount} current filaments`}</span>
+                  <span className="block text-[11px] font-normal opacity-90">{existingCount === null ? 'Removes all current filaments' : `Removes all ${existingCount} current filaments`}</span>
                 </button>
               </div>
             </div>

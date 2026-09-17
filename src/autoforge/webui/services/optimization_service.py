@@ -5,6 +5,7 @@ import threading
 from typing import Optional
 from datetime import datetime, timezone
 from ..models import JobStatus, OptimizationSettings
+from ..helpers.gpu_memory import release_pipeline_result
 
 TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
@@ -61,8 +62,28 @@ class OptimizationService:
                 json.dump(data, f, indent=2)
 
     def set_pipeline_result(self, job_id: str, result: dict):
+        """Record a finished run's pipeline state (so Prune can reuse it) and
+        release every older one.
+
+        A pipeline result pins its whole optimizer — and therefore hundreds
+        of MB of VRAM — on the training device. Keeping one per job meant
+        optimizing several images in a row accumulated all of them, which is
+        what made VRAM climb run after run until a later run OOM'd. Only the
+        newest result can still be pruned from the UI (the Pruning dialog
+        always targets the current job), so everything before it is dropped.
+        """
         with self._lock:
+            stale = [(jid, res) for jid, res in self._pipeline_results.items() if jid != job_id]
+            for jid, _res in stale:
+                self._pipeline_results.pop(jid, None)
+            previous = self._pipeline_results.get(job_id)
             self._pipeline_results[job_id] = result
+        # Outside the lock: releasing touches the GPU and can block, and no
+        # other call needs to wait for that to read an unrelated job.
+        for _jid, res in stale:
+            release_pipeline_result(res)
+        if previous is not None and previous is not result:
+            release_pipeline_result(previous)
 
     def get_pipeline_result(self, job_id: str) -> dict | None:
         with self._lock:
@@ -70,7 +91,23 @@ class OptimizationService:
 
     def clear_pipeline_result(self, job_id: str):
         with self._lock:
-            self._pipeline_results.pop(job_id, None)
+            result = self._pipeline_results.pop(job_id, None)
+        release_pipeline_result(result)
+
+    def clear_all_pipeline_results(self):
+        """Release every retained result — used when a new run is about to
+        allocate, so the previous image's optimizer isn't still resident
+        while the new one builds its own tensors."""
+        with self._lock:
+            results = list(self._pipeline_results.values())
+            self._pipeline_results.clear()
+        for result in results:
+            release_pipeline_result(result)
+
+    def pipeline_result_job_ids(self) -> list[str]:
+        """Test/diagnostic view of what is still holding device memory."""
+        with self._lock:
+            return list(self._pipeline_results)
 
     def create_job(self, settings: dict, job_id: str | None = None) -> JobStatus:
         with self._lock:
@@ -118,6 +155,14 @@ class OptimizationService:
                     ev = self._pause_events.get(job_id)
                     if ev is not None and ev.is_set():
                         status = "paused"
+                        # The report describes work finished *before* the
+                        # pause: a callback already on its way when the user
+                        # clicked can only land afterwards. Applying its
+                        # progress/phase/counts made a paused job appear to
+                        # keep advancing (the pruning overlay's phase label
+                        # moving on after Pause), so drop them and keep what
+                        # was on screen when the pause took effect.
+                        kwargs = {}
             # A job that already reached a terminal state must stay there.
             # Cancelling a job races the background thread's own updates: its
             # first "running" update (fired right after thread.start()) could

@@ -1,6 +1,10 @@
 from fastapi import APIRouter
 from ..services.optimization_service import get_optimization_service
-from ..helpers.sliders import derive_sliders_from_result, derive_layer_range_from_result
+from ..helpers.sliders import (
+    derive_base_from_result,
+    derive_sliders_from_result,
+    derive_layer_range_from_result,
+)
 from .init import get_init_pipeline_result
 
 router = APIRouter()
@@ -44,3 +48,32 @@ async def get_sliders_from_optimizer():
             return {"sliders": [], **range_info}
 
     return _DEFAULTS
+
+
+@router.get("/base")
+async def get_base_color():
+    """The base/background slab as it was actually built: its resolved color,
+    its height, and which active filament that color belongs to.
+
+    The frontend shows the base as the bottom row of the color layers, and it
+    cannot read that row off its own settings: ``auto_background_color``
+    (on by default) makes the pipeline replace ``background_color`` with the
+    active filament closest to the image's dominant color, and only the
+    pipeline result knows which one that was.
+
+    Answers for the newest completed job, else the auto-preview, else
+    ``null`` — the caller then falls back to its own settings.
+    """
+    svc = get_optimization_service()
+    for job in svc.get_history():
+        if job.status != "completed":
+            continue
+        result = svc.get_pipeline_result(job.job_id)
+        if result:
+            return {"base": derive_base_from_result(result), "source": job.job_id}
+
+    init_result = get_init_pipeline_result()
+    if init_result:
+        return {"base": derive_base_from_result(init_result), "source": "init"}
+
+    return {"base": None, "source": None}

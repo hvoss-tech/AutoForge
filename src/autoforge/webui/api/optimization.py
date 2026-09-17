@@ -9,6 +9,7 @@ from ..services.optimization_service import get_optimization_service
 from ..services.project_service import get_project_service
 from ..services.filament_service import get_filament_service
 from ..helpers.pipeline_runner import run_pipeline as _run_pipeline, friendly_error_message
+from ..helpers.gpu_memory import empty_device_cache, release_pipeline_result
 from ..config import config
 from .ws import broadcast_preview
 
@@ -87,9 +88,19 @@ async def start_optimization(settings: OptimizationSettings):
 
     def _run():
         nonlocal input_image_path
+        run_device = None
         try:
             svc.update_status(job.job_id, "running",
-                              total_iterations=settings.iterations)
+                              total_iterations=settings.iterations,
+                              phase="Preparing")
+
+            # Hand back every earlier run's device memory *before* this one
+            # allocates. Each retained pipeline result pins a whole optimizer
+            # (parameters, Adam state, target images) on the GPU, so running
+            # image after image without this climbed until a later run OOM'd.
+            # Only the newest result is reachable from the UI anyway — the
+            # Pruning dialog always targets the job currently on screen.
+            svc.clear_all_pipeline_results()
 
 
             output_dir = os.path.join(config.checkpoints_path, job.job_id)
@@ -127,6 +138,7 @@ async def start_optimization(settings: OptimizationSettings):
                         iteration=step,
                         loss=loss_val,
                         total_iterations=settings.iterations,
+                        phase="Optimizing",
                     )
                 except Exception:
                     import traceback
@@ -180,9 +192,14 @@ async def start_optimization(settings: OptimizationSettings):
                 pause_event=pause_event,
             )
 
+            run_device = result.get("device")
             cancelled = result.get("cancelled", False)
             if cancelled:
                 svc.update_status(job.job_id, "cancelled")
+                # Nothing keeps a cancelled run's state — and nothing will
+                # ever ask for it again, so its device memory goes back now
+                # rather than whenever this frame happens to be collected.
+                release_pipeline_result(result)
                 return
 
             # Store pipeline result for pruning later
@@ -190,6 +207,7 @@ async def start_optimization(settings: OptimizationSettings):
             logger.info("Optimization completed: job_id=%s", job.job_id)
 
             # Generate output files (STL, colored PLY, preview PNG, swap instructions)
+            svc.update_status(job.job_id, "running", phase="Exporting results")
             try:
                 from ..helpers.pipeline_runner import export_results
                 export_results(result)
@@ -198,6 +216,7 @@ async def start_optimization(settings: OptimizationSettings):
                 logger.warning("Could not export all output files: %s", exc)
 
             svc.update_status(job.job_id, "completed",
+                              phase=None,
                               progress=100.0,
                               iteration=settings.iterations,
                               total_iterations=settings.iterations)
@@ -207,6 +226,11 @@ async def start_optimization(settings: OptimizationSettings):
             traceback.print_exc()
             logger.error("Optimization failed: %s", e)
             svc.update_status(job.job_id, "failed", error=friendly_error_message(e))
+        finally:
+            # Training and export both leave large freed blocks in the
+            # caching allocator. Returning them keeps `nvidia-smi` honest and,
+            # more importantly, leaves room for the next image's init.
+            empty_device_cache(run_device)
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()

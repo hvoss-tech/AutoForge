@@ -31,6 +31,8 @@ test.describe('Input image and auto-preview', () => {
   })
 
   test('image + filament builds the 3D auto-preview and enables Run', async ({ page, request }) => {
+    // Waits for a real heightmap init, which alone can take ~30s under load.
+    test.setTimeout(120_000)
     await activePalette(request)
     await presetSettings(request, { max_layers: 40 })
     await openApp(page)
@@ -94,7 +96,7 @@ test.describe('Job feedback', () => {
       setTimeout(() => ws.send(jobMessage('failed', { error: 'The GPU ran out of memory.\n\nCUDA out of memory. Tried to allocate 2 GiB' })), 400)
     })
     await openApp(page)
-    await uploadImage(page)
+    await uploadAndWaitForPreview(page)
     await byTestId(page, 'top-start-btn').click()
 
     await expect(byTestId(page, 'toast-error')).toHaveText('Optimization failed: The GPU ran out of memory.')
@@ -109,17 +111,19 @@ test.describe('Job feedback', () => {
   })
 
   test('progress, iteration count and loss are shown while running', async ({ page, request }) => {
+    // Waits for a real heightmap init, which alone can take ~30s under load.
+    test.setTimeout(120_000)
     await activePalette(request)
     await page.route('**/api/optimize/start', (route) => route.fulfill({ json: { job_id: 'e2e-mock-job', total_iterations: 10, status: 'running' } }))
     await page.routeWebSocket(/\/ws\/optimize\//, (ws) => {
       ws.send(jobMessage('running'))
     })
     await openApp(page)
-    await uploadImage(page)
+    await uploadAndWaitForPreview(page)
     await byTestId(page, 'top-start-btn').click()
     await expect(byTestId(page, 'job-iteration-count')).toHaveText('(4/10)')
     await expect(byTestId(page, 'top-bar')).toContainText('40.0%')
-    await expect(byTestId(page, 'top-bar')).toContainText('Loss: 0.1234')
+    await expect(byTestId(page, 'job-phase')).toHaveText('Optimizing')
     await expect(byTestId(page, 'top-cancel-btn')).toBeVisible()
   })
 })
@@ -132,7 +136,7 @@ test.describe('Color sliders', () => {
     await expect(byTestId(page, 'filament-label-1')).toHaveText('E2E Drop Blue')
     await expect(byTestId(page, 'td-input-1')).toHaveValue('3.5')
     await expect(byTestId(page, 'color-indicator-1')).toHaveCSS('background-color', 'rgb(0, 51, 255)')
-    await expect(byTestId(page, `active-filament-${f.uuid}`)).toBeVisible()
+    await expect(page.locator(`[data-testid="filament-${f.uuid}"][data-active="true"]`)).toBeVisible()
   })
 
   test('TD and layer can be typed key by key', async ({ page }) => {
@@ -143,7 +147,7 @@ test.describe('Color sliders', () => {
     await expect(byTestId(page, 'td-input-0')).toHaveValue('1.25')
     await typeInto(page, 'layer-input-0', '12')
     await expect(byTestId(page, 'layer-input-0')).toHaveValue('12')
-    await expect(byTestId(page, 'depth-0')).toHaveText('0.48')
+    await expect(byTestId(page, 'depth-0')).toHaveText('0.48 mm')
     await byTestId(page, 'td-input-0').click()
     await expect(byTestId(page, 'color-core-handle-0')).toHaveAttribute('data-layer', /\d+/)
   })
@@ -159,15 +163,18 @@ test.describe('Color sliders', () => {
     await expect(byTestId(page, 'layer-input-0')).toHaveValue('75')
   })
 
-  test('the mouse wheel moves a slider one layer at a time within range', async ({ page }) => {
+  test('the mouse wheel scrolls the list and never moves a slider', async ({ page }) => {
+    // It used to move the hovered band one layer per notch, which made
+    // scrolling through the list rewrite the stack by accident.
     await openApp(page)
     const slider = byTestId(page, 'slider-0')
     await slider.hover()
     await page.mouse.wheel(0, -100)
-    await expect(byTestId(page, 'layer-input-0')).toHaveValue('9')
     await page.mouse.wheel(0, 100)
     await page.mouse.wheel(0, 100)
-    await expect(byTestId(page, 'layer-input-0')).toHaveValue('7')
+    await page.waitForTimeout(200)
+    await expect(byTestId(page, 'layer-input-0')).toHaveValue('8')
+    expect(await byTestId(page, 'slider-columns').evaluate((el) => el.scrollTop)).toBeGreaterThan(0)
   })
 
   test('toggling a column disables its inputs and removes its color-core handle', async ({ page }) => {
@@ -194,15 +201,16 @@ test.describe('Color sliders', () => {
     await openApp(page)
     // Defaults: top slider at layer 27 × 0.04mm + 0.24mm base. (The default
     // columns used to carry depths that didn't match their layers: 2.48.)
-    await expect(byTestId(page, 'mesh-height-label')).toContainText('1.32/')
-    await expect(byTestId(page, 'depth-3')).toHaveText('1.08')
+    await expect(byTestId(page, 'mesh-height-current')).toHaveText('1.32 mm')
+    await expect(byTestId(page, 'mesh-height-label')).toContainText('Max print height: 3.24 mm')
+    await expect(byTestId(page, 'depth-3')).toHaveText('1.08 mm')
     await typeInto(page, 'layer-input-3', '30')
     await byTestId(page, 'td-input-0').click()
-    await expect(byTestId(page, 'mesh-height-label')).toContainText('1.44/')
+    await expect(byTestId(page, 'mesh-height-current')).toHaveText('1.44 mm')
     // Depths follow a layer height change instead of keeping stale values.
     await typeInto(page, 'global-layer-height', '0.08')
-    await expect(byTestId(page, 'mesh-height-label')).toContainText('2.64/')
-    await expect(byTestId(page, 'depth-3')).toHaveText('2.40')
+    await expect(byTestId(page, 'mesh-height-current')).toHaveText('2.64 mm')
+    await expect(byTestId(page, 'depth-3')).toHaveText('2.40 mm')
   })
 })
 
@@ -226,7 +234,7 @@ test.describe('Color core', () => {
     await openApp(page)
     await page.locator(`[data-testid="filament-${f.uuid}"]`).dragTo(byTestId(page, 'color-core'))
     await expect(byTestId(page, 'filament-label-4')).toHaveText('E2E Core Drop')
-    await expect(byTestId(page, 'toggle-4')).toHaveText('-')
+    await expect(byTestId(page, 'toggle-4')).toHaveAttribute('data-enabled', 'true')
   })
 })
 
@@ -240,12 +248,16 @@ test.describe('Global parameters and settings', () => {
     await expect(byTestId(page, 'setting-layer_height')).toHaveValue('0.08')
   })
 
-  test('base layers and background height stay in sync', async ({ page }) => {
+  test('the base height is one field that can be edited in mm or layers', async ({ page }) => {
     await openApp(page)
+    await expect(byTestId(page, 'base-converted')).toHaveText('= 6 layers')
+    await byTestId(page, 'base-unit-layers').click()
     await typeInto(page, 'global-base-layers', '10')
+    await expect(byTestId(page, 'base-converted')).toHaveText('= 0.40 mm')
+    await byTestId(page, 'base-unit-mm').click()
     await expect(byTestId(page, 'global-background-height')).toHaveValue('0.4')
     await typeInto(page, 'global-background-height', '0.12')
-    await expect(byTestId(page, 'global-base-layers')).toHaveValue('3')
+    await expect(byTestId(page, 'base-converted')).toHaveText('= 3 layers')
   })
 
   test('dimension below the minimum is clamped when leaving the field', async ({ page }) => {
@@ -259,8 +271,10 @@ test.describe('Global parameters and settings', () => {
     await openApp(page)
     await byTestId(page, 'settings-button').click()
     await typeInto(page, 'setting-iterations', '1234.6')
-    await byTestId(page, 'setting-learning_rate').click()
+    await byTestId(page, 'setting-max_layers').click()
     await expect(byTestId(page, 'setting-iterations')).toHaveValue('1235')
+    await expect(byTestId(page, 'settings-preset-balanced')).toHaveAttribute('aria-pressed', 'false')
+    if (!(await byTestId(page, 'setting-learning_rate').isVisible())) await byTestId(page, 'settings-advanced-toggle').click()
     await typeInto(page, 'setting-learning_rate', '0.02')
     await byTestId(page, 'close-settings').click()
     await waitForSnapshot(page)
@@ -283,12 +297,50 @@ test.describe('Global parameters and settings', () => {
     expect(state.settings).toMatchObject({ init_heightmap_method: 'depth', auto_background_color: false, background_color: '#336699' })
   })
 
-  test('settings groups collapse', async ({ page }) => {
+  test('advanced settings are collapsed until asked for, and remembered', async ({ page }) => {
     await openApp(page)
     await byTestId(page, 'settings-button').click()
-    await expect(byTestId(page, 'setting-iterations')).toBeVisible()
-    await byTestId(page, 'settings-group-Optimization').click()
-    await expect(byTestId(page, 'setting-iterations')).toHaveCount(0)
+    await expect(byTestId(page, 'setting-max_layers')).toBeVisible()
+    await expect(byTestId(page, 'setting-learning_rate')).toHaveCount(0)
+    await byTestId(page, 'settings-advanced-toggle').click()
+    await expect(byTestId(page, 'setting-learning_rate')).toBeVisible()
+    await page.reload()
+    await byTestId(page, 'settings-button').click()
+    await expect(byTestId(page, 'setting-learning_rate')).toBeVisible()
+  })
+
+  test('quality presets set the iteration count', async ({ page }) => {
+    await openApp(page)
+    await byTestId(page, 'settings-button').click()
+    await byTestId(page, 'settings-preset-fast').click()
+    await expect(byTestId(page, 'setting-iterations')).toHaveValue('2000')
+    await expect(byTestId(page, 'settings-preset-fast')).toHaveAttribute('aria-pressed', 'true')
+    await byTestId(page, 'settings-preset-best').click()
+    await expect(byTestId(page, 'setting-iterations')).toHaveValue('15000')
+  })
+
+  test('Reset to defaults asks first and keeps the image', async ({ page }) => {
+    await openApp(page)
+    await uploadImage(page)
+    await byTestId(page, 'settings-button').click()
+    await typeInto(page, 'setting-max_layers', '40')
+    await byTestId(page, 'settings-reset-btn').click()
+    await byTestId(page, 'confirm-cancel').click()
+    await expect(byTestId(page, 'setting-max_layers')).toHaveValue('40')
+    await byTestId(page, 'settings-reset-btn').click()
+    await byTestId(page, 'confirm-ok').click()
+    await expect(byTestId(page, 'setting-max_layers')).toHaveValue('75')
+    await byTestId(page, 'close-settings').click()
+    await expect(byTestId(page, 'input-image')).toBeVisible()
+  })
+
+  test('the Settings dialog has no run or download buttons and one close button', async ({ page }) => {
+    await openApp(page)
+    await byTestId(page, 'settings-button').click()
+    for (const id of ['start-btn', 'cancel-btn', 'resume-btn', 'download-stl']) {
+      await expect(byTestId(page, 'settings-modal').locator(`[data-testid="${id}"]`)).toHaveCount(0)
+    }
+    await expect(byTestId(page, 'settings-modal').getByRole('button', { name: /close/i })).toHaveCount(1)
   })
 })
 
@@ -320,11 +372,11 @@ test.describe('App shell', () => {
     await setActive(request, [f])
     await page.route('**/api/optimize/start', (route) => route.fulfill({ status: 409, json: { detail: 'An optimization is already running.' } }))
     await openApp(page)
-    await uploadImage(page)
+    await uploadAndWaitForPreview(page)
     await byTestId(page, 'top-start-btn').click()
     await expect(byTestId(page, 'start-error')).toHaveText('An optimization is already running.')
 
-    await byTestId(page, `remove-filament-${f.uuid}`).click()
+    await byTestId(page, `toggle-filament-${f.uuid}`).click()
     await expect(byTestId(page, 'start-error')).toHaveCount(0)
     await expect(byTestId(page, 'run-disabled-reason')).toHaveText('Add at least one active filament first')
   })

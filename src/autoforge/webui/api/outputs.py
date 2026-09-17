@@ -82,6 +82,18 @@ def discard_slider_edits(job_id: str) -> None:
             os.remove(path)
 
 
+@router.get("/current-preview/{job_id}")
+async def current_preview(job_id: str):
+    """The result image as it currently looks: slider-edited if edited,
+    otherwise the optimizer's own. (/preview/{job_id} stays the optimizer's
+    file, for downloads.)"""
+    edited = _job_path(job_id, EDITED_PNG)
+    if edited and os.path.exists(edited):
+        return FileResponse(edited, media_type="image/png")
+    path = _resolve_or_404(job_id, "final_model.png", "Preview not found")
+    return FileResponse(path, media_type="image/png")
+
+
 @router.get("/colored-ply/{job_id}")
 async def download_colored_ply(job_id: str):
     """The mesh the 3D view shows: the user's slider-edited version when one

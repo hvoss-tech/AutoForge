@@ -58,23 +58,46 @@ test('a run from the UI: progress, result view, and a single history step for it
   await expect(byTestId(page, 'top-pruning-btn')).toBeEnabled()
   expect(await page.locator('[data-testid^="slider-column-"]').count()).toBeGreaterThan(0)
 
+  // The result is shown next to the original, and the 3D view has camera controls.
+  await expect(byTestId(page, 'image-view-split')).toHaveAttribute('aria-pressed', 'true')
+  await expect(byTestId(page, 'result-image')).toBeVisible()
+  await expect.poll(() => byTestId(page, 'result-image').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0)
+  for (const id of ['view-top-btn', 'view-angled-btn', 'view-reset-btn']) await byTestId(page, id).click()
+  await expect(byTestId(page, 'workflow-step-export')).toHaveAttribute('data-state', 'current')
+  // The print plan reflects the optimizer's stack.
+  await byTestId(page, 'tab-print-plan').click()
+  await expect(page.locator('[data-testid="plan-swap-row"]').first()).toBeVisible()
+  await byTestId(page, 'tab-color-layers').click()
+
   await waitForSnapshot(page)
   // Live slider updates during the run used to be recorded as dozens of
   // "Color slider edit" steps.
   expect(await historyLabels(page)).toEqual([...labelsBefore.map((l) => l.replace(/^▶/, '')), '▶Optimization completed'])
+
+  // Changing a setting the run used flags the result as out of date and makes
+  // Run the primary action again; changing it back clears that.
+  await expect(byTestId(page, 'top-start-btn')).toHaveAttribute('data-primary', 'false')
+  await typeInto(page, 'global-layer-height', '0.08')
+  await byTestId(page, 'global-params').click({ position: { x: 5, y: 5 } })
+  await expect(byTestId(page, 'job-stale-badge')).toBeVisible()
+  await expect(byTestId(page, 'top-start-btn')).toHaveAttribute('data-primary', 'true')
+  await typeInto(page, 'global-layer-height', '0.04')
+  await byTestId(page, 'global-params').click({ position: { x: 5, y: 5 } })
+  await expect(byTestId(page, 'job-done-badge')).toBeVisible()
+  await waitForSnapshot(page)
 })
 
 test('downloads and the export zip contain the result files', async ({ page, request }) => {
   await openApp(page)
   await expect(byTestId(page, 'three-d-view')).toBeVisible({ timeout: 15000 })
 
-  await byTestId(page, 'settings-button').click()
-  for (const [button, ext] of [['download-stl', 'stl'], ['download-preview', 'png'], ['download-instructions', 'txt'], ['download-project', 'hfp']]) {
+  // All downloads live in File › Export result (they used to be hidden in Settings).
+  for (const [button, filename] of [['download-stl', 'final_model.stl'], ['download-preview', 'final_model.png'], ['download-instructions', 'swap_instructions.txt'], ['download-project', 'final_model.hfp']]) {
+    await byTestId(page, 'file-menu-btn').click()
     const [download] = await Promise.all([page.waitForEvent('download'), byTestId(page, button).click()])
-    expect(download.suggestedFilename()).toBe(`final_model.${ext}`)
+    expect(download.suggestedFilename()).toBe(filename)
     expect(fs.statSync(await download.path()).size).toBeGreaterThan(0)
   }
-  await byTestId(page, 'close-settings').click()
 
   await byTestId(page, 'file-menu-btn').click()
   const [zip] = await Promise.all([page.waitForEvent('download'), byTestId(page, 'file-menu-export').click()])
@@ -111,8 +134,8 @@ test('undoing past the run and redoing back keeps history, preview and result in
   expect(resultIndex).toBeGreaterThan(0)
   const pngBefore = await fetchHash(request, `/api/outputs/preview/${jobId}`)
   const stepsBack = labels.length - 1 - (resultIndex - 1)
-  const undo = page.getByRole('button', { name: '↶ Undo' })
-  const redo = page.getByRole('button', { name: '↷ Redo' })
+  const undo = byTestId(page, 'undo-btn')
+  const redo = byTestId(page, 'redo-btn')
 
   // Back to before the result: the pre-run preview, no result.
   for (let i = 0; i < stepsBack; i++) {
@@ -144,9 +167,19 @@ test('undoing past the run and redoing back keeps history, preview and result in
   await expect(page.locator('[data-testid="toast-error"]')).toHaveCount(0)
 })
 
-test('a reload shows the finished result again', async ({ page }) => {
+test('a reload shows the finished result again, image included', async ({ page }) => {
   await openApp(page)
   await expect(byTestId(page, 'three-d-view')).toBeVisible({ timeout: 15000 })
+  // The image comes back with the result (it used to show an empty upload box
+  // next to "Done").
+  await expect(byTestId(page, 'input-image')).toBeVisible()
+  await expect(byTestId(page, 'session-restored-banner')).toContainText('result')
+  await byTestId(page, 'image-view-compare').click()
+  await expect(byTestId(page, 'image-compare')).toBeVisible()
+  const divider = byTestId(page, 'compare-divider')
+  await divider.focus()
+  await page.keyboard.press('ArrowLeft')
+  await expect(divider).toHaveAttribute('aria-valuenow', '45')
   await expect(byTestId(page, 'top-pruning-btn')).toBeEnabled()
   await byTestId(page, 'file-menu-btn').click()
   await expect(byTestId(page, 'file-menu-export')).toBeEnabled()
@@ -158,16 +191,26 @@ test('pruning from the dialog reduces the stack and is an undo step', async ({ p
   const columnsBefore = await page.locator('[data-testid^="slider-column-"]').count()
 
   await byTestId(page, 'top-pruning-btn').click()
+  // The dialog shows what there is to reduce and opens on exactly those
+  // numbers — it no longer proposes a reduction the user didn't ask for, so
+  // the cut below is the user's own choice.
+  const currentSwaps = Number(await byTestId(page, 'pruning-current-swaps').getAttribute('data-value'))
+  expect(currentSwaps).toBeGreaterThan(0)
+  await expect(byTestId(page, 'pruning-max-swaps')).toHaveValue(String(currentSwaps))
   await typeInto(page, 'pruning-max-colors', '3')
   await typeInto(page, 'pruning-max-swaps', '4')
   await expect(byTestId(page, 'pruning-max-colors')).toHaveValue('3')
   await byTestId(page, 'pruning-start-btn').click()
-  await expect(byTestId(page, 'pruning-modal')).toHaveCount(0)
+  // Progress is shown in the dialog; it can be closed and keeps running.
+  await expect(byTestId(page, 'pruning-progress-view')).toBeVisible()
+  await expect(byTestId(page, 'pruning-modal-status')).toHaveText('Pruning finished — the color layers were updated.', { timeout: 200000 })
+  await expect(byTestId(page, 'pruning-summary')).toContainText('→')
+  await byTestId(page, 'pruning-close-btn').click()
 
-  await expect(byTestId(page, 'pruning-done')).toBeVisible({ timeout: 200000 })
+  await expect(byTestId(page, 'pruning-done')).toBeVisible()
   await expect.poll(() => page.locator('[data-testid^="slider-column-"]').count(), { timeout: 15000 }).toBeLessThanOrEqual(Math.max(columnsBefore, 5))
   const materials = new Set(
-    await page.locator('[data-testid^="filament-label-"]').allInnerTexts(),
+    await page.locator('[data-testid^="filament-label-"]').evaluateAll((els) => els.map((e) => e.textContent)),
   )
   expect(materials.size).toBeLessThanOrEqual(3)
   await waitForSnapshot(page)
@@ -176,7 +219,7 @@ test('pruning from the dialog reduces the stack and is an undo step', async ({ p
   expect(instructions.ok()).toBeTruthy()
 })
 
-test('pause, resume and cancel from the UI; the Settings dialog offers Resume, not a second run', async ({ page, request }) => {
+test('pause, resume and cancel from the UI', async ({ page, request }) => {
   await presetSettings(request, { ...FAST_SETTINGS, iterations: 20000, early_stopping: 100000 })
   await openApp(page)
   await uploadImage(page)
@@ -193,11 +236,17 @@ test('pause, resume and cancel from the UI; the Settings dialog offers Resume, n
   await page.waitForTimeout(1500)
   expect((await (await request.get(`/api/optimize/status/${paused.job_id}`)).json()).iteration).toBe(iteration)
 
+  // Settings can be opened while paused without offering a second run.
   await byTestId(page, 'settings-button').click()
-  await expect(byTestId(page, 'start-btn')).toHaveCount(0)
-  await byTestId(page, 'resume-btn').click()
-  await expect(byTestId(page, 'cancel-btn')).toBeVisible()
+  await expect(byTestId(page, 'settings-modal')).toContainText('not the one currently running')
   await byTestId(page, 'close-settings').click()
+  await expect(byTestId(page, 'job-phase')).toHaveText('Paused')
+  // Details (loss curve, timing) open from the progress pill at any width.
+  await byTestId(page, 'job-progress').click()
+  await expect(byTestId(page, 'job-progress-details')).toContainText('Iteration')
+  await expect(byTestId(page, 'job-loss')).toBeVisible()
+  await page.keyboard.press('Escape')
+  await byTestId(page, 'top-resume-btn').click()
   await expect(byTestId(page, 'top-pause-btn')).toBeVisible()
 
   await byTestId(page, 'top-cancel-btn').click()

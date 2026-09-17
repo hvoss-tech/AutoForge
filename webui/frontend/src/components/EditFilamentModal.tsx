@@ -1,8 +1,9 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
+import type { Filament } from '../types'
 import { NumberInput } from './ui/number-input'
 import { refreshLibrary } from '../services/filamentService'
-import { X, Pencil, Trash2 } from 'lucide-react'
+import { Check, X, Pencil, Trash2 } from 'lucide-react'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from './ui/dialog'
 
 const DEFAULT_TYPES = ['PLA', 'PETG', 'ABS', 'TPU', 'ASA', 'Nylon', 'PC', 'PVB']
@@ -29,6 +30,9 @@ export const EditFilamentModal: React.FC = () => {
   const [colorB, setColorB] = React.useState(128)
   const [confirmingDelete, setConfirmingDelete] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+  const [savedAt, setSavedAt] = React.useState<number | null>(null)
+  const [baseline, setBaseline] = React.useState<Filament | null>(null)
+  const autoSaveLibrary = useAppStore((s) => s.autoSaveLibrary)
 
   React.useEffect(() => {
     if (!editingFilament) return
@@ -44,6 +48,8 @@ export const EditFilamentModal: React.FC = () => {
     setConfirmingDelete(false)
     setCustomType('')
     setError(null)
+    setSavedAt(null)
+    setBaseline(editingFilament)
   }, [editingFilament])
 
   const isAddingCustomType = filamentType === NEW_TYPE_SENTINEL
@@ -51,16 +57,37 @@ export const EditFilamentModal: React.FC = () => {
 
   const hexColor = `#${colorR.toString(16).padStart(2, '0')}${colorG.toString(16).padStart(2, '0')}${colorB.toString(16).padStart(2, '0')}`
 
+  // "Different from what the library holds" — auto save only fires on a real
+  // change, so opening the dialog writes nothing back, and a save that just
+  // succeeded doesn't immediately queue another one. `baseline` deliberately
+  // is not `editingFilament`: rewriting that after each save would reset
+  // every field from the response and yank the cursor out of whatever the
+  // user was still typing.
+  const dirty = !!baseline && (
+    brand !== baseline.brand ||
+    name !== baseline.name ||
+    hexColor.toLowerCase() !== (baseline.color || '').toLowerCase() ||
+    td !== baseline.td ||
+    owned !== baseline.owned ||
+    effectiveType !== (baseline.filament_type || 'PLA')
+  )
+
   const close = () => {
     setEditFilamentModalOpen(false)
     setEditingFilament(null)
   }
 
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!editingFilament || !brand || !name) return
-    if (isAddingCustomType && !effectiveType) return
+  /** Writes the form to the library. Returns false if it couldn't.
+   *
+   * `reloadLibrary` is off for auto saves: refreshLibrary() refetches types,
+   * brands and the list *and* switches the visible tab to the filament's
+   * type, which is right when the user presses Done but jarring (and three
+   * extra requests) every time a debounced keystroke lands. The saved record
+   * is patched into the list instead, which is all the list needs. */
+  const persist = React.useCallback(async ({ reloadLibrary = true } = {}): Promise<boolean> => {
+    if (!editingFilament || !brand || !name) return false
+    if (isAddingCustomType && !effectiveType) return false
     setError(null)
 
     const updated = {
@@ -82,15 +109,16 @@ export const EditFilamentModal: React.FC = () => {
       })
       if (!response.ok) {
         setError('Failed to save changes')
-        return
+        return false
       }
       const saved = await response.json()
 
       // If this filament is active, refresh that list too — the sliders
       // and color core read filament color/TD by uuid lookup, so simply
       // syncing this list is enough for them to pick up the new values.
-      if (activeFilaments.some((f) => f.uuid === editingFilament.uuid)) {
-        setActiveFilaments(activeFilaments.map((f) => (f.uuid === editingFilament.uuid ? saved : f)))
+      const active = useAppStore.getState().activeFilaments
+      if (active.some((f) => f.uuid === editingFilament.uuid)) {
+        setActiveFilaments(active.map((f) => (f.uuid === editingFilament.uuid ? saved : f)))
         await fetch('/api/filaments/active', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -106,12 +134,38 @@ export const EditFilamentModal: React.FC = () => {
           setSliders(colorSliders.map((s) => (s.filament_uuid === saved.uuid ? { ...s, td: saved.td } : s)))
         }
       }
-      await refreshLibrary(effectiveType)
-      close()
+      if (reloadLibrary) {
+        await refreshLibrary(effectiveType)
+      } else {
+        useAppStore.setState((state) => ({
+          filaments: state.filaments.map((f) => (f.uuid === saved.uuid ? saved : f)),
+        }))
+      }
+      setBaseline(saved)
+      setSavedAt(Date.now())
+      return true
     } catch (err) {
       console.error('Failed to update filament:', err)
       setError('Failed to save changes')
+      return false
     }
+  }, [editingFilament, brand, name, hexColor, td, owned, effectiveType, isAddingCustomType, setActiveFilaments])
+
+  // Auto save: every edit lands in the library shortly after it's made, so
+  // closing the dialog (or the tab) can't quietly discard it. Debounced,
+  // because dragging an R/G/B slider would otherwise fire a request per pixel.
+  const persistRef = React.useRef(persist)
+  persistRef.current = persist
+  React.useEffect(() => {
+    if (!autoSaveLibrary || !editFilamentModalOpen || !editingFilament) return
+    if (!dirty) return
+    const timer = setTimeout(() => { persistRef.current({ reloadLibrary: false }) }, 400)
+    return () => clearTimeout(timer)
+  }, [autoSaveLibrary, editFilamentModalOpen, editingFilament, dirty])
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (await persist()) close()
   }
 
   const handleDelete = async () => {
@@ -144,7 +198,7 @@ export const EditFilamentModal: React.FC = () => {
 
   return (
     <Dialog open={editFilamentModalOpen} onOpenChange={(open) => { if (!open) close() }}>
-      <DialogContent data-testid="edit-filament-modal">
+      <DialogContent className="p-0 gap-0 bg-gray-900 border-gray-700" data-testid="edit-filament-modal">
         <div className="bg-gray-900 rounded-lg w-full flex flex-col">
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
           <DialogTitle className="text-sm font-semibold text-gray-200 flex items-center gap-2 leading-none tracking-normal">
@@ -154,7 +208,7 @@ export const EditFilamentModal: React.FC = () => {
           <DialogDescription className="sr-only">
             Edit or delete this filament's brand, name, type, transmission distance, and color.
           </DialogDescription>
-          <button onClick={close} className="text-gray-400 hover:text-gray-200" data-testid="close-edit-filament">
+          <button onClick={close} className="text-gray-400 hover:text-gray-200" aria-label="Close" data-testid="close-edit-filament">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -290,12 +344,25 @@ export const EditFilamentModal: React.FC = () => {
               <Trash2 className="w-3 h-3" />
               {confirmingDelete ? 'Confirm delete?' : 'Delete'}
             </button>
-            <div className="flex gap-2">
-              <button type="button" onClick={close} className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-200">
-                Cancel
+            <div className="flex items-center gap-2">
+              {autoSaveLibrary && (
+                <span className="flex items-center gap-1 text-[11px] text-gray-400" data-testid="edit-filament-autosave-state" data-dirty={dirty || undefined}>
+                  {dirty ? (
+                    'Saving…'
+                  ) : savedAt ? (
+                    <>
+                      <Check className="w-3 h-3 text-emerald-500" /> Saved
+                    </>
+                  ) : (
+                    'Auto save is on'
+                  )}
+                </span>
+              )}
+              <button type="button" onClick={close} className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-200" data-testid="close-edit-filament-btn">
+                {autoSaveLibrary ? 'Close' : 'Cancel'}
               </button>
               <button type="submit" className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-xs text-white" data-testid="save-filament-btn">
-                Save Changes
+                {autoSaveLibrary ? 'Done' : 'Save Changes'}
               </button>
             </div>
           </div>

@@ -18,8 +18,20 @@ export function luminance(hex: string): number {
   return 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2]
 }
 
+/** Black or white, whichever has the higher WCAG contrast ratio against the
+ * color. The old "luminance > 0.5" cut-off put white text on mid-tones like
+ * green, orange or silver, where it was barely readable. */
 export function contrastTextColor(hex: string): string {
-  return luminance(hex) > 0.5 ? '#000000' : '#ffffff'
+  const rgb = hexToRgb(hex)
+  if (!rgb) return '#ffffff'
+  const channel = (v: number) => {
+    const c = v / 255
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+  }
+  const L = 0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
+  const onBlack = (L + 0.05) / 0.05
+  const onWhite = 1.05 / (L + 0.05)
+  return onBlack >= onWhite ? '#000000' : '#ffffff'
 }
 
 export function hexToTdOverlay(td: number, maxTd: number = 20): string {

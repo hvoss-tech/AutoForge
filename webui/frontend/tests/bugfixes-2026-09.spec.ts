@@ -18,14 +18,17 @@ test.afterEach(async ({ baseURL }) => {
   await cleanupTestFilaments(baseURL!)
 })
 
-test.describe('Active Filaments panel — double-click and drag (bug #1, #2)', () => {
+const activeRows = '[data-testid="filament-list"] [data-testid^="filament-"][data-active="true"]'
+
+test.describe('Active filaments — double-click and drag (bug #1, #2)', () => {
   test('double-clicking an active filament opens the edit modal', async ({ page }) => {
     // Activate the first library filament via its own "+" toggle (deterministic,
     // doesn't depend on drag simulation working).
     const firstToggle = page.locator('[data-testid="filament-list"] [data-testid^="toggle-filament-"]').first()
     await firstToggle.click()
+    await page.locator('[data-testid="active-only-toggle"]').click()
 
-    const activeRow = page.locator('[data-testid="active-filaments-list"] [data-testid^="active-filament-"]').first()
+    const activeRow = page.locator(activeRows).first()
     await expect(activeRow).toBeVisible()
 
     await activeRow.dblclick()
@@ -38,8 +41,8 @@ test.describe('Active Filaments panel — double-click and drag (bug #1, #2)', (
   test('active filament rows are draggable (drag source for slider assignment)', async ({ page }) => {
     const firstToggle = page.locator('[data-testid="filament-list"] [data-testid^="toggle-filament-"]').first()
     await firstToggle.click()
-    await expect(page.locator('[data-testid="active-filaments-list"] [data-testid^="active-filament-"]')).toHaveCount(1)
-    const activeRow = page.locator('[data-testid="active-filaments-list"] [data-testid^="active-filament-"]').first()
+    await expect(page.locator(activeRows)).toHaveCount(1)
+    const activeRow = page.locator(activeRows).first()
     await expect(activeRow).toHaveAttribute('draggable', 'true')
   })
 })
@@ -50,7 +53,7 @@ test.describe('Dragging a filament onto a slider (bug #2, #10)', () => {
     const uuid = await libraryItem.getAttribute('data-testid').then((v) => v!.replace('filament-', ''))
 
     // Sanity: not active yet.
-    await expect(page.locator(`[data-testid="active-filament-${uuid}"]`)).toHaveCount(0)
+    await expect(page.locator(`[data-testid="filament-${uuid}"][data-active="true"]`)).toHaveCount(0)
 
     const targetSlider = page.locator('[data-testid="slider-column-0"]')
     await libraryItem.dragTo(targetSlider)
@@ -60,7 +63,7 @@ test.describe('Dragging a filament onto a slider (bug #2, #10)', () => {
     // ...and now also in Active Filaments, not just referenced by the slider —
     // this is the part that was missing: the optimizer only ever sees
     // active_filaments, so a slider-only assignment was invisible to it.
-    await expect(page.locator(`[data-testid="active-filament-${uuid}"]`)).toBeVisible({ timeout: 5000 })
+    await expect(page.locator(`[data-testid="filament-${uuid}"][data-active="true"]`)).toBeVisible({ timeout: 5000 })
   })
 })
 

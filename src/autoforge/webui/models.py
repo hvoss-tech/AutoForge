@@ -100,6 +100,19 @@ class JobStatus(CamelCaseModel):
     completed_at: Optional[str] = None
     preview_image: Optional[str] = None
     phase: Optional[str] = None
+    # Live counts of the solution as it stands, reported while pruning runs.
+    # Pruning's whole purpose is to bring these down, so the dialog shows them
+    # changing as it happens rather than only once the job is finished.
+    result_colors: Optional[int] = None
+    result_swaps: Optional[int] = None
+    result_layers: Optional[int] = None
+    # Which pruning pass is running, and how many are allowed, when pruning
+    # repeats itself until it stops improving.
+    pruning_pass: Optional[int] = None
+    pruning_max_passes: Optional[int] = None
+    # The loss pruning started from, so the UI can show what it has gained
+    # (`loss` carries the live value). Lower is closer to the input image.
+    pruning_start_loss: Optional[float] = None
 
 
 class PruningSettings(CamelCaseModel):
@@ -107,6 +120,23 @@ class PruningSettings(CamelCaseModel):
     pruning_max_swaps: int = 100
     pruning_max_layer: int = 75
     job_id: Optional[str] = None
+    # Keep pruning the same result until a pass stops finding an
+    # improvement. Pruning is a greedy search that restarts from whatever it
+    # is given, so repeated passes keep gaining — but only up to a point, and
+    # nobody wants to sit there pressing the button.
+    auto_repeat: bool = False
+    # Safety net for auto_repeat: a pass is minutes of GPU work, and a metric
+    # that oscillates by a hair could otherwise loop forever.
+    max_passes: int = Field(25, ge=1, le=200)
+    # Two optional polish passes that run *before* the reduction phases.
+    # Every pruning phase is a greedy search scored against the current
+    # solution, so a better starting point improves everything after it.
+    # Both are strictly non-worsening (see FilamentOptimizer.rng_seed_search
+    # and .polish_height_offsets) and both were previously hardcoded on.
+    seed_search: bool = True
+    seed_search_count: int = Field(200, ge=1, le=20000)
+    fine_tune_height: bool = True
+    fine_tune_steps: int = Field(50, ge=1, le=2000)
 
 
 class StateSnapshot(CamelCaseModel):
