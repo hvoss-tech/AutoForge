@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { useAppStore } from '../store/appStore'
+import { NumberInput } from './ui/number-input'
 import { X, Play } from 'lucide-react'
 
 export const PruningModal: React.FC = () => {
@@ -46,17 +47,13 @@ export const PruningModal: React.FC = () => {
             <label className="block text-xs text-gray-400 mb-1">
               Max Colors
             </label>
-            <input
-              type="number"
+            <NumberInput
               value={localSettings.pruning_max_colors}
-              onChange={(e) =>
-                setLocalSettings({
-                  ...localSettings,
-                  pruning_max_colors: parseInt(e.target.value) || 100,
-                })
-              }
+              onValueChange={(v) => setLocalSettings((prev) => ({ ...prev, pruning_max_colors: v }))}
               className="w-full text-sm bg-gray-700 border border-gray-600 rounded px-2 py-1.5 text-gray-200 focus:outline-none focus:border-blue-500"
+              integer
               min={1}
+              data-testid="pruning-max-colors"
             />
           </div>
 
@@ -64,17 +61,13 @@ export const PruningModal: React.FC = () => {
             <label className="block text-xs text-gray-400 mb-1">
               Max Swaps
             </label>
-            <input
-              type="number"
+            <NumberInput
               value={localSettings.pruning_max_swaps}
-              onChange={(e) =>
-                setLocalSettings({
-                  ...localSettings,
-                  pruning_max_swaps: parseInt(e.target.value) || 100,
-                })
-              }
+              onValueChange={(v) => setLocalSettings((prev) => ({ ...prev, pruning_max_swaps: v }))}
               className="w-full text-sm bg-gray-700 border border-gray-600 rounded px-2 py-1.5 text-gray-200 focus:outline-none focus:border-blue-500"
+              integer
               min={1}
+              data-testid="pruning-max-swaps"
             />
           </div>
 
@@ -82,18 +75,14 @@ export const PruningModal: React.FC = () => {
             <label className="block text-xs text-gray-400 mb-1">
               Max Layers
             </label>
-            <input
-              type="number"
+            <NumberInput
               value={localSettings.pruning_max_layer}
-              onChange={(e) =>
-                setLocalSettings({
-                  ...localSettings,
-                  pruning_max_layer: parseInt(e.target.value) || 75,
-                })
-              }
+              onValueChange={(v) => setLocalSettings((prev) => ({ ...prev, pruning_max_layer: v }))}
               className="w-full text-sm bg-gray-700 border border-gray-600 rounded px-2 py-1.5 text-gray-200 focus:outline-none focus:border-blue-500"
+              integer
               min={1}
               max={200}
+              data-testid="pruning-max-layer"
             />
           </div>
 

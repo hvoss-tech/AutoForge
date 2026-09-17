@@ -12,6 +12,7 @@ import { ImportModal } from './components/ImportModal'
 import { ToastContainer } from './components/ToastContainer'
 import { useAppStore } from './store/appStore'
 import { useJobWebSocket } from './hooks/useJobWebSocket'
+import { historyShortcut } from './lib/history'
 
 const App: React.FC = () => {
   const loadProjectState = useAppStore((s) => s.loadProjectState)
@@ -22,7 +23,11 @@ const App: React.FC = () => {
   const sliderLayerRange = useAppStore((s) => s.sliderLayerRange)
   const settings = useAppStore((s) => s.settings)
 
-  const enabledDepths = colorSliders.filter((s) => s.enabled && s.layer > 0).map((s) => s.depth_mm)
+  // From layer × layer height, not the stored depth_mm: that copy goes stale
+  // when the layer height changes, and the built-in default columns never
+  // matched it (layer 27 claimed 2.24mm at 0.04mm layers).
+  const layerHeight = settings.layer_height || 0.04
+  const enabledDepths = colorSliders.filter((s) => s.enabled && s.layer > 0).map((s) => s.layer * layerHeight)
   // Both current and total measure from the true build-plate Z=0, matching
   // the actual mesh's top surface (background_height + print layers, see
   // helpers/colored_mesh.py's top_z) — even with zero color layers placed,
@@ -90,13 +95,11 @@ const App: React.FC = () => {
   // Keyboard shortcuts for undo/redo
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.key === 'z') {
-        e.preventDefault()
-        useAppStore.getState().redo()
-      } else if (e.ctrlKey && e.key === 'z') {
-        e.preventDefault()
-        useAppStore.getState().undo()
-      }
+      const action = historyShortcut(e)
+      if (!action) return
+      e.preventDefault()
+      if (action === 'undo') useAppStore.getState().undo()
+      else useAppStore.getState().redo()
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)

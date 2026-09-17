@@ -1,6 +1,7 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
-import { loadFilamentTypes } from '../services/filamentService'
+import { NumberInput } from './ui/number-input'
+import { refreshLibrary } from '../services/filamentService'
 import { X, Pencil, Trash2 } from 'lucide-react'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from './ui/dialog'
 
@@ -13,7 +14,6 @@ export const EditFilamentModal: React.FC = () => {
   const editingFilament = useAppStore((s) => s.editingFilament)
   const setEditingFilament = useAppStore((s) => s.setEditingFilament)
   const filamentTypes = useAppStore((s) => s.filamentTypes)
-  const setFilaments = useAppStore((s) => s.setFilaments)
   const activeFilaments = useAppStore((s) => s.activeFilaments)
   const setActiveFilaments = useAppStore((s) => s.setActiveFilaments)
   const removeActiveFilament = useAppStore((s) => s.removeActiveFilament)
@@ -56,10 +56,6 @@ export const EditFilamentModal: React.FC = () => {
     setEditingFilament(null)
   }
 
-  const refreshFilaments = async () => {
-    const refetch = await fetch('/api/filaments')
-    setFilaments(await refetch.json())
-  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -101,9 +97,16 @@ export const EditFilamentModal: React.FC = () => {
           body: JSON.stringify(saved),
         }).catch(() => {})
       }
-
-      if (isAddingCustomType) await loadFilamentTypes()
-      await refreshFilaments()
+      // Sliders keep their own TD copy (it's what the render uses); carry a
+      // changed library TD over to the sliders using this filament, or the
+      // edit would have no visible effect.
+      if (saved.td !== editingFilament.td) {
+        const { colorSliders, setSliders } = useAppStore.getState()
+        if (colorSliders.some((s) => s.filament_uuid === saved.uuid)) {
+          setSliders(colorSliders.map((s) => (s.filament_uuid === saved.uuid ? { ...s, td: saved.td } : s)))
+        }
+      }
+      await refreshLibrary(effectiveType)
       close()
     } catch (err) {
       console.error('Failed to update filament:', err)
@@ -127,7 +130,7 @@ export const EditFilamentModal: React.FC = () => {
       if (activeFilaments.some((f) => f.uuid === editingFilament.uuid)) {
         await removeActiveFilament(editingFilament.uuid)
       }
-      await refreshFilaments()
+      await refreshLibrary()
       close()
     } catch (err) {
       console.error('Failed to delete filament:', err)
@@ -213,13 +216,11 @@ export const EditFilamentModal: React.FC = () => {
             </div>
             <div className="flex flex-col gap-1">
               <label className="text-xs text-gray-400">Transmission Distance (TD)</label>
-              <input
-                type="number"
+              <NumberInput
                 value={td}
-                onChange={(e) => setTd(parseFloat(e.target.value) || 0)}
+                onValueChange={setTd}
                 step={0.1}
                 min={0}
-                max={10}
                 className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-gray-200 focus:outline-none focus:border-blue-500"
                 data-testid="edit-filament-td"
               />

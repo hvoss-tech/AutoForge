@@ -12,6 +12,23 @@ const TINY_PNG_BYTES = Buffer.from([
 ])
 
 test.describe('Pipeline E2E Tests', () => {
+  // Only one optimization may run at a time; don't let a test that stops
+  // watching its job early (e.g. once progress shows up) block the next one.
+  test.afterEach(async ({ request }) => {
+    const latest = await request.get('/api/optimize/latest')
+    if (!latest.ok()) return
+    const job = await latest.json()
+    if (!['pending', 'running', 'paused'].includes(job.status)) return
+    await request.post(`/api/optimize/cancel/${job.job_id}`)
+    for (let i = 0; i < 100; i++) {
+      const s = await (await request.get(`/api/optimize/status/${job.job_id}`)).json()
+      if (s.status !== 'running' && s.status !== 'paused' && s.status !== 'pending') break
+      await new Promise((r) => setTimeout(r, 200))
+    }
+    // The worker thread notices the cancel between iterations; give it a moment.
+    await new Promise((r) => setTimeout(r, 1000))
+  })
+
 
   test('upload image and add active filaments via API', async ({ request }) => {
     // Upload a test image
@@ -178,7 +195,7 @@ test.describe('Pipeline E2E Tests', () => {
 
     // Now run pruning
     const pruneResp = await request.post('/api/pruning/start', {
-      data: { pruning_max_colors: 5, pruning_max_swaps: 5, pruning_max_layer: 5 }
+      data: { pruning_max_colors: 5, pruning_max_swaps: 5, pruning_max_layer: 5, job_id: job_id2 }
     })
     expect(pruneResp.ok()).toBeTruthy()
     const { job_id: pruneJobId } = await pruneResp.json()
@@ -210,53 +227,18 @@ test.describe('Pipeline E2E Tests', () => {
   }, 300_000) // 5 min timeout
 
   test('error when no active filaments', async ({ request }) => {
-    // Upload image
     const uploadResp = await request.post('/api/images/upload', {
       multipart: { file: { name: 'test.png', mimeType: 'image/png', buffer: TINY_PNG_BYTES } }
     })
     expect(uploadResp.ok()).toBeTruthy()
     const { filename } = await uploadResp.json()
 
-    // Delete all active filaments
-    const activeResp = await request.get('/api/filaments/active')
-    if (activeResp.ok()) {
-      for (const f of await activeResp.json()) {
-        await request.delete(`/api/filaments/active/${f.uuid}`)
-      }
-    }
+    await request.put('/api/filaments/active', { data: [] })
 
-    // Start optimization - should succeed (job is created)
-    const startResp = await request.post('/api/optimize/start', {
-      data: {
-        input_image: filename,
-        iterations: 2, max_layers: 3, layer_height: 0.04, background_height: 0.12,
-        stl_output_size: 20, processing_reduction_factor: 1, random_seed: 42,
-        num_init_rounds: 1, num_init_cluster_layers: 3, learning_rate: 0.01,
-        init_tau: 1.0, final_tau: 0.5, early_stopping: 1000, visualize: false,
-        perform_pruning: false, num_init_threads: 1, best_of: 1, discrete_check: 1,
-        csv_file: '', json_file: '',
-      }
-    })
-    expect(startResp.ok()).toBeTruthy()
-    const { job_id } = await startResp.json()
-
-    // Job should fail with the "no active filaments" error
-    const deadline = Date.now() + 30_000
-    let failed = false
-    while (Date.now() < deadline) {
-      const sr = await request.get(`/api/optimize/status/${job_id}`)
-      if (sr.ok()) {
-        const s = await sr.json()
-        if (s.status === 'failed') {
-          expect(s.error).toContain('active filaments')
-          failed = true
-          break
-        }
-        if (s.status === 'completed') break
-      }
-      await new Promise(r => setTimeout(r, 200))
-    }
-    expect(failed).toBeTruthy()
+    // Rejected up front — no job is created that would briefly look "running".
+    const startResp = await request.post('/api/optimize/start', { data: { input_image: filename, iterations: 2 } })
+    expect(startResp.status()).toBe(400)
+    expect((await startResp.json()).detail).toContain('active filament')
   })
 
   test('pause, resume and cancel an optimization job from the UI', async ({ page }) => {
@@ -508,36 +490,22 @@ test.describe('Pipeline E2E Tests', () => {
   })
 
   test('optimize start requires input_image', async ({ request }) => {
+    await request.post('/api/filaments/active', { data: { uuid: 'e2e-needs-image', brand: 'E2E', name: 'Img', color: '#ff0000', td: 1 } })
     const sr = await request.post('/api/optimize/start', {
       data: { iterations: 1, max_layers: 1, visualize: false, csv_file: '', json_file: '', input_image: '' }
     })
-    // The job is created successfully; it fails in the background thread
-    expect(sr.ok()).toBeTruthy()
-    const { job_id } = await sr.json()
-    const deadline = Date.now() + 10_000
-    let failed = false
-    while (Date.now() < deadline) {
-      const s = await (await request.get(`/api/optimize/status/${job_id}`)).json()
-      if (s.status === 'failed') {
-        failed = true
-        expect(s.error).toContain('No input image')
-        break
-      }
-      if (s.status === 'completed') break
-      await new Promise(r => setTimeout(r, 200))
-    }
-    expect(failed).toBeTruthy()
+    expect(sr.status()).toBe(400)
+    expect((await sr.json()).detail).toContain('input image')
   })
 
   test('pruning without completed optimization returns error', async ({ request }) => {
     const sr = await request.post('/api/pruning/start', {
       data: { pruning_max_colors: 5, pruning_max_swaps: 5, pruning_max_layer: 5 }
     })
-    // May succeed or return error depending on whether other tests left completed jobs
-    if (!sr.ok()) {
-      const err = await sr.json()
-      expect(err.detail).toContain('No completed optimization')
-    }
+    // Pruning is always pinned to an explicit job_id (the result on screen),
+    // so a request without one is rejected regardless of job history.
+    expect(sr.status()).toBe(400)
+    expect((await sr.json()).detail).toContain('Run an optimization first')
   })
 
   test('filament CRUD is idempotent', async ({ request }) => {

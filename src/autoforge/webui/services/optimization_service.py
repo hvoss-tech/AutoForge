@@ -6,6 +6,8 @@ from typing import Optional
 from datetime import datetime, timezone
 from ..models import JobStatus, OptimizationSettings
 
+TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
 
 class OptimizationService:
     def __init__(self, checkpoints_dir: str = "checkpoints"):
@@ -37,7 +39,12 @@ class OptimizationService:
                     self._jobs[job_id] = js
                     record_settings = record.get("settings")
                     if isinstance(record_settings, dict):
-                        self._settings[job_id] = OptimizationSettings(**record_settings)
+                        try:
+                            self._settings[job_id] = OptimizationSettings(**record_settings)
+                        except ValueError:
+                            # Recorded before settings were range-checked;
+                            # the job's status is still worth keeping.
+                            pass
             except (json.JSONDecodeError, IOError, KeyError):
                 pass
 
@@ -111,13 +118,13 @@ class OptimizationService:
                     ev = self._pause_events.get(job_id)
                     if ev is not None and ev.is_set():
                         status = "paused"
-                # A job that already reached a terminal state must stay there.
-                # Cancelling a job races the background thread's own first
-                # "running" update (fired right after thread.start()) — without
-                # this guard that update can silently resurrect an already
-                # cancelled job back to "running".
-                elif js.status in ("cancelled", "failed", "completed"):
-                    status = js.status
+            # A job that already reached a terminal state must stay there.
+            # Cancelling a job races the background thread's own updates: its
+            # first "running" update (fired right after thread.start()) could
+            # resurrect a cancelled job, and an exception or export finishing
+            # after the cancel could turn it into "failed"/"completed".
+            if js is not None and js.status in TERMINAL_STATUSES:
+                return js
             return self._update_status_locked(job_id, status, **kwargs)
 
     def save_job_result(self, job_id: str, result: JobStatus):
@@ -153,6 +160,13 @@ class OptimizationService:
                 return None
             return max(candidates, key=lambda j: j.started_at or "")
 
+    def get_active_optimization_job(self) -> JobStatus | None:
+        with self._lock:
+            for j in self._jobs.values():
+                if not j.job_id.startswith("prune-") and j.status in ("pending", "running", "paused"):
+                    return j
+            return None
+
     def cancel_event(self, job_id: str) -> threading.Event | None:
         with self._lock:
             return self._cancel_events.get(job_id)
@@ -161,10 +175,20 @@ class OptimizationService:
         with self._lock:
             return self._pause_events.get(job_id)
 
+    def _is_terminal_locked(self, job_id: str) -> bool:
+        """Pause/resume/cancel on a job that already finished (e.g. the user
+        clicked Cancel just as it completed) must be a no-op: otherwise a
+        completed job was overwritten to "cancelled" in history, or flipped to
+        "paused"/"running" with no thread left to ever finish it."""
+        js = self._jobs.get(job_id)
+        return js is not None and js.status in TERMINAL_STATUSES
+
     def pause(self, job_id: str) -> bool:
         with self._lock:
             ev = self._pause_events.get(job_id)
             if ev:
+                if self._is_terminal_locked(job_id):
+                    return True
                 ev.set()  # is_set=True = paused
                 self._update_status_locked(job_id, "paused")
                 return True
@@ -174,6 +198,8 @@ class OptimizationService:
         with self._lock:
             ev = self._pause_events.get(job_id)
             if ev:
+                if self._is_terminal_locked(job_id):
+                    return True
                 ev.clear()  # is_set=False = running
                 self._update_status_locked(job_id, "running")
                 return True
@@ -183,6 +209,8 @@ class OptimizationService:
         with self._lock:
             ev = self._cancel_events.get(job_id)
             if ev:
+                if self._is_terminal_locked(job_id):
+                    return True
                 ev.set()
                 self._update_status_locked(job_id, "cancelled")
                 return True

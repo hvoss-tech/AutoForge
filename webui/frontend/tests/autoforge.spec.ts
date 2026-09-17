@@ -9,7 +9,7 @@ import { makeSolidPng } from './png-helper'
 // "default state" assertions — global-setup.ts only resets once per run,
 // which isn't enough for tests within the same run.
 test.beforeEach(async ({ baseURL }) => {
-  await resetProjectState(baseURL ?? 'http://127.0.0.1:8000')
+  await resetProjectState(baseURL!)
 })
 
 test.describe('AutoForge WebUI - Application Shell', () => {
@@ -70,12 +70,12 @@ test.describe('AutoForge WebUI - Application Shell', () => {
   })
 
   test('mesh height label reflects real slider state', async ({ page }) => {
-    // Defaults: column 4 (index 3) is the highest enabled slider, depth
-    // 2.24mm — plus the default background_height (0.24mm), which the
+    // Defaults: column 4 (index 3) is the highest enabled slider, layer 27
+    // × 0.04mm = 1.08mm — plus the default background_height (0.24mm), which the
     // label now includes so it matches the actual mesh's Z height
     // (background_height + print layers, see helpers/colored_mesh.py's
     // top_z) instead of undercounting by exactly the background slab.
-    await expect(page.locator('[data-testid="mesh-height-label"]')).toContainText('2.48')
+    await expect(page.locator('[data-testid="mesh-height-label"]')).toContainText('1.32')
   })
 
   test('layout order: filament left, input center-left, color core center, preview center-right', async ({ page }) => {
@@ -257,17 +257,7 @@ test.describe('Input Image Panel', () => {
     await fileInput.setInputFiles({
       name: 'test.png',
       mimeType: 'image/png',
-      buffer: Buffer.from([
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-        0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
-        0x54, 0x08, 0xD7, 0x63, 0xF8, 0xFF, 0xFF, 0xFF,
-        0x00, 0x05, 0xFE, 0x02, 0xFE, 0xA7, 0x94, 0x91,
-        0x9C, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
-        0x44, 0xAE, 0x42, 0x60, 0x82,
-      ]),
+      buffer: makeSolidPng(1, 1, [255, 0, 0]),
     })
     await expect(page.locator('[data-testid="input-image"]')).toBeVisible()
   })
@@ -712,8 +702,8 @@ test.describe('Color Sliders Panel', () => {
     await expect(page.locator('[data-testid="layer-input-0"]')).toHaveValue('8')
   })
 
-  test('column 1 default depth is 0.72', async ({ page }) => {
-    await expect(page.locator('[data-testid="depth-0"]')).toContainText('0.72')
+  test('column 1 default depth is 0.32 (layer 8 × 0.04mm)', async ({ page }) => {
+    await expect(page.locator('[data-testid="depth-0"]')).toContainText('0.32')
   })
 
   test('column 2 default TD is 3.0', async ({ page }) => {
@@ -724,8 +714,8 @@ test.describe('Color Sliders Panel', () => {
     await expect(page.locator('[data-testid="layer-input-1"]')).toHaveValue('13')
   })
 
-  test('column 2 default depth is 1.12', async ({ page }) => {
-    await expect(page.locator('[data-testid="depth-1"]')).toContainText('1.12')
+  test('column 2 default depth is 0.52', async ({ page }) => {
+    await expect(page.locator('[data-testid="depth-1"]')).toContainText('0.52')
   })
 
   test('column 3 default TD is 8.0', async ({ page }) => {
@@ -736,8 +726,8 @@ test.describe('Color Sliders Panel', () => {
     await expect(page.locator('[data-testid="layer-input-2"]')).toHaveValue('20')
   })
 
-  test('column 3 default depth is 1.68', async ({ page }) => {
-    await expect(page.locator('[data-testid="depth-2"]')).toContainText('1.68')
+  test('column 3 default depth is 0.80', async ({ page }) => {
+    await expect(page.locator('[data-testid="depth-2"]')).toContainText('0.80')
   })
 
   test('column 4 default TD is 5.0', async ({ page }) => {
@@ -748,8 +738,8 @@ test.describe('Color Sliders Panel', () => {
     await expect(page.locator('[data-testid="layer-input-3"]')).toHaveValue('27')
   })
 
-  test('column 4 default depth is 2.24', async ({ page }) => {
-    await expect(page.locator('[data-testid="depth-3"]')).toContainText('2.24')
+  test('column 4 default depth is 1.08', async ({ page }) => {
+    await expect(page.locator('[data-testid="depth-3"]')).toContainText('1.08')
   })
 
   test('columns 1-4 are enabled by default', async ({ page }) => {
@@ -1469,6 +1459,8 @@ test.describe('Pruning Flow', () => {
   })
 
   test('pruning can be paused (progress freezes), resumed, and cancelled from the UI', async ({ page, request }) => {
+    // A real optimization + prune with deliberate waits — well over the 30s default.
+    test.setTimeout(180_000)
     // A bigger, noisier image with more layers/colors than the smoke test
     // above, so pruning has enough real work to still be running when we
     // click Pause/Cancel rather than finishing before we get there.
@@ -1715,6 +1707,23 @@ test.describe('Filament CRUD Flow', () => {
 })
 
 test.describe('Optimization Job Flow', () => {
+  // A job needs an active filament and an input image before it's created;
+  // 'test.png' doesn't exist on disk, so these jobs fail right after starting.
+  test.beforeEach(async ({ request }) => {
+    await request.put('/api/filaments/active', {
+      data: [{ uuid: 'e2e-jobflow', brand: 'E2E', name: 'JobFlow', color: '#ff0000', td: 1 }],
+    })
+  })
+
+  const waitUntilDone = async (request: any, jobId: string) => {
+    for (let i = 0; i < 50; i++) {
+      const s = await (await request.get(`/api/optimize/status/${jobId}`)).json()
+      if (['completed', 'failed', 'cancelled'].includes(s.status)) return s
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    throw new Error('job did not finish')
+  }
+
   test('start job returns job_id and running status', async ({ request }) => {
     const response = await request.post('/api/optimize/start', {
       data: { input_image: 'test.png', iterations: 100 },
@@ -1723,6 +1732,7 @@ test.describe('Optimization Job Flow', () => {
     const data = await response.json()
     expect(data.job_id).toBeDefined()
     expect(data.status).toBe('running')
+    await waitUntilDone(request, data.job_id)
   })
 
   test('get job status after start', async ({ request }) => {
@@ -1736,6 +1746,8 @@ test.describe('Optimization Job Flow', () => {
     const statusData = await statusResponse.json()
     expect(statusData.job_id).toBe(jobId)
     expect(statusData.total_iterations).toBe(100)
+    const finished = await waitUntilDone(request, jobId)
+    expect(finished.error).toContain('Input image not found')
   })
 
   test('cancel job stays cancelled (does not race the background thread)', async ({ request }) => {
@@ -1747,29 +1759,21 @@ test.describe('Optimization Job Flow', () => {
     const cancelResponse = await request.post(`/api/optimize/cancel/${jobId}`)
     expect(cancelResponse.ok()).toBeTruthy()
 
-    // Give the background thread time to run its own first status update —
-    // this must not resurrect the job back to "running".
+    // Give the background thread time to run its own status updates — none
+    // may turn the job into "running" or "failed" again.
     await new Promise((r) => setTimeout(r, 1000))
 
-    const statusResponse = await request.get(`/api/optimize/status/${jobId}`)
-    const statusData = await statusResponse.json()
-    expect(statusData.status).toBe('cancelled')
+    const statusData = await (await request.get(`/api/optimize/status/${jobId}`)).json()
+    // Either the cancel landed first, or the job had already failed (missing
+    // image) and the cancel correctly left that final state alone.
+    expect(['cancelled', 'failed']).toContain(statusData.status)
+    expect((await cancelResponse.json()).status).toBe(statusData.status)
   })
 })
 
 test.describe('Image Upload Flow', () => {
   test('upload image returns filename and url', async ({ request }) => {
-    const pngData = Buffer.from([
-      0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-      0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-      0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-      0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-      0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
-      0x54, 0x08, 0xD7, 0x63, 0xF8, 0xFF, 0xFF, 0xFF,
-      0x00, 0x05, 0xFE, 0x02, 0xFE, 0xA7, 0x94, 0x91,
-      0x9C, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
-      0x44, 0xAE, 0x42, 0x60, 0x82,
-    ])
+    const pngData = makeSolidPng(1, 1, [255, 0, 0])
 
     const response = await request.post('/api/images/upload', {
       multipart: {
@@ -1896,10 +1900,20 @@ test.describe('Edge Cases and Boundary Tests', () => {
   })
 
   test('multiple jobs have unique IDs', async ({ request }) => {
+    await request.put('/api/filaments/active', {
+      data: [{ uuid: 'e2e-unique', brand: 'E2E', name: 'Unique', color: '#ff0000', td: 1 }],
+    })
     const r1 = await request.post('/api/optimize/start', { data: { input_image: 'a.png' } })
-    const r2 = await request.post('/api/optimize/start', { data: { input_image: 'b.png' } })
     const j1 = (await r1.json()).job_id
+    // One optimization at a time: wait for the first (missing image) to fail.
+    for (let i = 0; i < 50; i++) {
+      if ((await (await request.get(`/api/optimize/status/${j1}`)).json()).status === 'failed') break
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    const r2 = await request.post('/api/optimize/start', { data: { input_image: 'b.png' } })
     const j2 = (await r2.json()).job_id
+    expect(j1).toBeDefined()
+    expect(j2).toBeDefined()
     expect(j1).not.toBe(j2)
   })
 

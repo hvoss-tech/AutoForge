@@ -9,7 +9,7 @@ import { resetProjectState, cleanupTestFilaments } from './reset-state'
 // filaments in the library, and later runs silently inherit that state
 // instead of the documented defaults.
 export default async function globalSetup(config: FullConfig) {
-  const baseURL = config.projects[0]?.use?.baseURL ?? 'http://127.0.0.1:8000'
+  const baseURL = config.projects[0]?.use?.baseURL!
   await resetProjectState(baseURL)
   await cleanupTestFilaments(baseURL)
 }

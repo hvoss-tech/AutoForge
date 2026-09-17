@@ -1,5 +1,6 @@
 import React, { useCallback, useRef, useState } from 'react'
 import { useAppStore } from '../store/appStore'
+import { describeApiError } from '../lib/apiError'
 import { Upload, Image as ImageIcon, RefreshCw } from 'lucide-react'
 
 export const InputImagePanel: React.FC = () => {
@@ -23,19 +24,18 @@ export const InputImagePanel: React.FC = () => {
         body: formData,
       })
       if (!response.ok) {
-        throw new Error(`Upload failed (HTTP ${response.status})`)
+        throw new Error(`Upload failed: ${describeApiError(await response.json().catch(() => null), response.status)}`)
       }
       const data = await response.json()
       if (!data.filename) {
         throw new Error('Upload failed: server did not return a filename')
       }
 
-      const url = URL.createObjectURL(file)
-      setInputImage(url)
-
-      // Read current settings from the store to avoid stale closures
+      // Settings first: both queue one undo step and the last label wins, so
+      // this step is recorded as "Input image changed", not "Settings changed".
       const current = useAppStore.getState().settings
       setSettings({ ...current, input_image: data.filename })
+      setInputImage(URL.createObjectURL(file))
       // Init is triggered reactively by ActiveFilamentsPanel's effect (it
       // watches for the image+filaments-present transition from both
       // directions) — calling it here too raced that effect whenever

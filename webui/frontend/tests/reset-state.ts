@@ -1,8 +1,8 @@
 export const DEFAULT_SLIDERS = [
-  { td: 2.0, layer: 8, depth_mm: 0.72, filament_uuid: '', enabled: true },
-  { td: 3.0, layer: 13, depth_mm: 1.12, filament_uuid: '', enabled: true },
-  { td: 8.0, layer: 20, depth_mm: 1.68, filament_uuid: '', enabled: true },
-  { td: 5.0, layer: 27, depth_mm: 2.24, filament_uuid: '', enabled: true },
+  { td: 2.0, layer: 8, depth_mm: 0.32, filament_uuid: '', enabled: true },
+  { td: 3.0, layer: 13, depth_mm: 0.52, filament_uuid: '', enabled: true },
+  { td: 8.0, layer: 20, depth_mm: 0.8, filament_uuid: '', enabled: true },
+  { td: 5.0, layer: 27, depth_mm: 1.08, filament_uuid: '', enabled: true },
   ...Array.from({ length: 11 }, () => ({ td: 5.0, layer: 0, depth_mm: 0.0, filament_uuid: '', enabled: false })),
 ]
 
@@ -46,6 +46,7 @@ export async function resetProjectState(baseURL: string): Promise<void> {
     }),
   }).catch(() => {})
   await resetActiveFilaments(baseURL)
+  await fetch(`${baseURL}/api/state/history`, { method: 'DELETE' }).catch(() => {})
 }
 
 /** Remove filaments created by test runs so brand/tab lists and counts stay

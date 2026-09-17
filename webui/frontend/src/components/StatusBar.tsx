@@ -1,5 +1,6 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
+import { NumberInput } from './ui/number-input'
 
 export const StatusBar: React.FC = () => {
   const settings = useAppStore((s) => s.settings)
@@ -26,28 +27,25 @@ export const StatusBar: React.FC = () => {
       data-testid="global-params"
     >
       <label style={{ color: 'var(--text-secondary)' }}>Layer Height</label>
-      <input type="number" value={settings.layer_height} step={0.01} min={0.01} onChange={(e) => updateSetting('layer_height', parseFloat(e.target.value) || 0.01)} className="w-16 px-1 py-0.5 rounded text-xs text-center" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }} data-testid="global-layer-height" />
+      <NumberInput value={settings.layer_height} step={0.01} min={0.01} onValueChange={(v) => updateSetting('layer_height', v)} className="w-16 px-1 py-0.5 rounded text-xs text-center" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }} data-testid="global-layer-height" />
 
       <label style={{ color: 'var(--text-secondary)' }}>Background Height</label>
-      <input type="number" value={settings.background_height} step={0.01} min={0} onChange={(e) => updateSetting('background_height', parseFloat(e.target.value) || 0)} className="w-16 px-1 py-0.5 rounded text-xs text-center" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }} data-testid="global-background-height" />
+      <NumberInput value={settings.background_height} step={0.01} min={0} onValueChange={(v) => updateSetting('background_height', v)} className="w-16 px-1 py-0.5 rounded text-xs text-center" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }} data-testid="global-background-height" />
 
       <label style={{ color: 'var(--text-secondary)' }}>Base Layers</label>
-      <input
-        type="number"
+      <NumberInput
         value={baseLayers}
         step={1}
         min={0}
-        onChange={(e) => {
-          const layers = Math.max(0, parseInt(e.target.value) || 0)
-          updateSetting('background_height', parseFloat((layers * layerHeight).toFixed(4)))
-        }}
+        integer
+        onValueChange={(layers) => updateSetting('background_height', parseFloat((layers * layerHeight).toFixed(4)))}
         className="w-16 px-1 py-0.5 rounded text-xs text-center"
         style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }}
         data-testid="global-base-layers"
       />
 
       <label style={{ color: 'var(--text-secondary)' }}>Dimension (mm)</label>
-      <input type="number" value={settings.stl_output_size} step={1} min={10} onChange={(e) => updateSetting('stl_output_size', parseFloat(e.target.value) || 10)} className="w-16 px-1 py-0.5 rounded text-xs text-center" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }} data-testid="global-stl-size" />
+      <NumberInput value={settings.stl_output_size} step={1} min={10} onValueChange={(v) => updateSetting('stl_output_size', v)} className="w-16 px-1 py-0.5 rounded text-xs text-center" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }} data-testid="global-stl-size" />
 
       <div className="flex-1" />
       <div className="flex items-center gap-2 text-xs">

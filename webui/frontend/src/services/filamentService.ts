@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useAppStore } from '../store/appStore'
 import type { Filament } from '../types'
+import { chooseActiveTab } from '../lib/library'
 
 const MAX_RETRIES = 10
 const RETRY_DELAY = 2000 // ms
@@ -20,7 +21,14 @@ async function fetchWithRetry(url: string, retries = MAX_RETRIES): Promise<Respo
   throw new Error(`Backend unreachable: ${url}`)
 }
 
+// Every library reload bumps this; a response that arrives after a newer
+// request was sent is dropped. Typing in the search box fires one request per
+// keystroke, and an older, slower response used to land last and show results
+// for a query the user had already changed.
+let filamentsRequestSeq = 0
+
 export async function loadFilaments() {
+  const seq = ++filamentsRequestSeq
   try {
     const state = useAppStore.getState()
     const params = new URLSearchParams()
@@ -30,9 +38,10 @@ export async function loadFilaments() {
 
     const response = await fetchWithRetry(`/api/filaments?${params.toString()}`, 1)
     const filaments: Filament[] = await response.json()
+    if (seq !== filamentsRequestSeq) return
     useAppStore.getState().setFilaments(filaments)
   } catch {
-    // Backend unreachable – show empty list
+    // Backend not ready or unreachable — keep current state
   }
 }
 
@@ -40,13 +49,29 @@ export async function loadFilamentTypes() {
   try {
     const response = await fetchWithRetry('/api/filaments/types', 1)
     const types: string[] = await response.json()
-    useAppStore.getState().setFilamentTypes(types)
-    if (types.length > 0 && !useAppStore.getState().activeTab) {
-      useAppStore.getState().setActiveTab(types[0])
-    }
+    const store = useAppStore.getState()
+    store.setFilamentTypes(types)
+    const tab = chooseActiveTab(types, store.activeTab)
+    if (tab !== store.activeTab) store.setActiveTab(tab)
   } catch {
-    // Backend unreachable
+    // Backend not ready or unreachable — keep current state
   }
+}
+
+/** Reload everything the library panel shows (tabs, the active tab's list,
+ * brands) after the library changed. The create/edit/import dialogs each did
+ * their own partial refetch: editing reloaded *every* type into the current
+ * tab, creating showed the new filament's type under the old tab, and
+ * imports never refreshed the tabs, so imported types only appeared after a
+ * page reload. `showType` switches to that tab first, so a filament you just
+ * created is actually visible. */
+export async function refreshLibrary(showType?: string) {
+  await loadFilamentTypes()
+  if (showType && useAppStore.getState().filamentTypes.includes(showType)) {
+    useAppStore.getState().setActiveTab(showType)
+  }
+  await loadFilaments()
+  await loadFilamentBrands()
 }
 
 export async function loadFilamentBrands() {
@@ -78,11 +103,10 @@ export function useFilamentLoader() {
       const types: string[] = await response.json()
       const store = useAppStore.getState()
       store.setFilamentTypes(types)
-      if (types.length > 0 && !store.activeTab) {
-        store.setActiveTab(types[0])
-      }
+      const tab = chooseActiveTab(types, store.activeTab)
+      if (tab !== store.activeTab) store.setActiveTab(tab)
     } catch {
-      // Still no backend – leave empty
+      // Backend not ready or unreachable — keep current state
     }
 
     try {

@@ -96,6 +96,13 @@ export const TopBar: React.FC = () => {
     return () => clearInterval(interval)
   }, [isActive, jobId, currentJob])
 
+  // A "can't start" message is about the state at click time; once that's
+  // fixed (image uploaded, filament added) it shouldn't linger next to an
+  // enabled Run button.
+  useEffect(() => {
+    setStartError(null)
+  }, [canRun, currentJob?.status])
+
   const handleStart = async () => {
     setStartError(null)
     if (currentJob?.status !== 'paused' && !canRun) {
@@ -125,8 +132,11 @@ export const TopBar: React.FC = () => {
   }
 
   const handleCancel = async () => {
-    if (currentJob) {
+    if (!currentJob) return
+    try {
       await cancelOptimization(currentJob.job_id)
+    } catch (e) {
+      useAppStore.getState().pushToast(`Failed to cancel: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
@@ -151,8 +161,11 @@ export const TopBar: React.FC = () => {
   }
 
   const handlePruneCancel = async () => {
-    if (pruningJob) {
+    if (!pruningJob) return
+    try {
       await cancelPruning(pruningJob.job_id)
+    } catch (e) {
+      useAppStore.getState().pushToast(`Failed to cancel pruning: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 

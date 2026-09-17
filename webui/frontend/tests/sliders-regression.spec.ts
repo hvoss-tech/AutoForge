@@ -138,7 +138,7 @@ test('sliders and color core stay populated after optimization and pruning (live
 
   // Prune down to max_layer 6 and verify the UI follows the reduced stack.
   const pruneResp = await request.post('/api/pruning/start', {
-    data: { pruning_max_colors: 4, pruning_max_swaps: 4, pruning_max_layer: 6 },
+    data: { pruning_max_colors: 4, pruning_max_swaps: 4, pruning_max_layer: 6, job_id: optJobId },
   })
   expect(pruneResp.ok()).toBeTruthy()
   const pruneResult = await waitForStatus(request, (await pruneResp.json()).job_id)

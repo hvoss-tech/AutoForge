@@ -28,7 +28,7 @@ from ..helpers.sliders import derive_layer_range_from_result
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_state: dict[str, Any] = {"status": "idle", "preview_image": None, "error": None}
+_state: dict[str, Any] = {"status": "idle", "preview_image": None, "error": None, "range": None}
 _pipeline_result: Optional[dict[str, Any]] = None
 _lock = threading.RLock()
 
@@ -141,7 +141,7 @@ async def run_init(settings: OptimizationSettings):
 
     with _lock:
         _pipeline_result = built["result"]
-        _state = {"status": "ready", "preview_image": built["preview_b64"], "error": None}
+        _state = {"status": "ready", "preview_image": built["preview_b64"], "error": None, "range": built["range"]}
 
     return {
         "status": "ready",
@@ -154,7 +154,11 @@ async def run_init(settings: OptimizationSettings):
 @router.get("/status")
 async def init_status():
     with _lock:
-        return {"status": _state["status"], "error": _state.get("error")}
+        # The layer range comes with it so a client that finds the preview
+        # already "ready" (a reload, another tab) doesn't have to ask
+        # /api/sliders/from-optimizer — which answers for the latest
+        # *completed job*, not for this preview.
+        return {"status": _state["status"], "error": _state.get("error"), **(_state.get("range") or {})}
 
 
 @router.get("/preview")

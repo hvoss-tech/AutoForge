@@ -1,5 +1,6 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
+import { NumberInput } from './ui/number-input'
 import { Settings, X, Play, Square, Download, FileText, Box, Image as ImageIcon, ChevronDown, ChevronRight } from 'lucide-react'
 import type { OptimizationSettings as SettingsType } from '../types'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from './ui/dialog'
@@ -7,7 +8,7 @@ import { Button } from './ui/button'
 
 interface SettingsGroup {
   title: string
-  fields: { key: keyof SettingsType; label: string; type: 'number' | 'text' | 'boolean' | 'select' | 'color'; options?: string[]; step?: number; min?: number; max?: number }[]
+  fields: { key: keyof SettingsType; label: string; type: 'number' | 'text' | 'boolean' | 'select' | 'color'; options?: string[]; step?: number; min?: number; max?: number; integer?: boolean }[]
 }
 
 // Deliberately scoped down to the settings a webUI user is actually likely
@@ -24,12 +25,12 @@ const SETTINGS_GROUPS: SettingsGroup[] = [
   {
     title: 'Optimization',
     fields: [
-      { key: 'iterations', label: 'Iterations', type: 'number', step: 100, min: 100 },
+      { key: 'iterations', label: 'Iterations', type: 'number', step: 100, min: 100, integer: true },
       { key: 'learning_rate', label: 'Learning Rate', type: 'number', step: 0.001, min: 0.0001 },
       { key: 'warmup_fraction', label: 'Warmup Fraction', type: 'number', step: 0.05, min: 0, max: 1 },
       { key: 'learning_rate_warmup_fraction', label: 'LR Warmup Fraction', type: 'number', step: 0.01, min: 0, max: 1 },
-      { key: 'early_stopping', label: 'Early Stopping', type: 'number', step: 100, min: 100 },
-      { key: 'discrete_check', label: 'Discrete Check', type: 'number', step: 10, min: 10 },
+      { key: 'early_stopping', label: 'Early Stopping', type: 'number', step: 100, min: 100, integer: true },
+      { key: 'discrete_check', label: 'Discrete Check', type: 'number', step: 10, min: 10, integer: true },
     ],
   },
   {
@@ -43,8 +44,8 @@ const SETTINGS_GROUPS: SettingsGroup[] = [
     title: 'Layers',
     fields: [
       { key: 'layer_height', label: 'Layer Height (mm)', type: 'number', step: 0.01, min: 0.01 },
-      { key: 'max_layers', label: 'Max Layers', type: 'number', step: 1, min: 1, max: 200 },
-      { key: 'min_layers', label: 'Min Layers', type: 'number', step: 1, min: 0 },
+      { key: 'max_layers', label: 'Max Layers', type: 'number', step: 1, min: 1, max: 200, integer: true },
+      { key: 'min_layers', label: 'Min Layers', type: 'number', step: 1, min: 0, integer: true },
       { key: 'background_height', label: 'Background Height (mm)', type: 'number', step: 0.01, min: 0 },
       { key: 'background_color', label: 'Background Color', type: 'color' },
       { key: 'auto_background_color', label: 'Auto Background Color', type: 'boolean' },
@@ -53,15 +54,15 @@ const SETTINGS_GROUPS: SettingsGroup[] = [
   {
     title: 'Output',
     fields: [
-      { key: 'processing_reduction_factor', label: 'Processing Reduction', type: 'number', step: 1, min: 1 },
+      { key: 'processing_reduction_factor', label: 'Processing Reduction', type: 'number', step: 1, min: 1, integer: true },
       { key: 'nozzle_diameter', label: 'Nozzle Diameter (mm)', type: 'number', step: 0.05, min: 0.1 },
     ],
   },
   {
     title: 'Initialization',
     fields: [
-      { key: 'num_init_rounds', label: 'Init Rounds', type: 'number', step: 1, min: 1 },
-      { key: 'num_init_cluster_layers', label: 'Cluster Layers', type: 'number', step: 1, min: -1 },
+      { key: 'num_init_rounds', label: 'Init Rounds', type: 'number', step: 1, min: 1, integer: true },
+      { key: 'num_init_cluster_layers', label: 'Cluster Layers', type: 'number', step: 1, min: -1, integer: true },
       { key: 'init_heightmap_method', label: 'Heightmap Method', type: 'select', options: ['kmeans', 'depth'] },
     ],
   },
@@ -75,6 +76,7 @@ export const SettingsModal: React.FC = () => {
   const currentJob = useAppStore((s) => s.currentJob)
   const startOptimization = useAppStore((s) => s.startOptimization)
   const cancelOptimization = useAppStore((s) => s.cancelOptimization)
+  const resumeOptimization = useAppStore((s) => s.resumeOptimization)
   const pushToast = useAppStore((s) => s.pushToast)
 
   const [expandedGroups, setExpandedGroups] = React.useState<Record<string, boolean>>(
@@ -103,15 +105,23 @@ export const SettingsModal: React.FC = () => {
   }
 
   const handleCancel = async () => {
-    if (currentJob) {
+    if (!currentJob) return
+    try {
       await cancelOptimization(currentJob.job_id)
+    } catch (e) {
+      pushToast(`Failed to cancel: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
   const handleDownload = async (type: 'stl' | 'preview' | 'instructions' | 'project') => {
     if (!currentJob) return
     const response = await fetch(`/api/outputs/${type}/${currentJob.job_id}`)
-    if (response.ok) {
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}))
+      pushToast(`Download failed: ${err.detail ?? `HTTP ${response.status}`}`)
+      return
+    }
+    {
       const blob = await response.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -196,10 +206,10 @@ export const SettingsModal: React.FC = () => {
                           data-testid={`setting-${field.key}`}
                         />
                       ) : (
-                        <input
-                          type="number"
+                        <NumberInput
                           value={settings[field.key] as number}
-                          onChange={(e) => updateSetting(field.key, field.type === 'number' ? parseFloat(e.target.value) || 0 : e.target.value)}
+                          onValueChange={(v) => updateSetting(field.key, v)}
+                          integer={field.integer}
                           className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-blue-500"
                           step={field.step}
                           min={field.min}
@@ -217,7 +227,17 @@ export const SettingsModal: React.FC = () => {
 
         {/* Footer with actions */}
         <div className="px-4 py-3 border-t border-gray-700 flex items-center gap-2">
-          {currentJob?.status === 'running' ? (
+          {currentJob?.status === 'paused' && (
+            <button
+              onClick={() => resumeOptimization(currentJob.job_id).catch((e) => pushToast(`Failed to resume: ${e instanceof Error ? e.message : String(e)}`))}
+              className="flex items-center gap-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-xs text-white"
+              data-testid="resume-btn"
+            >
+              <Play className="w-3 h-3" />
+              Resume
+            </button>
+          )}
+          {currentJob && ['pending', 'running', 'paused'].includes(currentJob.status) ? (
             <button
               onClick={handleCancel}
               className="flex items-center gap-1 px-3 py-1.5 bg-red-600 hover:bg-red-500 rounded text-xs text-white"

@@ -114,6 +114,12 @@ async def start_pruning(settings: PruningSettings):
 
             optimizer.preview_callback = _prune_progress
 
+            # Pruning regenerates this job's real outputs; an earlier slider
+            # edit rendered against the unpruned solution would otherwise
+            # keep hiding the pruned mesh in the 3D view.
+            from .outputs import discard_slider_edits
+            discard_slider_edits(job_id)
+
             outputs = export_results(
                 pipeline_result,
                 cancel_event=cancel_event,

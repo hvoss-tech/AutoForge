@@ -33,6 +33,17 @@ def create_filament(filament: Filament):
     return result.model_dump()
 
 
+@router.put("/active")
+def replace_active_filaments(filaments: list[Filament]):
+    """Set the active list to exactly these filaments. Undo/redo and project
+    loading use this so the backend (which is what /api/optimize/start reads)
+    can't drift from what the UI shows.
+
+    Registered before ``PUT /{uuid}``, which would otherwise match first."""
+    svc = get_filament_service()
+    return [f.model_dump() for f in svc.replace_active(filaments)]
+
+
 @router.put("/{uuid}")
 def update_filament(uuid: str, filament: Filament):
     svc = get_filament_service()
@@ -93,6 +104,14 @@ async def import_json(data: list[dict], mode: str = "merge"):
     svc = get_filament_service()
     if mode not in ("merge", "replace"):
         raise HTTPException(400, "mode must be 'merge' or 'replace'")
+    for i, item in enumerate(data):
+        try:
+            Filament(**item)
+        except ValueError as e:
+            # Validate everything before touching the library, so a bad
+            # entry can't leave a "replace" half-applied (or crash with 500).
+            first = str(e).splitlines()[1:3]
+            raise HTTPException(400, f"Entry {i + 1} is not a valid filament: {' '.join(s.strip() for s in first)}")
     result = svc.import_json(data, mode=mode)
     return {
         "status": "ok",

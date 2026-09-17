@@ -1,5 +1,14 @@
 import { defineConfig, devices } from '@playwright/test'
 
+// By default the suite starts its own backend with throwaway data
+// (tests/test-server.mjs) instead of touching a real server on :8000. Set
+// WEBUI_TEST_BASE_URL to run against an already-running server instead.
+// The backend serves webui/frontend/dist, so run `npm run build` first
+// (`npm test` does both).
+const externalBaseURL = process.env.WEBUI_TEST_BASE_URL
+const testPort = process.env.WEBUI_TEST_PORT || '8799'
+const baseURL = externalBaseURL || `http://127.0.0.1:${testPort}`
+
 export default defineConfig({
   testDir: './tests',
   globalSetup: './tests/global-setup.ts',
@@ -15,12 +24,29 @@ export default defineConfig({
   workers: 1,
   reporter: 'html',
   use: {
-    baseURL: process.env.WEBUI_TEST_BASE_URL || 'http://127.0.0.1:8000',
+    baseURL,
     trace: 'on-first-retry',
   },
+  webServer: externalBaseURL
+    ? undefined
+    : {
+        command: 'node tests/test-server.mjs',
+        url: `${baseURL}/api/system/health`,
+        timeout: 120_000,
+        reuseExistingServer: false,
+        env: { WEBUI_TEST_PORT: testPort },
+      },
+  // `jobs` run real optimizations and leave finished results behind (which
+  // the app restores on load), so they go after everything else.
   projects: [
     {
       name: 'chromium',
+      testIgnore: /jobs\//,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'jobs',
+      testMatch: /jobs\/.*\.spec\.ts/,
       use: { ...devices['Desktop Chrome'] },
     },
   ],

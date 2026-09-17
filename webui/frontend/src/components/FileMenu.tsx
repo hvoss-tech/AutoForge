@@ -96,7 +96,11 @@ export const FileMenu: React.FC = () => {
   return (
     <div className="relative" ref={menuRef}>
       <button
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          setOpen((o) => !o)
+          // An old error has nothing to do with whatever the user does next.
+          setLoadError(null)
+        }}
         className="flex items-center gap-1 px-2 py-1.5 text-xs text-gray-300 hover:bg-gray-800 rounded"
         data-testid="file-menu-btn"
       >
@@ -152,7 +156,15 @@ export const FileMenu: React.FC = () => {
           className="absolute left-0 top-full mt-1 w-64 bg-red-900/80 border border-red-700 rounded px-2 py-1 text-xs text-red-200 z-50"
           data-testid="file-menu-error"
         >
-          {loadError}
+          <span>{loadError}</span>
+          <button
+            onClick={() => setLoadError(null)}
+            className="ml-2 text-red-300 hover:text-white"
+            aria-label="Dismiss"
+            data-testid="file-menu-error-dismiss"
+          >
+            ×
+          </button>
         </div>
       )}
     </div>

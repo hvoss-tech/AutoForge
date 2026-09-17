@@ -1,6 +1,8 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
-import { loadFilamentTypes } from '../services/filamentService'
+import { NumberInput } from './ui/number-input'
+import { refreshLibrary } from '../services/filamentService'
+import { describeApiError } from '../lib/apiError'
 import { X, Plus } from 'lucide-react'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from './ui/dialog'
 
@@ -11,7 +13,6 @@ export const NewFilamentModal: React.FC = () => {
   const newFilamentModalOpen = useAppStore((s) => s.newFilamentModalOpen)
   const setNewFilamentModalOpen = useAppStore((s) => s.setNewFilamentModalOpen)
   const filamentTypes = useAppStore((s) => s.filamentTypes)
-  const setFilaments = useAppStore((s) => s.setFilaments)
   const setCustomLibraryLoaded = useAppStore((s) => s.setCustomLibraryLoaded)
   const pushToast = useAppStore((s) => s.pushToast)
 
@@ -53,21 +54,12 @@ export const NewFilamentModal: React.FC = () => {
         body: JSON.stringify(newFilament),
       })
       if (!response.ok) {
-        const err = await response.json().catch(() => ({ detail: `HTTP ${response.status}` }))
-        throw new Error(err.detail ?? `HTTP ${response.status}`)
+        throw new Error(describeApiError(await response.json().catch(() => null), response.status))
       }
-      const data = await response.json()
+      await response.json()
 
-      const params = new URLSearchParams()
-      if (effectiveType) params.set('filament_type', effectiveType)
-      const refetch = await fetch(`/api/filaments?${params.toString()}`)
-      const filaments = await refetch.json()
-      setFilaments(filaments)
       setCustomLibraryLoaded(true)
-      // A brand-new type (not among the preset/known tabs) needs the tab
-      // bar refreshed immediately, or it only appears after a reload even
-      // though the filament itself was created and is otherwise usable.
-      if (isAddingCustomType) await loadFilamentTypes()
+      await refreshLibrary(effectiveType)
 
       setNewFilamentModalOpen(false)
       setBrand('')
@@ -165,13 +157,12 @@ export const NewFilamentModal: React.FC = () => {
             </div>
             <div className="flex flex-col gap-1">
               <label className="text-xs text-gray-400">Transmission Distance (TD)</label>
-              <input
-                type="number"
+              <NumberInput
                 value={td}
-                onChange={(e) => setTd(parseFloat(e.target.value) || 0)}
+                onValueChange={setTd}
                 step={0.1}
                 min={0}
-                max={10}
+                data-testid="new-filament-td"
                 className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-gray-200 focus:outline-none focus:border-blue-500"
               />
             </div>

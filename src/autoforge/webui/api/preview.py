@@ -1,4 +1,7 @@
+import asyncio
 import os
+import threading
+from collections import defaultdict
 
 from fastapi import APIRouter, HTTPException
 
@@ -8,6 +11,7 @@ from ..services.filament_service import get_filament_service
 from ..helpers.slider_render import render_with_sliders
 from .ws import broadcast_preview
 from .init import get_init_pipeline_result, _init_dir
+from .outputs import EDITED_PLY, EDITED_PNG
 
 router = APIRouter()
 
@@ -17,13 +21,9 @@ router = APIRouter()
 # nothing until the user runs a real optimization.
 INIT_JOB_SENTINEL = "__init__"
 
-
-def _latest_completed_job():
-    svc = get_optimization_service()
-    for job in svc.get_history():
-        if job.status == "completed":
-            return job
-    return None
+_seq_lock = threading.Lock()
+_latest_seq: dict[str, int] = {}
+_render_locks: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
 @router.post("/render-with-sliders")
@@ -55,22 +55,28 @@ async def render_preview(data: dict):
             raise HTTPException(400, "No auto-preview result to render yet")
         effective_job_id = INIT_JOB_SENTINEL
         output_dir = _init_dir()
+        file_names = {}
     else:
-        job = None
-        if requested_job_id:
-            candidate = svc.get_job(requested_job_id)
-            if candidate and candidate.status == "completed":
-                job = candidate
-        if job is None:
-            job = _latest_completed_job()
-        if job is None:
+        # Never fall back to "some other completed job" when the requested one
+        # isn't renderable: that rendered the edit into an unrelated job's
+        # output folder, and the broadcast (tagged with the other job's id)
+        # was dropped by the client anyway.
+        if not requested_job_id:
+            raise HTTPException(400, "No job_id given")
+        job = svc.get_job(requested_job_id)
+        if job is None or job.status != "completed":
             raise HTTPException(400, "No completed optimization result to render")
 
         pipeline_result = svc.get_pipeline_result(job.job_id)
         if not pipeline_result:
-            raise HTTPException(400, "No optimization pipeline result found")
+            raise HTTPException(
+                409,
+                "This result can't be re-colored anymore (the server was restarted "
+                "since it was computed). Run the optimization again to edit its colors.",
+            )
         effective_job_id = job.job_id
         output_dir = os.path.join(config.checkpoints_path, job.job_id)
+        file_names = {"png_name": EDITED_PNG, "ply_name": EDITED_PLY}
 
     filament_lookup = {f.uuid: f.model_dump() for f in filament_svc.list()}
     # The frontend also sends the currently active filament list, which may
@@ -80,7 +86,25 @@ async def render_preview(data: dict):
         if uuid_ and uuid_ not in filament_lookup:
             filament_lookup[uuid_] = f
 
-    result = render_with_sliders(pipeline_result, sliders, filament_lookup, output_dir)
+    with _seq_lock:
+        _latest_seq[effective_job_id] = seq = _latest_seq.get(effective_job_id, 0) + 1
+        render_lock = _render_locks[effective_job_id]
+
+    def _render():
+        # One render per target at a time (they write the same files), and a
+        # request that was overtaken by a newer edit while it waited is
+        # skipped — otherwise a slow older render could finish last and
+        # leave the preview showing a stale slider stack.
+        with render_lock:
+            if _latest_seq.get(effective_job_id) != seq:
+                return "superseded"
+            return render_with_sliders(pipeline_result, sliders, filament_lookup, output_dir, **file_names)
+
+    # Off the event loop: this is real GPU/CPU work, and running it inline
+    # stalled every other request and websocket while a slider was dragged.
+    result = await asyncio.to_thread(_render)
+    if result == "superseded":
+        return {"status": "superseded", "job_id": effective_job_id}
     if result is None:
         return {"status": "no_solution", "job_id": effective_job_id}
 

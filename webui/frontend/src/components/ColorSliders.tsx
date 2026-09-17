@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useRef } from 'react'
 import { useDebouncedCallback } from '../hooks/useDebouncedCallback'
 import { useAppStore } from '../store/appStore'
+import { NumberInput } from './ui/number-input'
 import type { Filament } from '../types'
 import { getOverlapDisabledIndices } from '../lib/colorStack'
+import { slidersNeedRender } from '../lib/sliderDiff'
 
 // Mirrors api/preview.py's INIT_JOB_SENTINEL — tells the backend "there's
 // no completed job yet, render against the post-upload auto-preview state
@@ -18,8 +20,11 @@ export const ColorSliders: React.FC = () => {
   const currentJob = useAppStore((s) => s.currentJob)
   const initState = useAppStore((s) => s.initState)
   const activeFilaments = useAppStore((s) => s.activeFilaments)
+  const layerHeight = useAppStore((s) => s.settings.layer_height) || 0.04
   const lastRenderedSlidersRef = useRef(JSON.stringify(colorSliders))
+  const lastRenderedJobRef = useRef<string>(INIT_JOB_SENTINEL)
   const [isRendering, setIsRendering] = React.useState(false)
+  const lastRenderErrorRef = useRef<string | null>(null)
 
   // Slider edits only make sense once there's a discretized solution to
   // recolor — either a completed job, or (now that api/init.py actually
@@ -27,17 +32,31 @@ export const ColorSliders: React.FC = () => {
   // pre-run auto-preview: its height map is real, so a slider edit can be
   // rendered against it exactly like a completed job's, letting the user
   // assign colors manually before ever running the real optimizer.
-  const hasResult = currentJob?.status === 'completed' || initState.status === 'ready'
+  // Not while a job is running: its live broadcasts replace the stack every
+  // few iterations, and each one used to trigger a pointless auto-preview
+  // re-render competing with the optimizer for the GPU.
+  const jobActive = !!currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
+  const hasResult = !jobActive && (currentJob?.status === 'completed' || initState.status === 'ready')
   const jobId = currentJob?.status === 'completed' ? currentJob.job_id : INIT_JOB_SENTINEL
 
   const triggerPreviewRender = useDebouncedCallback(async (sliders: typeof colorSliders, filaments: Filament[], jobId: string | undefined) => {
     setIsRendering(true)
     try {
-      await fetch('/api/preview/render-with-sliders', {
+      const response = await fetch('/api/preview/render-with-sliders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sliders, active_filaments: filaments, job_id: jobId }),
       })
+      if (!response.ok) {
+        // e.g. the result was computed before a server restart and can't be
+        // re-colored — previously the edit just silently did nothing.
+        const err = await response.json().catch(() => ({}))
+        const message = `Preview not updated: ${err.detail ?? `HTTP ${response.status}`}`
+        if (message !== lastRenderErrorRef.current) useAppStore.getState().pushToast(message, 'warning')
+        lastRenderErrorRef.current = message
+      } else {
+        lastRenderErrorRef.current = null
+      }
     } catch {
       // Ignore — the WS-driven preview simply won't update this round.
     } finally {
@@ -46,22 +65,35 @@ export const ColorSliders: React.FC = () => {
   }, [], 150)
 
   useEffect(() => {
+    // While a job runs, its broadcasts *are* the rendered state — track them
+    // so completion doesn't look like an edit and re-render the result.
+    if (jobActive) {
+      lastRenderedSlidersRef.current = JSON.stringify(colorSliders)
+      lastRenderedJobRef.current = currentJob.job_id
+      return
+    }
     if (!hasResult) return
 
     const currentKey = JSON.stringify(colorSliders)
-    if (currentKey === lastRenderedSlidersRef.current) return
+    // A different target (undo/redo to another result, or back to the
+    // pre-run preview) has its own previously-rendered colors on disk, so
+    // it needs a render even when the slider stacks happen to match.
+    const targetChanged = jobId !== lastRenderedJobRef.current
+    if (!targetChanged && currentKey === lastRenderedSlidersRef.current) return
 
-    const hasChanges = colorSliders.some((s, i) => {
-      const prev = JSON.parse(lastRenderedSlidersRef.current)[i]
-      return s.td !== prev.td || s.layer !== prev.layer || s.enabled !== prev.enabled || s.filament_uuid !== prev.filament_uuid
-    })
-
-    if (hasChanges) {
+    // ...except the pre-run preview with nothing assigned yet: rendering that
+    // would replace the photo-draped mesh with an all-gray one.
+    const nothingAssigned = jobId === INIT_JOB_SENTINEL && !colorSliders.some((s) => s.enabled && s.filament_uuid)
+    const needsRender = targetChanged
+      ? !nothingAssigned
+      : slidersNeedRender(JSON.parse(lastRenderedSlidersRef.current), colorSliders)
+    if (needsRender) {
       triggerPreviewRender(colorSliders, activeFilaments, jobId)
     }
 
     lastRenderedSlidersRef.current = currentKey
-  }, [colorSliders, hasResult, activeFilaments, jobId, triggerPreviewRender])
+    lastRenderedJobRef.current = jobId
+  }, [colorSliders, hasResult, jobActive, activeFilaments, jobId, triggerPreviewRender])
 
   // Sliders can now be dragged onto the same layer as one another; when that
   // happens only the right-most one actually governs that layer's material
@@ -145,10 +177,10 @@ export const ColorSliders: React.FC = () => {
               title={isOverlapDisabled ? 'This filament is covered by another slider on the same layer' : undefined}
             >
               <div style={{ fontSize: 7, color: 'var(--text-secondary)', letterSpacing: 0.5 }}>TD</div>
-              <input
-                type="number"
+              <NumberInput
                 value={slider.td}
-                onChange={(e) => handleTdChange(i, parseFloat(e.target.value) || 0)}
+                onValueChange={(v) => handleTdChange(i, v)}
+                min={0}
                 style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)', borderRadius: 2, width: 36, padding: '1px 2px', textAlign: 'center', fontSize: 9, color: 'var(--text-primary)' }}
                 step={0.1}
                 disabled={!slider.enabled}
@@ -166,17 +198,17 @@ export const ColorSliders: React.FC = () => {
                 style={{ height: 70, width: 12, writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
                 data-testid={`slider-${i}`}
               />
-              <input
-                type="number"
+              <NumberInput
                 value={slider.layer}
                 min={sliderLayerRange.min}
                 max={sliderLayerRange.max}
-                onChange={(e) => handleLayerChange(i, parseInt(e.target.value) || 0)}
+                integer
+                onValueChange={(v) => handleLayerChange(i, v)}
                 disabled={!slider.enabled}
                 style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)', borderRadius: 2, width: 36, padding: '1px 2px', textAlign: 'center', fontSize: 9, color: 'var(--cyan-accent)' }}
                 data-testid={`layer-input-${i}`}
               />
-              <div style={{ fontSize: 8, color: 'var(--text-secondary)' }} data-testid={`depth-${i}`}>{slider.depth_mm?.toFixed(2)}</div>
+              <div style={{ fontSize: 8, color: 'var(--text-secondary)' }} data-testid={`depth-${i}`}>{(slider.layer * layerHeight).toFixed(2)}</div>
               <div
                 style={{ width: 12, height: 12, borderRadius: '50%', border: '1px solid var(--border)', backgroundColor: color, flexShrink: 0 }}
                 data-testid={`color-indicator-${i}`}

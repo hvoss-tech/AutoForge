@@ -17,7 +17,10 @@ def _send_to_all(msg: str):
     """Safely send a message to all connected preview clients (thread-safe)."""
     global _main_loop
     to_remove: list[WebSocket] = []
-    for ws in _preview_connections:
+    # Iterate a copy: this runs on the optimizer's worker thread while the
+    # event loop adds/discards connections, and iterating the live set then
+    # raises "Set changed size during iteration", dropping the update.
+    for ws in list(_preview_connections):
         try:
             if _main_loop and not _main_loop.is_closed():
                 asyncio.run_coroutine_threadsafe(ws.send_text(msg), _main_loop)

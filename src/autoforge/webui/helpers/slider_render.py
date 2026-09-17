@@ -87,9 +87,14 @@ def _resolve_slider_materials(
     tds = np.zeros(len(sliders), dtype=np.float32)
     for i, s in enumerate(sliders):
         filament = filament_lookup.get(str(s.get("filament_uuid", "")))
+        # The slider's own TD wins: it starts as the filament's TD (set on
+        # drop / derived from the optimizer) and the TD box above each slider
+        # column edits it. Preferring the library value made that box a
+        # no-op for the render.
+        slider_td = float(s.get("td") or 0.0)
         if filament is not None:
             colors[i] = hex_to_rgb(filament["color"])
-            tds[i] = float(filament.get("td", s.get("td", 5.0)))
+            tds[i] = slider_td if slider_td > 0 else float(filament.get("td", 5.0))
         else:
             # No matching filament (e.g. a filament not in the library
             # anymore) — fall back to the slider's own td and a neutral
@@ -147,9 +152,11 @@ def render_with_sliders(
     sliders: list[dict],
     filament_lookup: dict[str, dict],
     output_dir: str,
+    png_name: str = "final_model.png",
+    ply_name: str = "final_model_colored.ply",
 ) -> Optional[dict[str, Any]]:
     """Recompute the composite preview + colored PLY from an edited slider
-    stack, overwriting the job's ``final_model.png`` / ``final_model_colored.ply``.
+    stack, writing ``png_name`` / ``ply_name`` into ``output_dir``.
 
     Returns ``{"image_b64": str, "preview_png": path, "colored_ply": path}``
     or ``None`` if there is no discretized solution to render yet.
@@ -199,7 +206,7 @@ def render_with_sliders(
         image_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
 
     os.makedirs(output_dir, exist_ok=True)
-    preview_path = os.path.join(output_dir, "final_model.png")
+    preview_path = os.path.join(output_dir, png_name)
     cv2.imwrite(preview_path, comp_bgr)
 
     height_map_mm = disc_height_image.detach().cpu().numpy().astype(np.float32) * h
@@ -211,7 +218,7 @@ def render_with_sliders(
         maximum_x_y_size=float(args.stl_output_size),
         alpha_mask=alpha,
     )
-    ply_path = os.path.join(output_dir, "final_model_colored.ply")
+    ply_path = os.path.join(output_dir, ply_name)
     colored_mesh.export(ply_path, encoding="binary")
 
     return {"image_b64": image_b64, "preview_png": preview_path, "colored_ply": ply_path}

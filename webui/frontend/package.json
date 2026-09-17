@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "playwright test"
+    "test": "npm run build && playwright test",
+    "test:e2e": "playwright test",
+    "test:unit": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.2",

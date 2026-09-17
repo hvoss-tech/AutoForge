@@ -1,5 +1,7 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
+import { refreshLibrary } from '../services/filamentService'
+import { describeApiError } from '../lib/apiError'
 import { X, Upload, FileJson, FileText, AlertTriangle } from 'lucide-react'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from './ui/dialog'
 
@@ -28,10 +30,10 @@ async function fetchWithRetry(url: string, init: RequestInit, retries = 3): Prom
 export const ImportModal: React.FC = () => {
   const importModalOpen = useAppStore((s) => s.importModalOpen)
   const setImportModalOpen = useAppStore((s) => s.setImportModalOpen)
-  const setFilaments = useAppStore((s) => s.setFilaments)
   const setCustomLibraryLoaded = useAppStore((s) => s.setCustomLibraryLoaded)
-  const activeTab = useAppStore((s) => s.activeTab)
-  const existingCount = useAppStore((s) => s.filaments.length)
+  // The store's `filaments` is only the current tab's list; the replace
+  // warning must state how many filaments the whole library really loses.
+  const [existingCount, setExistingCount] = React.useState<number | null>(null)
 
   const [dragOver, setDragOver] = React.useState(false)
   const [importStatus, setImportStatus] = React.useState<{ type: 'success' | 'error'; message: string } | null>(null)
@@ -52,6 +54,10 @@ export const ImportModal: React.FC = () => {
     reader.onload = () => {
       setPending({ ext, text: reader.result as string })
       setConfirmingReplace(false)
+      fetch('/api/filaments')
+        .then((r) => r.json())
+        .then((all) => setExistingCount(Array.isArray(all) ? all.length : null))
+        .catch(() => setExistingCount(null))
     }
     reader.readAsText(file)
   }
@@ -86,13 +92,9 @@ export const ImportModal: React.FC = () => {
         setPending(null)
         setConfirmingReplace(false)
 
-        const params = new URLSearchParams()
-        if (activeTab) params.set('filament_type', activeTab)
-        const refetch = await fetchWithRetry(`/api/filaments?${params.toString()}`, {})
-        const filaments = await refetch.json()
-        setFilaments(filaments)
+        await refreshLibrary()
       } else {
-        setImportStatus({ type: 'error', message: data.detail || data.message || 'Import failed' })
+        setImportStatus({ type: 'error', message: data?.message && !data?.detail ? data.message : describeApiError(data, response.status) })
       }
     } catch (err) {
       setImportStatus({ type: 'error', message: `Import failed: ${err}` })
@@ -216,7 +218,7 @@ export const ImportModal: React.FC = () => {
                   data-testid="import-mode-replace"
                 >
                   Replace Entire Library
-                  <span className="block text-[10px] font-normal opacity-80">Removes all {existingCount} current filaments</span>
+                  <span className="block text-[10px] font-normal opacity-80">{existingCount === null ? 'Removes all current filaments' : `Removes all ${existingCount} current filaments`}</span>
                 </button>
               </div>
             </div>
@@ -226,7 +228,7 @@ export const ImportModal: React.FC = () => {
             <div className="p-3 bg-red-900/30 border border-red-700 rounded space-y-3" data-testid="import-replace-confirm">
               <p className="text-xs text-red-200 flex items-start gap-2">
                 <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-                This deletes all {existingCount} filaments currently in your library and replaces them with the ones from this file. This can't be undone. Are you sure?
+                This deletes {existingCount === null ? 'all the' : `all ${existingCount}`} filaments currently in your library and replaces them with the ones from this file. This can't be undone. Are you sure?
               </p>
               <div className="flex gap-2">
                 <button

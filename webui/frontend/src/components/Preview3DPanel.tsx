@@ -52,7 +52,14 @@ export const Preview3DPanel: React.FC = () => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl = `${protocol}//${window.location.host}/ws/preview`
 
+    // Set on unmount so the socket closed by cleanup doesn't schedule a
+    // reconnect — otherwise every remount (StrictMode in dev, HMR) left an
+    // orphaned socket reconnecting forever and handling every update twice.
+    let disposed = false
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
     const connect = () => {
+      if (disposed) return
       const ws = new WebSocket(wsUrl)
       wsRef.current = ws
 
@@ -96,7 +103,7 @@ export const Preview3DPanel: React.FC = () => {
       }
 
       ws.onclose = () => {
-        setTimeout(connect, 2000)
+        if (!disposed) reconnectTimer = setTimeout(connect, 2000)
       }
 
       ws.onerror = () => {
@@ -107,6 +114,8 @@ export const Preview3DPanel: React.FC = () => {
     connect()
 
     return () => {
+      disposed = true
+      if (reconnectTimer) clearTimeout(reconnectTimer)
       if (wsRef.current) {
         wsRef.current.close()
         wsRef.current = null
@@ -130,6 +139,7 @@ export const Preview3DPanel: React.FC = () => {
     if (jobHasResult) return
 
     let cancelled = false
+    let lastStatus: string | null = null
 
     const poll = async () => {
       try {
@@ -141,33 +151,23 @@ export const Preview3DPanel: React.FC = () => {
           setInitState({ status: data.status })
         }
 
-        if (data.status === 'ready') {
+        // Only on the transition into "ready" — this used to refetch the
+        // preview image and re-apply /api/sliders/from-optimizer every
+        // second. That endpoint answers for the latest *completed job*, not
+        // this preview, so after undoing back to the pre-run phase it kept
+        // overwriting the restored sliders with the finished job's stack
+        // (and each overwrite became a new history entry, wiping redo).
+        if (data.status === 'ready' && lastStatus !== 'ready') {
+          if (Number.isFinite(data.min_layer) && Number.isFinite(data.max_layer)) {
+            setSliderLayerRange({ min: data.min_layer, max: data.max_layer })
+          }
           const previewRes = await fetch('/api/init/preview')
           const previewData = await previewRes.json()
           if (!cancelled && previewData.image) {
             setPreviewImage(`data:image/png;base64,${previewData.image}`)
           }
-
-          const slidersRes = await fetch('/api/sliders/from-optimizer')
-          const slidersData = await slidersRes.json()
-          if (!cancelled) {
-            const hasRange = Number.isFinite(slidersData.min_layer) && Number.isFinite(slidersData.max_layer)
-            if (
-              slidersData.sliders &&
-              Array.isArray(slidersData.sliders) &&
-              slidersData.sliders.length > 0
-            ) {
-              applySliders(slidersData.sliders, hasRange ? { min: slidersData.min_layer, max: slidersData.max_layer } : undefined)
-            } else if (hasRange) {
-              // No segments to apply (e.g. the pre-run auto-preview phase,
-              // where the layer->material assignment is meaningless — see
-              // api/sliders.py) but the real heightmap-derived range is
-              // still worth reflecting immediately, instead of leaving the
-              // slider track at its 0-75 placeholder default.
-              setSliderLayerRange({ min: slidersData.min_layer, max: slidersData.max_layer })
-            }
-          }
         }
+        lastStatus = data.status
       } catch {
         // ignore
       }
@@ -180,7 +180,7 @@ export const Preview3DPanel: React.FC = () => {
       cancelled = true
       clearInterval(interval)
     }
-    }, [inputImage, setPreviewImage, setInitState, setSliderLayerRange, updateSlider, optimizationStarted, jobFailed, jobHasResult])
+  }, [inputImage, setPreviewImage, setInitState, setSliderLayerRange, optimizationStarted, jobFailed, jobHasResult])
 
   const coloredPlyUrl = stlFile && currentJob?.job_id
     ? `/api/outputs/colored-ply/${currentJob.job_id}?v=${previewVersion}`

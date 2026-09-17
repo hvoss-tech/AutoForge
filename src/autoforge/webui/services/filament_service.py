@@ -233,6 +233,12 @@ class FilamentService:
             self._save_library()
             return filament
 
+    def replace_active(self, filaments: list[Filament]) -> list[Filament]:
+        with self._lock:
+            self._active = {f.uuid: f for f in filaments}
+            self._save_library()
+            return list(self._active.values())
+
     def remove_active(self, uuid_: str) -> bool:
         with self._lock:
             if uuid_ not in self._active:

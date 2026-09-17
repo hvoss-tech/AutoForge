@@ -22,7 +22,8 @@ async def get_project_state():
             with open(path) as f:
                 data = json.load(f)
             _state = ProjectState(**data)
-        except (json.JSONDecodeError, IOError):
+        except (json.JSONDecodeError, IOError, ValueError):
+            # ValueError: pydantic validation of an outdated/invalid file.
             pass
     return _state.model_dump()
 

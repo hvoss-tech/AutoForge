@@ -65,8 +65,30 @@ async def download_project(job_id: str):
     return FileResponse(path, filename=f"{job_id}_project.hfp")
 
 
+# Written by slider edits (api/preview.py) next to the optimizer's own
+# outputs instead of over them: overwriting final_model_colored.ply /
+# final_model.png meant an undo that briefly applied another state's sliders
+# permanently replaced the real result, and the export zip mixed edited
+# PNG/PLY with the unedited STL, swap instructions and project file.
+EDITED_PLY = "edited_model_colored.ply"
+EDITED_PNG = "edited_model.png"
+
+
+def discard_slider_edits(job_id: str) -> None:
+    """Called when a job's real outputs are regenerated (pruning)."""
+    for name in (EDITED_PLY, EDITED_PNG):
+        path = _job_path(job_id, name)
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
 @router.get("/colored-ply/{job_id}")
 async def download_colored_ply(job_id: str):
+    """The mesh the 3D view shows: the user's slider-edited version when one
+    exists, otherwise the optimizer's own."""
+    edited = _job_path(job_id, EDITED_PLY)
+    if edited and os.path.exists(edited):
+        return FileResponse(edited, filename=f"{job_id}_colored.ply")
     path = _resolve_or_404(job_id, "final_model_colored.ply", "Colored PLY not found")
     return FileResponse(path, filename=f"{job_id}_colored.ply")
 

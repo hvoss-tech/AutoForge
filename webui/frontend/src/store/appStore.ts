@@ -1,9 +1,13 @@
 import { create } from 'zustand'
 import type { Filament, ColorSliderConfig, OptimizationSettings, JobStatus, ProjectState, PruningSettings, InitState, Snapshot } from '../types'
+import { jobStatusFromControlResponse } from '../lib/jobControl'
+import { resolveRestoredJob } from '../lib/history'
+import { describeApiError } from '../lib/apiError'
 
 // Module-level undo stack — NOT in Zustand store to avoid infinite loops via subscribe
 const UNDO_STACK: Snapshot[] = []
 let UNDO_INDEX = -1
+const MAX_HISTORY = 50
 
 export interface HistoryEntry {
   timestamp: number
@@ -44,6 +48,26 @@ export function shouldRestoreJobOnLoad(status: string): boolean {
   return status === 'running' || status === 'paused' || status === 'completed'
 }
 
+async function refreshCurrentJob(jobId: string): Promise<void> {
+  try {
+    const response = await fetch(`/api/optimize/status/${jobId}`)
+    if (response.ok) useAppStore.getState().setCurrentJob(await response.json())
+  } catch (_) {}
+}
+
+// Replace the backend's active-filament list wholesale. /api/optimize/start
+// reads the backend's list, not the store's, so anything that swaps the
+// store's list (undo/redo, loading a project file) must sync it or the next
+// Run silently uses different filaments than the UI shows.
+async function syncActiveFilamentsToServer(filaments: Filament[]): Promise<void> {
+  const response = await fetch('/api/filaments/active', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(filaments),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+}
+
 // `inputImage` holds a `blob:` object URL right after a local upload (valid
 // only in this browser tab, until the page reloads or is closed) — it's
 // swapped for the durable `/uploads/<filename>` server path on the next
@@ -64,10 +88,10 @@ export function durableInputImageUrl(inputImage: string | null, settings: Optimi
 // can produce. Once a job actually completes, `applySliders` replaces this
 // wholesale with however many bands the result really has.
 const defaultSliders: ColorSliderConfig[] = [
-  { td: 2.0, layer: 8, depth_mm: 0.72, filament_uuid: '', enabled: true },
-  { td: 3.0, layer: 13, depth_mm: 1.12, filament_uuid: '', enabled: true },
-  { td: 8.0, layer: 20, depth_mm: 1.68, filament_uuid: '', enabled: true },
-  { td: 5.0, layer: 27, depth_mm: 2.24, filament_uuid: '', enabled: true },
+  { td: 2.0, layer: 8, depth_mm: 0.32, filament_uuid: '', enabled: true },
+  { td: 3.0, layer: 13, depth_mm: 0.52, filament_uuid: '', enabled: true },
+  { td: 8.0, layer: 20, depth_mm: 0.8, filament_uuid: '', enabled: true },
+  { td: 5.0, layer: 27, depth_mm: 1.08, filament_uuid: '', enabled: true },
   ...Array.from({ length: 6 }, () => ({ td: 5.0, layer: 0, depth_mm: 0.0, filament_uuid: '', enabled: false })),
 ]
 
@@ -235,6 +259,7 @@ interface AppState {
   undo: () => Promise<void>
   redo: () => Promise<void>
   restoreToIndex: (index: number) => Promise<void>
+  clearHistory: () => Promise<void>
   captureSnapshot: (label?: string) => void
 }
 
@@ -283,7 +308,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
 
-  setFilaments: (filaments) => { set({ filaments }); queueCaptureSnapshot('Filament library updated') },
+  // Not an undo step: the library list is refreshed by searches/filters and
+  // after imports, and isn't part of a snapshot anyway.
+  setFilaments: (filaments) => set({ filaments }),
   setFilamentTypes: (types) => set({ filamentTypes: types }),
   setFilamentBrands: (brands) => set({ filamentBrands: brands }),
   setActiveFilaments: (filaments) => { set({ activeFilaments: filaments }); queueCaptureSnapshot('Active filaments changed') },
@@ -305,7 +332,11 @@ export const useAppStore = create<AppState>((set, get) => ({
           : {}),
       }
     })
-    queueCaptureSnapshot('Color slider edit')
+    // No snapshot: this is the optimizer/pruner pushing its stack, not a user
+    // edit. Recording each live preview update as "Color slider edit" filled
+    // the history with noise during a run and — once an undo landed in the
+    // pre-run phase, where the init poll kept re-applying a stack — created
+    // new entries every second that wiped the redo branch.
   },
   addActiveFilament: async (filament) => {
     set((state) => {
@@ -363,17 +394,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (job && job.status === 'completed') {
       set({ stlFile: job.job_id })
     }
-    // Only worth a history entry on a real transition (job started, or
-    // reached a terminal state) — not on every progress tick, which would
-    // otherwise queue (and coalesce away) a snapshot write every callback
-    // for the whole duration of a run.
-    if (job && job.status !== prevStatus) {
-      const label = job.status === 'completed' ? 'Optimization completed'
-        : job.status === 'failed' ? 'Optimization failed'
-        : job.status === 'cancelled' ? 'Optimization cancelled'
-        : job.status === 'running' && prevStatus !== 'paused' ? 'Optimization started'
-        : 'Job status changed'
-      queueCaptureSnapshot(label)
+    // The finished result is the one job transition worth an undo step (it's
+    // a state you can return to); started/failed/cancelled change nothing
+    // the user can restore.
+    if (job && job.status === 'completed' && prevStatus !== 'completed') {
+      queueCaptureSnapshot('Optimization completed')
     }
   },
   setSliderLayerRange: (range) => set({ sliderLayerRange: range }),
@@ -444,11 +469,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     // loaded on a different machine/profile) is created first so the
     // reference doesn't silently dangle.
     if (Array.isArray(parsed.activeFilaments)) {
-      for (const f of state.activeFilaments) {
-        try {
-          await fetch(`/api/filaments/active/${f.uuid}`, { method: 'DELETE' })
-        } catch (_) {}
-      }
       const libraryRes = await fetch('/api/filaments')
       const library: Filament[] = await libraryRes.json().catch(() => [])
       const libraryUuids = new Set(library.map((f) => f.uuid))
@@ -463,12 +483,12 @@ export const useAppStore = create<AppState>((set, get) => ({
             })
             libraryChanged = true
           }
-          await fetch('/api/filaments/active', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(f),
-          })
         } catch (_) {}
+      }
+      try {
+        await syncActiveFilamentsToServer(parsed.activeFilaments)
+      } catch (e) {
+        get().pushToast(`Failed to save the project's active filaments on the server: ${e instanceof Error ? e.message : String(e)}`)
       }
       if (libraryChanged) {
         const refreshed = await fetch('/api/filaments')
@@ -496,15 +516,15 @@ export const useAppStore = create<AppState>((set, get) => ({
         body: JSON.stringify(state.settings),
       })
       if (!response.ok) {
-        const err = await response.json().catch(() => ({ detail: `HTTP ${response.status}` }))
-        console.error('[store] Init rejected:', err.detail)
+        const detail = describeApiError(await response.json().catch(() => null), response.status)
+        console.error('[store] Init rejected:', detail)
         set({ initState: { status: 'idle', preview_image: null } })
         // "Already initializing" is a benign race (see the comment on
         // ActiveFilamentsPanel's effect) — not worth alarming the user
         // about; anything else (including an OOM from heightmap init,
         // which runs real GPU work) is not.
-        if (!String(err.detail ?? '').includes('Already initializing')) {
-          get().pushToast(`Failed to prepare preview: ${err.detail ?? `HTTP ${response.status}`}`)
+        if (!detail.includes('Already initializing')) {
+          get().pushToast(`Failed to prepare preview: ${detail}`)
         }
         return
       }
@@ -529,8 +549,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       body: JSON.stringify(state.settings),
     })
     if (!response.ok) {
-      const err = await response.json().catch(() => ({ detail: 'Request failed' }))
-      throw new Error(err.detail ?? `HTTP ${response.status}`)
+      throw new Error(describeApiError(await response.json().catch(() => null), response.status))
     }
     const data = await response.json()
     if (pruningPollTimer) clearTimeout(pruningPollTimer)
@@ -541,24 +560,45 @@ export const useAppStore = create<AppState>((set, get) => ({
   pauseOptimization: async (jobId) => {
     const response = await fetch(`/api/optimize/pause/${jobId}`, { method: 'POST' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const status = jobStatusFromControlResponse(await response.json().catch(() => null), 'paused')
+    if (status !== 'paused') {
+      // The job had already finished — pick up its final state (and, for a
+      // completed job, its result) instead of the one we asked for.
+      await refreshCurrentJob(jobId)
+      return
+    }
     set((state) => ({
-      currentJob: state.currentJob ? { ...state.currentJob, status: 'paused' } : null,
+      currentJob: state.currentJob ? { ...state.currentJob, status } : null,
     }))
   },
 
   resumeOptimization: async (jobId) => {
     const response = await fetch(`/api/optimize/resume/${jobId}`, { method: 'POST' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const status = jobStatusFromControlResponse(await response.json().catch(() => null), 'running')
+    if (status !== 'running') {
+      // The job had already finished — pick up its final state (and, for a
+      // completed job, its result) instead of the one we asked for.
+      await refreshCurrentJob(jobId)
+      return
+    }
     set((state) => ({
-      currentJob: state.currentJob ? { ...state.currentJob, status: 'running' } : null,
+      currentJob: state.currentJob ? { ...state.currentJob, status } : null,
     }))
   },
 
   cancelOptimization: async (jobId) => {
     const response = await fetch(`/api/optimize/cancel/${jobId}`, { method: 'POST' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const status = jobStatusFromControlResponse(await response.json().catch(() => null), 'cancelled')
+    if (status !== 'cancelled') {
+      // The job had already finished — pick up its final state (and, for a
+      // completed job, its result) instead of the one we asked for.
+      await refreshCurrentJob(jobId)
+      return
+    }
     set((state) => ({
-      currentJob: state.currentJob ? { ...state.currentJob, status: 'cancelled' } : null,
+      currentJob: state.currentJob ? { ...state.currentJob, status } : null,
     }))
   },
 
@@ -573,8 +613,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       body: JSON.stringify({ ...state.pruningSettings, job_id: state.currentJob.job_id }),
     })
     if (!response.ok) {
-      const err = await response.json().catch(() => ({ detail: 'Request failed' }))
-      throw new Error(err.detail ?? `HTTP ${response.status}`)
+      throw new Error(describeApiError(await response.json().catch(() => null), response.status))
     }
     const data = await response.json()
     set({ pruningJob: { ...data, progress: 0, iteration: 0, loss: null, error: null, started_at: new Date().toISOString(), completed_at: null, preview_image: null } })
@@ -587,6 +626,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (res.ok) {
           const job = await res.json()
           set({ pruningJob: job })
+          if (job.status === 'completed') queueCaptureSnapshot('Pruning completed')
           if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') return
         }
       } catch {
@@ -601,24 +641,27 @@ export const useAppStore = create<AppState>((set, get) => ({
   pausePruning: async (jobId) => {
     const response = await fetch(`/api/optimize/pause/${jobId}`, { method: 'POST' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const status = jobStatusFromControlResponse(await response.json().catch(() => null), 'paused')
     set((state) => ({
-      pruningJob: state.pruningJob ? { ...state.pruningJob, status: 'paused' } : null,
+      pruningJob: state.pruningJob ? { ...state.pruningJob, status } : null,
     }))
   },
 
   resumePruning: async (jobId) => {
     const response = await fetch(`/api/optimize/resume/${jobId}`, { method: 'POST' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const status = jobStatusFromControlResponse(await response.json().catch(() => null), 'running')
     set((state) => ({
-      pruningJob: state.pruningJob ? { ...state.pruningJob, status: 'running' } : null,
+      pruningJob: state.pruningJob ? { ...state.pruningJob, status } : null,
     }))
   },
 
   cancelPruning: async (jobId) => {
     const response = await fetch(`/api/optimize/cancel/${jobId}`, { method: 'POST' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const status = jobStatusFromControlResponse(await response.json().catch(() => null), 'cancelled')
     set((state) => ({
-      pruningJob: state.pruningJob ? { ...state.pruningJob, status: 'cancelled' } : null,
+      pruningJob: state.pruningJob ? { ...state.pruningJob, status } : null,
     }))
   },
 
@@ -631,16 +674,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       // type exactly, including nested fields like depth_mm and
       // filament_uuid — so this can be applied directly.
       if (data.color_sliders && data.color_sliders.length > 0) set({ colorSliders: data.color_sliders })
-      // `settings` (and therefore which input image is selected) was never
-      // restored here — after a reload the store fell back to hardcoded
-      // defaults even though the backend still had the real settings and
-      // uploaded image on disk, which left `input_image` empty and the Run
-      // button stuck disabled ("upload an image") until the user
-      // re-uploaded, despite nothing actually being wrong.
-      if (data.settings) set({ settings: data.settings })
-      if (data.settings?.input_image) {
-        set({ inputImage: `/uploads/${data.settings.input_image}` })
-      }
+      // `settings` restores on every load so options survive a reload, but
+      // `input_image` is deliberately excluded: a fresh webui start should
+      // always show the "upload an image" prompt rather than silently
+      // resuming whatever image a previous session (possibly days old) last
+      // uploaded. The user has to explicitly upload (or load a saved
+      // project) before Run is enabled again.
+      if (data.settings) set({ settings: { ...data.settings, input_image: '' } })
     } catch {
       // Use defaults
     }
@@ -656,7 +696,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         const ascending = [...snapshots].sort((a, b) => a.timestamp - b.timestamp)
         UNDO_STACK.length = 0
         UNDO_STACK.push(...ascending)
-        if (UNDO_STACK.length > 50) UNDO_STACK.splice(0, UNDO_STACK.length - 50)
+        if (UNDO_STACK.length > MAX_HISTORY) UNDO_STACK.splice(0, UNDO_STACK.length - MAX_HISTORY)
         UNDO_INDEX = UNDO_STACK.length - 1
         set({
           historyIndex: UNDO_INDEX,
@@ -681,34 +721,25 @@ export const useAppStore = create<AppState>((set, get) => ({
       currentJobId: state.currentJob?.job_id ?? null,
       optimizationResultId: state.currentJob?.status === 'completed' ? state.currentJob?.job_id : null,
       jobStatus: state.currentJob?.status ?? null,
+      sliderLayerRange: state.sliderLayerRange,
     }
 
-    fetch('/api/state/snapshot', {
+    // An edit made after undoing abandons the redo branch; the server must
+    // drop it too or it reappears (interleaved by time) on the next reload.
+    const abandonsRedo = UNDO_INDEX >= 0 && UNDO_INDEX < UNDO_STACK.length - 1
+    const query = abandonsRedo ? `?discard_after=${UNDO_STACK[UNDO_INDEX].timestamp}` : ''
+    fetch(`/api/state/snapshot${query}`, {
       method: 'POST',
+      keepalive: true,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(snapshot),
     }).catch(() => {})
 
-    // Keep the on-reload project state fresh — GET /api/project/state is
-    // read on every app mount, so if this never fires the endpoint keeps
-    // serving whatever was last written (or nothing), and a stale/empty
-    // snapshot silently overrides live defaults on next load.
-    fetch('/api/project/state', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        color_sliders: state.colorSliders,
-        settings: state.settings,
-        active_filaments: state.activeFilaments,
-      }),
-    }).catch(() => {})
+    persistProjectState(state)
 
-    // A snapshot taken after undoing drops everything ahead of it (the old
-    // "redo" branch) — standard undo-stack semantics, and it also keeps
-    // this array in lockstep with what's actually persisted server-side.
     UNDO_STACK.splice(UNDO_INDEX + 1)
     UNDO_STACK.push(snapshot)
-    if (UNDO_STACK.length > 50) UNDO_STACK.shift()
+    if (UNDO_STACK.length > MAX_HISTORY) UNDO_STACK.shift()
     UNDO_INDEX = UNDO_STACK.length - 1
     set({
       historyIndex: UNDO_INDEX,
@@ -717,66 +748,33 @@ export const useAppStore = create<AppState>((set, get) => ({
     })
   },
 
-  restoreToIndex: async (index) => {
-    const state = get()
-    if (index < 0 || index >= UNDO_STACK.length) return
-    const target = UNDO_STACK[index]
-    if (!target) return
-
-    // Stop running job — the state we're jumping to shouldn't have to
-    // race whatever's currently in flight.
-    if (state.currentJob && ['running', 'paused', 'pending'].includes(state.currentJob.status)) {
-      try {
-        await fetch(`/api/optimize/cancel/${state.currentJob.job_id}`, { method: 'POST' })
-      } catch (_) {}
+  clearHistory: () => runHistoryExclusive(async () => {
+    if (snapshotTimer) {
+      clearTimeout(snapshotTimer)
+      snapshotTimer = null
+      pendingLabel = undefined
     }
+    await fetch('/api/state/history', { method: 'DELETE' }).catch(() => {})
+    UNDO_STACK.length = 0
+    UNDO_INDEX = -1
+    // The current state becomes the new starting point.
+    get().captureSnapshot('History cleared')
+  }),
 
-    try {
-      const resp = await fetch('/api/state/restore', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timestamp: target.timestamp }),
-      })
-      if (!resp.ok) return
+  restoreToIndex: (index) => runHistoryExclusive(async () => {
+    flushPendingSnapshot()
+    await applySnapshot(index)
+  }),
 
-      UNDO_INDEX = index
+  undo: () => runHistoryExclusive(async () => {
+    flushPendingSnapshot()
+    if (UNDO_INDEX > 0) await applySnapshot(UNDO_INDEX - 1)
+  }),
 
-      // Restore whichever job was "current" at snapshot time — without
-      // this, undo/redo/History all lost the completed job's 3D result
-      // (currentJob was unconditionally nulled), even though the snapshot
-      // itself remembers exactly which job that was.
-      let restoredJob: JobStatus | null = null
-      if (target.currentJobId) {
-        try {
-          const jobResp = await fetch(`/api/optimize/status/${target.currentJobId}`)
-          if (jobResp.ok) restoredJob = await jobResp.json()
-        } catch (_) {}
-      }
-
-      set((prev) => ({
-        activeFilaments: target.activeFilaments ?? prev.activeFilaments,
-        colorSliders: target.colorSliders ?? prev.colorSliders,
-        settings: target.settings ?? prev.settings,
-        inputImage: target.inputImage ?? prev.inputImage,
-        historyIndex: UNDO_INDEX,
-        currentJob: restoredJob,
-        stlFile: restoredJob && restoredJob.status === 'completed' ? restoredJob.job_id : null,
-      }))
-      get().bumpPreviewVersion()
-    } catch (_) {}
-  },
-
-  undo: async () => {
-    const state = get()
-    if (state.historyIndex <= 0) return
-    await get().restoreToIndex(state.historyIndex - 1)
-  },
-
-  redo: async () => {
-    const state = get()
-    if (state.historyIndex >= UNDO_STACK.length - 1) return
-    await get().restoreToIndex(state.historyIndex + 1)
-  },
+  redo: () => runHistoryExclusive(async () => {
+    flushPendingSnapshot()
+    if (UNDO_INDEX < UNDO_STACK.length - 1) await applySnapshot(UNDO_INDEX + 1)
+  }),
 }))
 // Debounced snapshot queue — safe from infinite loops because captureSnapshot
 // only calls set({ historyIndex, historyLength, historyEntries }), none of
@@ -789,10 +787,94 @@ function queueCaptureSnapshot(label?: string) {
   if (label) pendingLabel = label
   if (snapshotTimer) clearTimeout(snapshotTimer)
   snapshotTimer = setTimeout(() => {
+    snapshotTimer = null
     const label = pendingLabel
     pendingLabel = undefined
     useAppStore.getState().captureSnapshot(label)
   }, 500)
+}
+
+// An edit made moments before Undo is still waiting in the debounce; record
+// it first so Undo steps back *from* it rather than silently discarding it.
+function flushPendingSnapshot() {
+  if (!snapshotTimer) return
+  clearTimeout(snapshotTimer)
+  snapshotTimer = null
+  const label = pendingLabel
+  pendingLabel = undefined
+  useAppStore.getState().captureSnapshot(label)
+}
+
+// Closing or reloading the tab within the debounce window used to drop the
+// last edit entirely (it's also what persists the project state). The
+// requests use `keepalive`, so they still go out while the page unloads.
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', flushPendingSnapshot)
+}
+
+// Undo/redo/History clicks run strictly one after another. Each one awaits
+// network calls, and they used to read `historyIndex` before the previous
+// one had updated it — pressing Ctrl+Z twice quickly restored the same step
+// twice instead of going back two.
+let historyQueue: Promise<void> = Promise.resolve()
+function runHistoryExclusive(fn: () => Promise<void>): Promise<void> {
+  const run = historyQueue.then(fn)
+  historyQueue = run.catch(() => {})
+  return run
+}
+
+function persistProjectState(state: Pick<AppState, 'colorSliders' | 'settings' | 'activeFilaments'>) {
+  // GET /api/project/state is what a reload starts from.
+  fetch('/api/project/state', {
+    method: 'POST',
+    keepalive: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      color_sliders: state.colorSliders,
+      settings: state.settings,
+      active_filaments: state.activeFilaments,
+    }),
+  }).catch(() => {})
+}
+
+async function applySnapshot(index: number) {
+  const target = UNDO_STACK[index]
+  if (!target) return
+  const store = useAppStore.getState()
+  UNDO_INDEX = index
+  useAppStore.setState({ historyIndex: index })
+
+  if (target.activeFilaments) {
+    try {
+      await syncActiveFilamentsToServer(target.activeFilaments)
+    } catch (_) {
+      store.pushToast('Failed to restore active filaments on the server — the next run may use a different set than shown.')
+    }
+  }
+
+  const jobPlan = resolveRestoredJob(store.currentJob, target)
+  let jobUpdate: Partial<AppState> = {}
+  if (jobPlan.kind === 'none') {
+    jobUpdate = { currentJob: null, stlFile: null }
+  } else if (jobPlan.kind === 'fetch') {
+    let job: JobStatus | null = null
+    try {
+      const resp = await fetch(`/api/optimize/status/${jobPlan.jobId}`)
+      if (resp.ok) job = await resp.json()
+    } catch (_) {}
+    jobUpdate = job?.status === 'completed' ? { currentJob: job, stlFile: job.job_id } : { currentJob: null, stlFile: null }
+  }
+
+  useAppStore.setState((prev) => ({
+    activeFilaments: target.activeFilaments ?? prev.activeFilaments,
+    colorSliders: target.colorSliders ?? prev.colorSliders,
+    settings: target.settings ?? prev.settings,
+    inputImage: target.inputImage ?? prev.inputImage,
+    ...(target.sliderLayerRange ? { sliderLayerRange: target.sliderLayerRange } : {}),
+    ...jobUpdate,
+  }))
+  useAppStore.getState().bumpPreviewVersion()
+  persistProjectState(useAppStore.getState())
 }
 
 

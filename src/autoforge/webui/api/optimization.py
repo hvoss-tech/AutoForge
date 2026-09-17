@@ -73,6 +73,16 @@ async def start_optimization(settings: OptimizationSettings):
         for f in active
     ]
 
+    # One optimization at a time: a second run (e.g. "Start Optimization" in
+    # the Settings dialog while the first was paused) competed for the same
+    # GPU memory and left two jobs broadcasting into the same preview.
+    busy = svc.get_active_optimization_job()
+    if busy is not None:
+        raise HTTPException(
+            409,
+            f"An optimization is already {busy.status}. Resume or cancel it before starting a new one.",
+        )
+
     job = svc.create_job(settings_dict)
 
     def _run():
@@ -213,7 +223,9 @@ async def pause_optimization(job_id: str):
     svc = get_optimization_service()
     if not svc.pause(job_id):
         raise HTTPException(404, "Job not found")
-    return {"status": "paused"}
+    # The job's real status, not an assumed one — a job that already
+    # finished is left untouched, and the client needs to know that.
+    return {"status": svc.get_job(job_id).status}
 
 
 @router.post("/resume/{job_id}")
@@ -221,7 +233,9 @@ async def resume_optimization(job_id: str):
     svc = get_optimization_service()
     if not svc.resume(job_id):
         raise HTTPException(404, "Job not found")
-    return {"status": "resumed"}
+    # The job's real status, not an assumed one — a job that already
+    # finished is left untouched, and the client needs to know that.
+    return {"status": svc.get_job(job_id).status}
 
 
 @router.post("/cancel/{job_id}")
@@ -229,7 +243,9 @@ async def cancel_optimization(job_id: str):
     svc = get_optimization_service()
     if not svc.cancel(job_id):
         raise HTTPException(404, "Job not found")
-    return {"status": "cancelled"}
+    # The job's real status, not an assumed one — a job that already
+    # finished is left untouched, and the client needs to know that.
+    return {"status": svc.get_job(job_id).status}
 
 
 @router.get("/status/{job_id}")

@@ -106,4 +106,5 @@ export interface Snapshot {
   currentJobId?: string | null
   optimizationResultId?: string | null
   jobStatus?: string | null
+  sliderLayerRange?: { min: number; max: number } | null
 }
