@@ -63,7 +63,7 @@ The easiest way to use AutoForge is the web UI — a local app (like ComfyUI) wi
    This checks GitHub for a newer release and, if one exists, pulls it and reinstalls dependencies for you. Add `--check` to only check without applying it (e.g. `./update.sh --check`).
 
 If you have problems running the code on your GPU, please refer to the [Pytorch Homepage](https://pytorch.org/) for help. \
-CUDA, ROCm, and MPS (Apple Metal) are supported, but you need to install the correct version of pytorch for your system — `install.sh`/`install.bat` install whatever `uv sync` resolves by default, so swap in a GPU-specific PyTorch build afterwards if you need one.
+CUDA, ROCm, and MPS (Apple Metal) are supported, but you need to install the correct version of pytorch for your system — `install.sh`/`install.bat` install whatever `uv sync` resolves by default, so swap in a GPU-specific PyTorch build afterwards if you need one. (`install.sh` handles older NVIDIA GPUs automatically, see below.)
 
 ## Manual Installation (CLI only)
 
@@ -74,6 +74,27 @@ If you just want the command-line tool (no web UI), install the current version 
 
 If you have problems running the code on your gpu, please refer to the [Pytorch Homepage](https://pytorch.org/) for help. \
 CUDA, ROCm, and MPS (Apple Metal) are supported, but you need to install the correct version of pytorch for your system.
+
+## Older NVIDIA GPUs (GTX 900/10-series, Titan V)
+
+The default CUDA build of PyTorch only ships kernels for compute capability 7.5 (Turing) and newer. On GTX 900-series (Maxwell), GTX 10-series (Pascal) and Titan V (Volta) cards, `torch.cuda.is_available()` still returns `True`, but the first kernel launch fails with `CUDA error: no kernel image is available for execution on the device`.
+
+`install.sh` (Linux/macOS) detects these GPUs and reinstalls PyTorch from the CUDA 12.6 index, the last build line that includes their kernels (see [pytorch/pytorch#190385](https://github.com/pytorch/pytorch/issues/190385)). `run_webui.sh` then skips `uv`'s automatic sync so the launch doesn't swap the default build back in. To do it by hand, run this in the project folder:
+
+```bash
+uv pip install --reinstall-package torch --reinstall-package torchvision torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu126
+```
+
+and set `UV_NO_SYNC=1` when using `uv run` so it isn't reverted. With plain `pip`, use `pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126` instead.
+
+To verify, check that the architecture list printed by the following contains an entry your GPU can run (`sm_61` is covered by `sm_60`):
+
+```bash
+uv run --no-sync python -c "import torch; print(torch.__version__, torch.cuda.get_arch_list())"
+```
+
+A working CUDA 12.6 build lists `sm_50`, `sm_60` and `sm_70` in addition to the newer architectures.
 
 ## Usage
 
@@ -215,6 +236,11 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 AutoForge © 2025 by Hendric Voss is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
 The software is provided as-is and comes with no warranty or guarantee of support.
 
+The above license applies to the software itself. How you use the generated files and prints is entirely up to you. If you want to print them for your friends or family, that's great. If you want to sell them, that's fine by me too. 
+
+From a licensing standpoint, this means that the prints you create are entirely subject to the [MIT License](https://opensource.org/licenses/MIT), and you can do whatever you like with them. The only thing the MIT License does not give you is a warranty, and it also frees me from any liability with regard to your 3D prints. Otherwise, do whatever you like.
+
+I would love to see what you have done with the software, so it would be great if you could send me a link to your work (even if it's just for selling). However, this is not necessary if you do not want to.
 
 ## Acknowledgements
 
