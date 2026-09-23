@@ -4,13 +4,47 @@ import { useAppStore } from '../store/appStore'
 
 const MAX_RECONNECT_ATTEMPTS = 5
 const BASE_RECONNECT_DELAY = 500 // ms
+// Once the WS gives up reconnecting, fall back to plain status polling (the
+// same thing pruning already does at 1 Hz) rather than leaving the progress
+// bar frozen with no error for the rest of a long run — a laptop sleep or a
+// ~20s network blip should not silently stop updates.
+const POLL_FALLBACK_INTERVAL = 2000 // ms
 
 export function useJobWebSocket(jobId: string | null) {
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectAttemptsRef = useRef(0)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const mountedRef = useRef(true)
   const setCurrentJob = useAppStore((s) => s.setCurrentJob)
+
+  const stopPolling = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
+  }, [])
+
+  const startPolling = useCallback(
+    (polledJobId: string) => {
+      stopPolling()
+      pollTimerRef.current = setInterval(async () => {
+        try {
+          const response = await fetch(`/api/optimize/status/${polledJobId}`)
+          if (!mountedRef.current) return
+          if (!response.ok) return
+          const data: JobStatus = await response.json()
+          setCurrentJob(data)
+          if (['completed', 'failed', 'cancelled'].includes(data.status)) {
+            stopPolling()
+          }
+        } catch {
+          // Transient network error — keep polling, same as before.
+        }
+      }, POLL_FALLBACK_INTERVAL)
+    },
+    [setCurrentJob, stopPolling]
+  )
 
   const connect = useCallback(() => {
     const currentJobId = jobId
@@ -29,14 +63,35 @@ export function useJobWebSocket(jobId: string | null) {
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws/optimize/${currentJobId}`)
     wsRef.current = ws
     let intentionalClose = false
+    // onerror and onclose both fire for a failed connection (a browser
+    // always closes after erroring); routing both to the same handler used
+    // to consume the reconnect-attempt budget twice per actual failure and
+    // could double-schedule a reconnect. Guard so only the first of the
+    // pair does anything.
+    let closeHandled = false
 
     ws.onopen = () => {
       reconnectAttemptsRef.current = 0
+      stopPolling()
     }
 
     ws.onmessage = (event) => {
       try {
         const data: JobStatus = JSON.parse(event.data)
+        // A backend restart mid-run sends this instead of a real status;
+        // storing it verbatim put a value outside the JobStatus union into
+        // currentJob (and from there into undo snapshots) with nothing in
+        // the UI explaining the vanished run.
+        if ((data.status as string) === 'not_found') {
+          intentionalClose = true
+          stopPolling()
+          setCurrentJob(null)
+          useAppStore.getState().pushToast(
+            'Lost track of this job (the server may have restarted).',
+            'warning'
+          )
+          return
+        }
         // The in-panel "Optimization failed" banner (Preview3DPanel) only
         // helps if that panel happens to be visible — it's fully covered
         // by the Settings/Pruning modals, which is exactly where a user
@@ -57,6 +112,7 @@ export function useJobWebSocket(jobId: string | null) {
         setCurrentJob(data)
         if (['completed', 'failed', 'cancelled'].includes(data.status)) {
           intentionalClose = true
+          stopPolling()
           ws.close()
         }
       } catch {
@@ -65,6 +121,8 @@ export function useJobWebSocket(jobId: string | null) {
     }
 
     const handleClose = () => {
+      if (closeHandled) return
+      closeHandled = true
       wsRef.current = null
       if (!mountedRef.current) return
       if (intentionalClose) return
@@ -77,12 +135,16 @@ export function useJobWebSocket(jobId: string | null) {
         reconnectTimerRef.current = setTimeout(() => {
           if (mountedRef.current) connect()
         }, delay)
+      } else {
+        // Reconnects exhausted: don't leave the progress bar frozen with no
+        // feedback for the rest of a long run — poll instead.
+        startPolling(currentJobId)
       }
     }
 
     ws.onclose = handleClose
     ws.onerror = handleClose
-  }, [jobId, setCurrentJob])
+  }, [jobId, setCurrentJob, startPolling, stopPolling])
 
   useEffect(() => {
     mountedRef.current = true
@@ -93,6 +155,7 @@ export function useJobWebSocket(jobId: string | null) {
         clearTimeout(reconnectTimerRef.current)
         reconnectTimerRef.current = null
       }
+      stopPolling()
       if (wsRef.current) {
         wsRef.current.onclose = null
         wsRef.current.onerror = null
@@ -101,7 +164,7 @@ export function useJobWebSocket(jobId: string | null) {
         wsRef.current = null
       }
     }
-  }, [jobId, connect])
+  }, [jobId, connect, stopPolling])
 
   return wsRef.current
 }

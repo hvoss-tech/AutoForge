@@ -8,6 +8,7 @@ from ..models import PruningSettings
 from ..services.optimization_service import get_optimization_service
 from ..helpers.pipeline_runner import friendly_error_message
 from ..helpers.sliders import result_counts_from_optimizer, should_repeat_prune
+from ..helpers.telemetry import capture_exception
 from ..config import config
 
 router = APIRouter()
@@ -16,6 +17,24 @@ router = APIRouter()
 @router.post("/start")
 async def start_pruning(settings: PruningSettings):
     svc = get_optimization_service()
+
+    # Pruning drives the same GPU (and the same FilamentOptimizer as any
+    # active optimization) — two such jobs running concurrently interleave
+    # mutations of `optimizer.best_params` and write the same output files,
+    # so this is a hard mutex, not a recommendation. A double-click on
+    # "Start pruning" used to start a second prune thread on the same
+    # result.
+    busy = svc.get_any_active_job()
+    if busy is not None:
+        if busy.job_id.startswith("prune-"):
+            raise HTTPException(
+                409,
+                f"Pruning is already {busy.status}. Let it finish or cancel it before starting another pass.",
+            )
+        raise HTTPException(
+            409,
+            f"An optimization is {busy.status}. Let it finish or cancel it before pruning.",
+        )
 
     # Pruning must operate on the specific result the frontend is looking
     # at (its `currentJob`) — not "whatever completed job happens to be
@@ -37,7 +56,20 @@ async def start_pruning(settings: PruningSettings):
     from datetime import timezone
 
     prune_job_id = f"prune-{uuid.uuid4().hex[:8]}"
-    svc.create_job({"iterations": 1}, job_id=prune_job_id)
+    # input_image/flatforge carry over so this job is restorable exactly
+    # like an optimization job once it completes (see get_latest_job and
+    # jobBelongsToImage) — a successful prune clones a real, independent
+    # result under this id (below), it is no longer just a progress tracker.
+    # input_image/flatforge are Optional[str]/Optional[bool] on JobStatus but
+    # plain (non-optional) fields on the settings model create_job() also
+    # populates — omit whichever is None rather than pass it through, which
+    # that model rejects.
+    prune_job_settings: dict = {"iterations": 1}
+    if target_job.input_image is not None:
+        prune_job_settings["input_image"] = target_job.input_image
+    if target_job.flatforge is not None:
+        prune_job_settings["flatforge"] = target_job.flatforge
+    svc.create_job(prune_job_settings, job_id=prune_job_id)
     cancel_event = svc.cancel_event(prune_job_id)
     pause_event = svc.pause_event(prune_job_id)
 
@@ -65,7 +97,22 @@ async def start_pruning(settings: PruningSettings):
             args.prune_fine_tune_height = settings.fine_tune_height
             args.prune_fine_tune_steps = settings.fine_tune_steps
 
-            output_dir = os.path.join(config.checkpoints_path, job_id)
+            # Every prune invocation writes into its *own*, fresh directory
+            # rather than overwriting the job it started from. Pruning used
+            # to always write into checkpoints/<job_id> — the same
+            # directory the original optimization (and any earlier prune
+            # pass on it) had already written to — so a second pruning pass
+            # silently replaced the first pass's output files in place.
+            # Anything that still referenced the *original* job id (a
+            # history step captured right after the first pass, an F5
+            # reload) then showed whatever pruning had most recently done
+            # to that shared directory instead of what was actually true
+            # when it was captured. Each pass gets its own id and directory
+            # instead, and the frontend switches to treating this new id as
+            # the current job once it completes (see appStore.startPruning)
+            # — so a subsequent pass targets *this* directory, never an
+            # earlier one.
+            output_dir = os.path.join(config.checkpoints_path, prune_job_id)
             args.output_folder = output_dir
             os.makedirs(output_dir, exist_ok=True)
 
@@ -99,6 +146,17 @@ async def start_pruning(settings: PruningSettings):
                 "Reducing swaps",
                 "Reducing layers",
                 "Optimising swap positions",
+                # prune()'s own unconditional closing polish — a second
+                # height fine-tune (reported under the same "Fine-tuning
+                # height" name; the `.index()` lookup below finds its
+                # *first* occurrence, which is fine — its progress is
+                # cosmetic this late) followed by spike cleanup, gated on
+                # `args.spike_removal` exactly as Optimizer.prune() gates it.
+                # Without an entry here, "Removing spikes" was an unknown
+                # phase name and fell into the *first* bucket instead of the
+                # last, so the bar visibly jumped backward right as pruning
+                # was finishing.
+                *(["Removing spikes"] if getattr(args, "spike_removal", True) else []),
             ]
             phase_slice = 100.0 / len(phases)
             _last = 0.0
@@ -142,7 +200,13 @@ async def start_pruning(settings: PruningSettings):
             def _prune_progress(_optimizer, _percent, phase=None, loss=None):
                 nonlocal _last
                 phase_name = phase or phases[0]
-                phase_idx = phases.index(phase_name) if phase_name in phases else 0
+                # A phase name not in the list (the optimizer reports one
+                # this webui version doesn't know about yet — e.g. a future
+                # phase added to Optimizer.prune's ordering) is far more
+                # likely to be a *late* one than the very first: pruning's
+                # named phases run in a fixed, append-only order, so bucket
+                # it at the end rather than jumping the bar back to 0%.
+                phase_idx = phases.index(phase_name) if phase_name in phases else len(phases) - 1
                 bucket_start = phase_idx * phase_slice
 
                 if phase_name in DIRECT_PERCENT_PHASES:
@@ -206,11 +270,14 @@ async def start_pruning(settings: PruningSettings):
                     _ok, buf = cv2.imencode('.png', img_bgr)
                     broadcast_preview(
                         base64.b64encode(buf.tobytes()).decode('utf-8'),
-                        # The pruned PLY/preview were regenerated in place for
-                        # the *original* optimization job (`job_id`), not the
-                        # pruning job (`prune_job_id`) — a client matches
-                        # broadcasts against currentJob.job_id, which stays
-                        # the optimization job throughout.
+                        # A client matches broadcasts against
+                        # currentJob.job_id, which is still `job_id` (the id
+                        # this prune action started from) for the whole
+                        # duration of this call — the frontend only switches
+                        # currentJob to the freshly-cloned `prune_job_id`
+                        # once this action fully completes (see
+                        # appStore.startPruning), so mid-run broadcasts must
+                        # keep targeting the id it's showing right now.
                         job_id=job_id,
                         sliders=slider_data["sliders"],
                         min_layer=slider_data["min_layer"],
@@ -247,6 +314,17 @@ async def start_pruning(settings: PruningSettings):
                 prune_job_id, "running", pruning_start_loss=start_loss, loss=start_loss,
             )
 
+            # Spike removal is a printability trade-off (see
+            # Optimizer.post_remove_spikes), not part of the color/swap/layer
+            # search — running it every auto-repeat pass paid its accuracy
+            # cost, and the extra compute, on intermediate results that the
+            # next pass was about to prune further anyway. It only has to run
+            # once the loop has actually settled, so every pass here applies
+            # it only when this is known to be the *last* one: either
+            # auto-repeat is off (a single pass is always "the end"), or the
+            # convergence check just below decided to stop and scheduled one
+            # extra pass purely to finish with spikes cleaned up.
+            final_spike_pass = False
             while True:
                 # Each pass starts its own 0-100 sweep.
                 _last = 0.0
@@ -260,10 +338,12 @@ async def start_pruning(settings: PruningSettings):
                     **_live_counts(), **_pass_fields(),
                 )
 
+                apply_spikes = (not settings.auto_repeat) or final_spike_pass
                 outputs = export_results(
                     pipeline_result,
                     cancel_event=cancel_event,
                     pause_event=pause_event,
+                    apply_spike_removal=apply_spikes,
                 )
                 # Cancelled between phases — the solution as of the last
                 # completed phase was still exported, so the partial result
@@ -281,7 +361,7 @@ async def start_pruning(settings: PruningSettings):
                     loss=loss, **_live_counts(), **_pass_fields(),
                 )
 
-                if not settings.auto_repeat:
+                if not settings.auto_repeat or final_spike_pass:
                     break
                 if cancel_event is not None and cancel_event.is_set():
                     cancelled_midway = True
@@ -291,6 +371,15 @@ async def start_pruning(settings: PruningSettings):
                     best_loss = loss
                 if not repeat:
                     print(f"Auto-repeat pruning: stopping after pass {_pass} — {reason}.")
+                    if getattr(args, "spike_removal", True):
+                        # One more pass, purely to clean up spikes on the
+                        # converged result — everything else is already
+                        # within its limits so the reduction phases exit
+                        # immediately, leaving only the spike pass to do
+                        # real work.
+                        final_spike_pass = True
+                        _pass += 1
+                        continue
                     break
                 _pass += 1
 
@@ -300,6 +389,14 @@ async def start_pruning(settings: PruningSettings):
                     prune_job_id, "cancelled", phase=None, **_live_counts(), **_pass_fields(),
                 )
             else:
+                # This job now has its own real output directory (written
+                # above) and needs its own pipeline result to match — a
+                # follow-up prune, or a slider-derivation lookup, targeting
+                # this id must find the (still-mutating) optimizer, not
+                # come up empty. Aliasing, not re-registering: see
+                # alias_pipeline_result for why this must not go through
+                # set_pipeline_result's "release every older result" path.
+                svc.alias_pipeline_result(prune_job_id, job_id)
                 svc.update_status(
                     prune_job_id, "completed", progress=100.0, phase=None,
                     **_live_counts(), **_pass_fields(),
@@ -307,6 +404,7 @@ async def start_pruning(settings: PruningSettings):
         except Exception as e:
             import traceback
             traceback.print_exc()
+            capture_exception(e, {"phase": "pruning", "job_id": prune_job_id})
             svc.update_status(prune_job_id, "failed", error=friendly_error_message(e))
 
     thread = threading.Thread(target=_run, daemon=True)

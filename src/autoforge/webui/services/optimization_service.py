@@ -9,6 +9,11 @@ from ..helpers.gpu_memory import release_pipeline_result
 
 TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
+# Cap on retained *terminal* job records (mirrors ProjectService.MAX_SNAPSHOTS).
+# Without this, _results/history.json grew by one entry per finished job
+# forever, and _save_history() rewrites the whole file on every completion.
+MAX_HISTORY_JOBS = 200
+
 
 class OptimizationService:
     def __init__(self, checkpoints_dir: str = "checkpoints"):
@@ -27,39 +32,59 @@ class OptimizationService:
 
     def _load_history(self):
         path = self._history_file()
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError, ValueError):
+            return
+        if not isinstance(data, dict):
+            # A non-object top level (e.g. an old-version file that was a
+            # bare list) used to raise AttributeError here and take the
+            # whole API down with it.
+            return
+        for job_id, record in data.items():
+            # Each record is validated independently: one bad record (an
+            # old version's field types, a truncated write) must not
+            # prevent the rest from loading — and must not crash
+            # OptimizationService.__init__, which would 500 every route.
             try:
-                with open(path) as f:
-                    data = json.load(f)
-                for job_id, record in data.items():
-                    record_status = record.get("status") if isinstance(record, dict) else None
-                    if not record_status:
-                        continue
-                    js = JobStatus(**record_status)
-                    self._results[job_id] = js
-                    self._jobs[job_id] = js
-                    record_settings = record.get("settings")
-                    if isinstance(record_settings, dict):
-                        try:
-                            self._settings[job_id] = OptimizationSettings(**record_settings)
-                        except ValueError:
-                            # Recorded before settings were range-checked;
-                            # the job's status is still worth keeping.
-                            pass
-            except (json.JSONDecodeError, IOError, KeyError):
-                pass
+                record_status = record.get("status") if isinstance(record, dict) else None
+                if not isinstance(record_status, dict) or not record_status.get("status"):
+                    continue
+                js = JobStatus(**record_status)
+            except (ValueError, TypeError, KeyError):
+                # ValidationError is a ValueError; a non-dict `status` a
+                # TypeError. Keep whatever else is healthy.
+                continue
+            self._results[job_id] = js
+            self._jobs[job_id] = js
+            record_settings = record.get("settings") if isinstance(record, dict) else None
+            if isinstance(record_settings, dict):
+                try:
+                    self._settings[job_id] = OptimizationSettings(**record_settings)
+                except ValueError:
+                    # Recorded before settings were range-checked;
+                    # the job's status is still worth keeping.
+                    pass
 
     def _save_history(self):
         with self._lock:
             os.makedirs(self._checkpoints_dir, exist_ok=True)
             data = {}
             for job_id, js in self._results.items():
-                record: dict = {"status": js.model_dump(by_alias=True)}
+                # preview_image is a full base64 PNG: it belongs on the live
+                # WS channel, not in a file that every startup re-reads and
+                # that grows by one image per finished job, forever.
+                record: dict = {"status": js.model_dump(by_alias=True, exclude={"preview_image"})}
                 if job_id in self._settings:
                     record["settings"] = self._settings[job_id].model_dump(by_alias=True)
                 data[job_id] = record
-            with open(self._history_file(), "w") as f:
+            tmp_path = self._history_file() + ".tmp"
+            with open(tmp_path, "w") as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp_path, self._history_file())
 
     def set_pipeline_result(self, job_id: str, result: dict):
         """Record a finished run's pipeline state (so Prune can reuse it) and
@@ -89,6 +114,29 @@ class OptimizationService:
         with self._lock:
             return self._pipeline_results.get(job_id)
 
+    def alias_pipeline_result(self, new_job_id: str, existing_job_id: str) -> None:
+        """Make ``new_job_id`` resolve to the same live pipeline result as
+        ``existing_job_id``, without touching anything else.
+
+        Used when a successful prune clones its output into its own job id
+        (see api/pruning.py) — that job needs `get_pipeline_result` to find
+        the same (still-mutating) optimizer for a follow-up prune or a
+        slider-derivation call, but it must not go through
+        `set_pipeline_result`: that method's "release every older result"
+        cleanup would find the *existing* entry under a different key and
+        release it — including calling `release_cuda_graph()` on the
+        optimizer this new entry is about to alias — destroying the very
+        result being registered. Both keys pointing at the same dict is
+        safe: `release_pipeline_result` empties the dict in place, so
+        whichever key is released first (by a later, real
+        `set_pipeline_result` call) leaves the dict falsy and every other
+        alias sees a no-op instead of a double-release.
+        """
+        with self._lock:
+            result = self._pipeline_results.get(existing_job_id)
+            if result is not None:
+                self._pipeline_results[new_job_id] = result
+
     def clear_pipeline_result(self, job_id: str):
         with self._lock:
             result = self._pipeline_results.pop(job_id, None)
@@ -103,6 +151,15 @@ class OptimizationService:
             self._pipeline_results.clear()
         for result in results:
             release_pipeline_result(result)
+        # The auto-preview (api/init.py) optimizer pins its own GPU memory
+        # independent of any optimization job's pipeline results — without
+        # this, starting a run right after uploading an image kept the
+        # preview's optimizer resident on the GPU for the whole training run.
+        # Imported lazily: api.init imports this module at load time, so a
+        # top-level import here would be circular.
+        from ..api.init import release_init_result
+
+        release_init_result()
 
     def pipeline_result_job_ids(self) -> list[str]:
         """Test/diagnostic view of what is still holding device memory."""
@@ -112,11 +169,16 @@ class OptimizationService:
     def create_job(self, settings: dict, job_id: str | None = None) -> JobStatus:
         with self._lock:
             jid = job_id or str(uuid.uuid4())
+            # input_image/flatforge ride along so a later page reload (or
+            # another tab) can tell which result belongs to which image, and
+            # which output shape the job produced — see JobStatus.
             js = JobStatus(
                 job_id=jid,
                 status="pending",
                 started_at=datetime.now(timezone.utc).isoformat(),
                 total_iterations=settings.get("iterations", 6000),
+                input_image=settings.get("input_image") or None,
+                flatforge=bool(settings.get("flatforge")) or None,
             )
             self._jobs[jid] = js
             self._settings[jid] = OptimizationSettings(**settings)
@@ -140,9 +202,39 @@ class OptimizationService:
             setattr(js, k, v)
         if status in ("completed", "failed", "cancelled"):
             js.completed_at = datetime.now(timezone.utc).isoformat()
-            self._results[job_id] = js
-            self._save_history()
+            # A pruning job (`prune-*`) that only reached "failed"/
+            # "cancelled" never got its own output directory (api/pruning.py
+            # only clones one on a *successful* pass) — recording it would
+            # add a history row with no real result behind it. A
+            # "completed" one is different now: it was cloned into its own
+            # checkpoints/<prune_job_id> directory with a real pipeline
+            # result aliased onto it (see alias_pipeline_result), making it
+            # exactly as real a result as an optimization job — leaving it
+            # out of history/`get_latest_job` was what let a history step
+            # (or an F5 reload) that pointed at a *pruned* result fall back
+            # to the job's original, unpruned files instead.
+            if not job_id.startswith("prune-") or status == "completed":
+                self._results[job_id] = js
+                self._prune_history_locked()
+                self._save_history()
         return js
+
+    def _prune_history_locked(self) -> None:
+        """Caller must hold self._lock. Evict the oldest terminal job
+        records once the retained count exceeds MAX_HISTORY_JOBS, dropping
+        their bookkeeping (settings/cancel/pause events) too so a
+        long-running server doesn't accumulate these forever."""
+        if len(self._results) <= MAX_HISTORY_JOBS:
+            return
+        oldest = sorted(self._results.values(), key=lambda j: j.started_at or "")
+        overflow = len(self._results) - MAX_HISTORY_JOBS
+        for js in oldest[:overflow]:
+            jid = js.job_id
+            self._results.pop(jid, None)
+            self._jobs.pop(jid, None)
+            self._settings.pop(jid, None)
+            self._cancel_events.pop(jid, None)
+            self._pause_events.pop(jid, None)
 
     def update_status(self, job_id: str, status: str, **kwargs) -> JobStatus | None:
         with self._lock:
@@ -193,14 +285,20 @@ class OptimizationService:
         its 3D result back), since `_jobs` (unlike `_results`) also holds
         jobs that haven't reached a terminal state yet.
 
-        Excludes pruning jobs (`prune-*`): those are a secondary tracking
-        entry for progress only — pruning writes its output into the
-        *original* optimization job's directory, not its own — so treating
-        one as "the current job" would point the UI at a job_id with no
-        real output directory.
+        Excludes *unfinished* pruning jobs (`prune-*`): those are a
+        secondary tracking entry for progress only, with no output
+        directory of their own until the prune actually succeeds. A
+        *completed* prune job is different — it was cloned into its own
+        checkpoints/<prune_job_id> directory (see api/pruning.py) and is a
+        real, independent result, so it is included here: without this, a
+        page reload after pruning fell back to the job's original,
+        unpruned files instead of the pruned ones actually on screen.
         """
         with self._lock:
-            candidates = [j for j in self._jobs.values() if not j.job_id.startswith("prune-")]
+            candidates = [
+                j for j in self._jobs.values()
+                if not j.job_id.startswith("prune-") or j.status == "completed"
+            ]
             if not candidates:
                 return None
             return max(candidates, key=lambda j: j.started_at or "")
@@ -209,6 +307,20 @@ class OptimizationService:
         with self._lock:
             for j in self._jobs.values():
                 if not j.job_id.startswith("prune-") and j.status in ("pending", "running", "paused"):
+                    return j
+            return None
+
+    def get_any_active_job(self) -> JobStatus | None:
+        """Any non-terminal job, pruning included.
+
+        Pruning and optimization both drive the same GPU (and pruning drives
+        the *same* FilamentOptimizer a later optimization would clear out),
+        so one of either kind must gate the other. The optimization-only
+        variant above deliberately ignores prune jobs for the "which result
+        am I looking at" questions; this one is for the GPU mutex."""
+        with self._lock:
+            for j in self._jobs.values():
+                if j.status in ("pending", "running", "paused"):
                     return j
             return None
 

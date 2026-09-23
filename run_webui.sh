@@ -8,6 +8,14 @@ HOST="${WEBUI_HOST:-0.0.0.0}"
 PORT="${WEBUI_PORT:-8000}"
 BUILD_FRONTEND="${BUILD_FRONTEND:-auto}"
 
+# --no-telemetry disables PostHog telemetry for this run (same effect as
+# AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false). Any other argument is ignored.
+for arg in "$@"; do
+    if [ "$arg" = "--no-telemetry" ]; then
+        export AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false
+    fi
+done
+
 # ---------------------------------------------------------------------------
 # Build the frontend, but only when it's actually out of date. BUILD_FRONTEND
 # used to default to "true", which ran a full `npm install && npm run build`
@@ -58,11 +66,34 @@ fi
 # Start the FastAPI server
 # ---------------------------------------------------------------------------
 echo "[webui] Starting server on http://${HOST}:${PORT}"
+if [ "${AUTOFORGE_WEBUI_TELEMETRY_ENABLED:-true}" != "false" ]; then
+    echo "[webui] Anonymous usage telemetry is on (PostHog). Disable with --no-telemetry."
+fi
 
 if [ "${NO_BROWSER:-false}" != "true" ]; then
     BROWSER_URL="http://localhost:${PORT}"
     (
-        sleep 2
+        # A flat `sleep 2` guessed at how long uvicorn + the app's own
+        # startup (loading the filament library, etc.) would take — on a
+        # slower machine, or one already loaded, the browser opened before
+        # the server was accepting connections and showed a bare
+        # "connection refused"/"problem loading page" instead of the app.
+        # Poll the health endpoint instead and open only once it actually
+        # answers, with a generous timeout as a fallback if the health
+        # check itself is unreachable (e.g. curl/wget missing).
+        HEALTH_URL="http://127.0.0.1:${PORT}/api/system/health"
+        ready=false
+        for _ in $(seq 1 150); do
+            if command -v curl &>/dev/null; then
+                curl -fsS -o /dev/null "$HEALTH_URL" && { ready=true; break; }
+            elif command -v wget &>/dev/null; then
+                wget -q -O /dev/null "$HEALTH_URL" && { ready=true; break; }
+            else
+                break
+            fi
+            sleep 0.2
+        done
+        [ "$ready" = false ] && sleep 2
         if command -v xdg-open &>/dev/null; then
             xdg-open "$BROWSER_URL" &>/dev/null
         elif command -v open &>/dev/null; then

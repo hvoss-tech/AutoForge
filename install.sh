@@ -70,3 +70,7 @@ echo
 echo "=== Install complete ==="
 echo "Start AutoForge with:   ./run_webui.sh"
 echo "Check for updates with: ./update.sh"
+echo
+echo "Note: the web UI sends anonymous usage telemetry (PostHog) by default."
+echo "  Disable it with ./run_webui.sh --no-telemetry, or permanently via"
+echo "  AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false. See README.md for details."

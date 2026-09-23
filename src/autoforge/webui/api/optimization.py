@@ -10,6 +10,8 @@ from ..services.project_service import get_project_service
 from ..services.filament_service import get_filament_service
 from ..helpers.pipeline_runner import run_pipeline as _run_pipeline, friendly_error_message
 from ..helpers.gpu_memory import empty_device_cache, release_pipeline_result
+from ..helpers.telemetry import capture_exception
+from ..services.image_service import get_image_service
 from ..config import config
 from .ws import broadcast_preview
 
@@ -74,11 +76,17 @@ async def start_optimization(settings: OptimizationSettings):
         for f in active
     ]
 
-    # One optimization at a time: a second run (e.g. "Start Optimization" in
-    # the Settings dialog while the first was paused) competed for the same
-    # GPU memory and left two jobs broadcasting into the same preview.
-    busy = svc.get_active_optimization_job()
+    # One GPU job at a time: a second run (e.g. "Start Optimization" in the
+    # Settings dialog while the first was paused) competed for the same GPU
+    # memory and left two jobs broadcasting into the same preview. Pruning
+    # counts too — it runs the same optimizer the new run would clear out.
+    busy = svc.get_any_active_job()
     if busy is not None:
+        if busy.job_id.startswith("prune-"):
+            raise HTTPException(
+                409,
+                f"Pruning is {busy.status}. Let it finish or cancel it before starting a new optimization.",
+            )
         raise HTTPException(
             409,
             f"An optimization is already {busy.status}. Resume or cancel it before starting a new one.",
@@ -94,6 +102,14 @@ async def start_optimization(settings: OptimizationSettings):
                               total_iterations=settings.iterations,
                               phase="Preparing")
 
+            # A run that has already been cancelled must not touch any other
+            # job's retained result: releasing them here was what made a
+            # cancelled (or OOM-during-init) run leave the previous, still
+            # completed, job un-prunable and un-re-colorable.
+            cancel_event = svc.cancel_event(job.job_id)
+            if cancel_event is not None and cancel_event.is_set():
+                return
+
             # Hand back every earlier run's device memory *before* this one
             # allocates. Each retained pipeline result pins a whole optimizer
             # (parameters, Adam state, target images) on the GPU, so running
@@ -106,16 +122,17 @@ async def start_optimization(settings: OptimizationSettings):
             output_dir = os.path.join(config.checkpoints_path, job.job_id)
             os.makedirs(output_dir, exist_ok=True)
 
-            # Resolve path: try as-is, then under uploads directory
-            if not os.path.exists(input_image_path):
-                abs_path = os.path.join(config.uploads_path, input_image_path)
-                if os.path.exists(abs_path):
-                    input_image_path = abs_path
-                else:
-                    err = f"Input image not found: {input_image_path} (tried {abs_path} too)"
-                    logger.error(err)
-                    svc.update_status(job.job_id, "failed", error=err)
-                    return
+            # Resolve to a real path under the uploads directory only — an
+            # arbitrary existing server path (e.g. "../../etc/passwd" or an
+            # absolute path outside uploads/) used to be accepted verbatim
+            # whenever os.path.exists() happened to be true for it.
+            resolved_path = get_image_service().get_path(input_image_path)
+            if resolved_path is None:
+                err = f"Input image not found: {input_image_path}"
+                logger.error(err)
+                svc.update_status(job.job_id, "failed", error=err)
+                return
+            input_image_path = resolved_path
 
             logger.info("Optimization starting: image=%s, filaments=%d, iters=%d",
                         input_image_path, len(filament_dicts), settings.iterations)
@@ -213,7 +230,15 @@ async def start_optimization(settings: OptimizationSettings):
                 export_results(result)
                 logger.info("Output files written to %s", output_dir)
             except Exception as exc:
-                logger.warning("Could not export all output files: %s", exc)
+                # A run whose export failed (e.g. OOM building the full-res
+                # composite, or a disk write error) has no STL/PLY/project
+                # files on disk, so downloads would 404. It used to still be
+                # marked "completed" here — a green run with a broken
+                # "Download" button and no error visible anywhere in the UI.
+                logger.error("Export failed for job %s: %s", job.job_id, exc)
+                capture_exception(exc, {"phase": "export", "job_id": job.job_id})
+                svc.update_status(job.job_id, "failed", error=friendly_error_message(exc))
+                return
 
             svc.update_status(job.job_id, "completed",
                               phase=None,
@@ -225,6 +250,7 @@ async def start_optimization(settings: OptimizationSettings):
             import traceback
             traceback.print_exc()
             logger.error("Optimization failed: %s", e)
+            capture_exception(e, {"phase": "optimization", "job_id": job.job_id})
             svc.update_status(job.job_id, "failed", error=friendly_error_message(e))
         finally:
             # Training and export both leave large freed blocks in the
@@ -272,13 +298,24 @@ async def cancel_optimization(job_id: str):
     return {"status": svc.get_job(job_id).status}
 
 
+# The preview image is a full base64 PNG that is only meaningful on the live
+# /ws/preview channel. Excluding it from every status payload keeps the
+# 0.5 s WS polls and 1 s status polls small, and stops it leaking into
+# history.json (which it grew without bound when it was serialized there).
+_STATUS_EXCLUDES = {"preview_image"}
+
+
+def _job_payload(job) -> dict:
+    return job.model_dump(exclude=_STATUS_EXCLUDES)
+
+
 @router.get("/status/{job_id}")
 async def get_status(job_id: str):
     svc = get_optimization_service()
     job = svc.get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    return job.model_dump()
+    return _job_payload(job)
 
 
 @router.get("/latest")
@@ -287,14 +324,14 @@ async def get_latest_job():
     job = svc.get_latest_job()
     if not job:
         raise HTTPException(404, "No jobs yet")
-    return job.model_dump()
+    return _job_payload(job)
 
 
 @router.get("/history")
 async def get_history():
     svc = get_optimization_service()
     results = svc.get_history()
-    return [r.model_dump() for r in results]
+    return [_job_payload(r) for r in results]
 
 
 @router.get("/result/{job_id}")
@@ -303,4 +340,4 @@ async def get_result(job_id: str):
     result = svc.get_result(job_id)
     if not result:
         raise HTTPException(404, "Result not found")
-    return result.model_dump()
+    return _job_payload(result)

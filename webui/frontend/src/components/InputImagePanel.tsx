@@ -111,6 +111,14 @@ export const InputImagePanel: React.FC = () => {
     [flash],
   )
 
+  // Two uploads can be in flight at once (a fast double-drop, or a drop
+  // right after picking a file) with no guarantee the network resolves them
+  // in the order they started — without a sequence guard, an older upload
+  // finishing last would silently win and show its (stale) image under
+  // the newer request. Only the most recently *started* upload's result is
+  // ever applied; every other one is dropped, success or failure alike.
+  const uploadSeqRef = useRef(0)
+
   const handleFile = useCallback(async (file: File) => {
     if (!file.type.startsWith('image/')) {
       // Used to be ignored without any feedback.
@@ -118,6 +126,7 @@ export const InputImagePanel: React.FC = () => {
       return
     }
     setUploadError(null)
+    const seq = ++uploadSeqRef.current
 
     const formData = new FormData()
     formData.append('file', file)
@@ -129,6 +138,7 @@ export const InputImagePanel: React.FC = () => {
       }
       const data = await response.json()
       if (!data.filename) throw new Error('Upload failed: server did not return a filename')
+      if (uploadSeqRef.current !== seq) return // superseded by a later upload
 
       // One action, because everything derived from the old image has to go
       // at the same moment the new one arrives — the previous result, its
@@ -138,6 +148,7 @@ export const InputImagePanel: React.FC = () => {
       await applyUploadedImage(data.filename, URL.createObjectURL(file))
       // Init is triggered reactively by useAutoPreviewInit.
     } catch (e) {
+      if (uploadSeqRef.current !== seq) return // superseded; not worth surfacing
       // No local blob preview on failure: Run must not look ready for an
       // image the server never received.
       console.error('Failed to upload image:', e)

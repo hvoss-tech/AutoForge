@@ -16,17 +16,29 @@ _main_loop: asyncio.AbstractEventLoop | None = None
 def _send_to_all(msg: str):
     """Safely send a message to all connected preview clients (thread-safe)."""
     global _main_loop
-    to_remove: list[WebSocket] = []
     # Iterate a copy: this runs on the optimizer's worker thread while the
     # event loop adds/discards connections, and iterating the live set then
     # raises "Set changed size during iteration", dropping the update.
     for ws in list(_preview_connections):
         try:
             if _main_loop and not _main_loop.is_closed():
-                asyncio.run_coroutine_threadsafe(ws.send_text(msg), _main_loop)
+                future = asyncio.run_coroutine_threadsafe(ws.send_text(msg), _main_loop)
+                # run_coroutine_threadsafe only schedules the coroutine — it
+                # returns immediately, so the try/except around it can never
+                # observe a failed send() (that happens later, on the event
+                # loop). Without this callback, a client that vanished
+                # without a clean close (network drop, tab killed) was never
+                # pruned from _preview_connections by this path: every future
+                # broadcast kept scheduling a doomed send to it forever.
+                future.add_done_callback(lambda f, ws=ws: _drop_on_failure(f, ws))
         except Exception:
-            to_remove.append(ws)
-    for ws in to_remove:
+            _preview_connections.discard(ws)
+
+
+def _drop_on_failure(future: "asyncio.Future", ws: WebSocket) -> None:
+    """Runs on the event-loop thread (add_done_callback's contract), so
+    mutating the set directly here is safe."""
+    if future.cancelled() or future.exception() is not None:
         _preview_connections.discard(ws)
 
 
@@ -72,7 +84,11 @@ async def ws_optimize(websocket: WebSocket, job_id: str):
             if not job:
                 await websocket.send_json({"job_id": job_id, "status": "not_found", "error": "Job not found"})
                 break
-            await websocket.send_json(job.model_dump())
+            # The base64 preview PNG rides only on /ws/preview, not here:
+            # this socket polls every 0.5 s for every connected client.
+            payload = job.model_dump()
+            payload.pop("preview_image", None)
+            await websocket.send_json(payload)
             if job.status in ("completed", "failed", "cancelled"):
                 sent_terminal = True
                 break

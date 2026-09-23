@@ -33,6 +33,18 @@ dependencies = [
   "aiofiles>=24.1.0",
   "websockets>=15.0",
   "pydantic-settings>=2.0.0",
+  "posthog>=3.7.0",
+]
+
+[project.optional-dependencies]
+# httpx isn't a runtime dependency of the app itself, but fastapi's
+# TestClient needs it installed, and tests/webui/test_review_2026_09_23.py
+# uses httpx.AsyncClient/ASGITransport directly to test concurrent requests.
+test = [
+  "pytest>=7.4",
+  "pytest-cov",
+  "hypothesis",
+  "httpx>=0.27",
 ]
 
 [tool.setuptools]

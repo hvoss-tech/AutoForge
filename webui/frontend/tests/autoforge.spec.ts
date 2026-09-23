@@ -1428,7 +1428,14 @@ test.describe('Pruning Flow', () => {
     await page.goto('/')
     await page.locator('[data-testid="top-pruning-btn"]').click()
     await expect(page.locator('[data-testid="pruning-modal"]')).toBeVisible()
+    const pruningStarted = page.waitForResponse('**/api/pruning/start')
     await page.locator('[data-testid="pruning-start-btn"]').click()
+    // /api/optimize/latest deliberately excludes prune-* jobs (a page reload
+    // must not land on one as "the current job" — pruning writes into the
+    // *original* job's directory, not its own), so the only reliable way to
+    // learn this job's id for the wait-for-completion below is straight off
+    // the response that started it.
+    const pruneJobId = (await (await pruningStarted).json()).job_id as string
 
     // The dialog switches to a progress view and can be closed while pruning
     // keeps running; progress also surfaces in the top bar (either running or
@@ -1449,6 +1456,18 @@ test.describe('Pruning Flow', () => {
     const sliders = page.locator('[data-testid="color-sliders-panel"]')
     await expect(sliders).toBeVisible()
     expect(await page.locator('[data-testid^="slider-column-"]').count()).toBeGreaterThan(0)
+
+    // Let the prune job actually finish before the suite moves on. Pruning
+    // and starting a new optimization now share a hard GPU mutex (one
+    // non-terminal job of either kind blocks the other — see the
+    // 2026-09-23 "pruning and optimization can run simultaneously" fix), so
+    // a prune left running here made the very next test's
+    // /api/optimize/start 409 instead of starting.
+    for (let i = 0; i < 120; i++) {
+      const body = await (await request.get(`/api/optimize/status/${pruneJobId}`)).json()
+      if (['completed', 'failed', 'cancelled'].includes(body.status)) break
+      await page.waitForTimeout(500)
+    }
   })
 
   test('pruning can be paused (progress freezes), resumed, and cancelled from the UI', async ({ page, request }) => {

@@ -100,6 +100,14 @@ class JobStatus(CamelCaseModel):
     completed_at: Optional[str] = None
     preview_image: Optional[str] = None
     phase: Optional[str] = None
+    # The input image this job ran on (and whether it produced the
+    # flatforge-style per-material STLs instead of a single final_model.stl).
+    # Both are read back on a page reload, where "the latest job" has no
+    # other way of being matched against the image currently on screen —
+    # without them a completed job from a different image was restored (and
+    # even exportable) right under another image.
+    input_image: Optional[str] = None
+    flatforge: Optional[bool] = None
     # Live counts of the solution as it stands, reported while pruning runs.
     # Pruning's whole purpose is to bring these down, so the dialog shows them
     # changing as it happens rather than only once the job is finished.

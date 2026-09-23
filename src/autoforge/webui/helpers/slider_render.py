@@ -155,6 +155,48 @@ def composite_from_slider_stack(
     return comp * 255.0
 
 
+def _alpha_matching_shape(pipeline_result: dict[str, Any], target_hw: tuple[int, int]) -> Optional[np.ndarray]:
+    """Return an (H,W[,1]) uint8/float alpha mask matching ``target_hw``.
+
+    ``disc_height_image`` is at *processing* resolution for a not-yet-trained
+    auto-preview result (``build_init_preview`` seeds it from
+    ``get_current_parameters()`` without ever calling ``export_results()``,
+    which is what restores the full-resolution height map for a real
+    optimization job). ``pipeline_result["alpha"]`` is always full/output
+    resolution though, so blindly using it against a processing-resolution
+    height map produced an alpha mask larger than the height grid --
+    ``generate_colored_preview_mesh`` then emitted face indices past the end
+    of its vertex array (IndexError, or a silently mangled mesh when the
+    sizes happened to be close enough not to crash). Prefer whichever stored
+    alpha already matches, falling back to a nearest-neighbor resize of the
+    full-res one so a mismatch can never reach the mesh builder.
+    """
+
+    def _to_np(a: Any) -> Optional[np.ndarray]:
+        if a is None:
+            return None
+        return a.detach().cpu().numpy() if torch.is_tensor(a) else np.asarray(a)
+
+    alpha_proc_np = _to_np(pipeline_result.get("alpha_proc"))
+    if alpha_proc_np is not None and tuple(alpha_proc_np.shape[:2]) == target_hw:
+        return alpha_proc_np
+
+    alpha_np = _to_np(pipeline_result.get("alpha"))
+    if alpha_np is None:
+        return None
+    if tuple(alpha_np.shape[:2]) == target_hw:
+        return alpha_np
+
+    resized = cv2.resize(
+        alpha_np.astype(np.float32),
+        (target_hw[1], target_hw[0]),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    if resized.ndim == 2:
+        resized = resized[..., None]
+    return resized
+
+
 def render_with_sliders(
     pipeline_result: dict[str, Any],
     sliders: list[dict],
@@ -171,7 +213,6 @@ def render_with_sliders(
     """
     optimizer = pipeline_result["optimizer"]
     args = pipeline_result["args"]
-    alpha = pipeline_result.get("alpha")
     background: torch.Tensor = pipeline_result["background"]
 
     disc_global, disc_height_image = optimizer.get_discretized_solution(best=True)
@@ -225,12 +266,13 @@ def render_with_sliders(
 
     height_map_mm = disc_height_image.detach().cpu().numpy().astype(np.float32) * h
     color_image_np = np.ascontiguousarray(comp_np)
+    alpha_for_mesh = _alpha_matching_shape(pipeline_result, height_map_mm.shape[:2])
     colored_mesh = generate_colored_preview_mesh(
         height_map=height_map_mm,
         color_image=color_image_np,
         background_height=float(args.background_height),
         maximum_x_y_size=float(args.stl_output_size),
-        alpha_mask=alpha,
+        alpha_mask=alpha_for_mesh,
     )
     ply_path = os.path.join(output_dir, ply_name)
     tmp_ply = f"{ply_path}.{os.getpid()}.{threading.get_ident()}.tmp.ply"

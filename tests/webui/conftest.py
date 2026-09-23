@@ -44,8 +44,10 @@ def _isolated_webui_storage():
 
 @pytest.fixture(autouse=True)
 def _reset_webui_singletons():
+    from autoforge.webui.api import init as init_api
     from autoforge.webui.api import project as project_api
     from autoforge.webui.api import settings as settings_api
+    from autoforge.webui.config import config
     from autoforge.webui.services import filament_service, optimization_service, project_service
 
     def _reset():
@@ -54,6 +56,17 @@ def _reset_webui_singletons():
         project_service.reset_project_service()
         settings_api._settings = settings_api.OptimizationSettings()
         project_api._state = project_api.ProjectState()
+        init_api._state = {"status": "idle", "preview_image": None, "error": None, "range": None}
+        init_api._pipeline_result = None
+        init_api._in_flight = None
+        init_api._generation = 0
+        # The singletons above are reset, but every service also persists to
+        # disk under the shared session tmp dir — leaving files there (e.g.
+        # filament_library/active.json) leaks state between tests that
+        # never re-imported/re-registered anything themselves, the way a
+        # bare singleton reset does not surface.
+        for d in (config.library_dir, config.checkpoints_dir, config.uploads_dir):
+            shutil.rmtree(d, ignore_errors=True)
 
     _reset()
     yield

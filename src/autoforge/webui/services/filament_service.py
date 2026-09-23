@@ -95,6 +95,11 @@ class FilamentService:
                 return None
             filament.uuid = uuid_
             self._filaments[uuid_] = filament
+            # Active entries are independent copies, so a library edit
+            # (e.g. a new TD) otherwise keeps silently driving runs and
+            # renders with the old value until the user re-picks it.
+            if uuid_ in self._active:
+                self._active[uuid_] = filament
             self._save_library()
             return filament
 
@@ -103,6 +108,9 @@ class FilamentService:
             if uuid_ not in self._filaments:
                 return False
             del self._filaments[uuid_]
+            # Deleting from the library must retire it everywhere: an
+            # active copy left behind keeps being used by the next run.
+            self._active.pop(uuid_, None)
             self._save_library()
             return True
 
@@ -114,11 +122,11 @@ class FilamentService:
                     types.add(f.filament_type)
             return sorted(types)
 
-    def get_brands(self) -> list[str]:
+    def get_brands(self, filament_type: Optional[str] = None) -> list[str]:
         with self._lock:
             brands = set()
             for f in self._filaments.values():
-                if f.brand:
+                if f.brand and (not filament_type or f.filament_type == filament_type):
                     brands.add(f.brand)
             return sorted(brands)
 
@@ -195,6 +203,13 @@ class FilamentService:
                     f.uuid = str(uuid.uuid4())
                 self._filaments[f.uuid] = f
                 imported.append(f)
+            # Same reason delete()/update() prune _active: an active entry
+            # whose uuid no longer exists in the library is a ghost that
+            # get_active() keeps returning — a "replace library" import
+            # (fresh uuids for anything the source didn't carry one for)
+            # otherwise orphaned every previously-active filament, and a run
+            # right after would silently use their stale colors/TD.
+            self._active = {u: f for u, f in self._active.items() if u in self._filaments}
             self._save_library()
             return imported
 

@@ -73,6 +73,10 @@ export const EditFilamentModal: React.FC = () => {
   )
 
   const close = () => {
+    // A still-pending debounced save (closed within the 400ms window) must
+    // be flushed, not discarded — the effect's own cleanup would otherwise
+    // just clearTimeout it away, dropping whatever edit was in flight.
+    flushPendingSave()
     setEditFilamentModalOpen(false)
     setEditingFilament(null)
   }
@@ -86,6 +90,14 @@ export const EditFilamentModal: React.FC = () => {
    * extra requests) every time a debounced keystroke lands. The saved record
    * is patched into the list instead, which is all the list needs. */
   const persist = React.useCallback(async ({ reloadLibrary = true } = {}): Promise<boolean> => {
+    // Any call to persist() (debounce firing, a manual flush, or Done)
+    // makes the current auto-save timer moot — clearing it here (rather
+    // than only in the effect's own cleanup) is what lets a manual flush
+    // and the debounce race safely without double-POSTing.
+    if (pendingSaveTimerRef.current) {
+      clearTimeout(pendingSaveTimerRef.current)
+      pendingSaveTimerRef.current = null
+    }
     if (!editingFilament || !brand || !name) return false
     if (isAddingCustomType && !effectiveType) return false
     setError(null)
@@ -131,7 +143,16 @@ export const EditFilamentModal: React.FC = () => {
       if (saved.td !== editingFilament.td) {
         const { colorSliders, setSliders } = useAppStore.getState()
         if (colorSliders.some((s) => s.filament_uuid === saved.uuid)) {
-          setSliders(colorSliders.map((s) => (s.filament_uuid === saved.uuid ? { ...s, td: saved.td } : s)))
+          // Not a hand edit of the sliders themselves — a library TD change
+          // following through to the sliders that reference it. Marking it
+          // hand-edited spuriously triggered the "Replace your color
+          // layers?" confirmation on the next Run, for a change the user
+          // never made to the layers directly.
+          setSliders(
+            colorSliders.map((s) => (s.filament_uuid === saved.uuid ? { ...s, td: saved.td } : s)),
+            `Updated TD to ${saved.td}`,
+            { handEdited: false },
+          )
         }
       }
       if (reloadLibrary) {
@@ -154,14 +175,47 @@ export const EditFilamentModal: React.FC = () => {
   // Auto save: every edit lands in the library shortly after it's made, so
   // closing the dialog (or the tab) can't quietly discard it. Debounced,
   // because dragging an R/G/B slider would otherwise fire a request per pixel.
+  //
+  // The timer must re-arm on every field change, not just on the dirty
+  // false->true transition: `dirty` is a boolean that stays `true` across a
+  // whole drag sequence, so keying the effect on `dirty` alone armed one
+  // 400ms timer at the *first* change and never rescheduled it — a drag
+  // that ran longer than 400ms saved whatever value was live at that one
+  // moment and then never saved again, so the final value only ever reached
+  // the library via the "Done" button.
   const persistRef = React.useRef(persist)
   persistRef.current = persist
+  const pendingSaveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   React.useEffect(() => {
     if (!autoSaveLibrary || !editFilamentModalOpen || !editingFilament) return
     if (!dirty) return
-    const timer = setTimeout(() => { persistRef.current({ reloadLibrary: false }) }, 400)
-    return () => clearTimeout(timer)
-  }, [autoSaveLibrary, editFilamentModalOpen, editingFilament, dirty])
+    const timer = setTimeout(() => {
+      pendingSaveTimerRef.current = null
+      persistRef.current({ reloadLibrary: false })
+    }, 400)
+    pendingSaveTimerRef.current = timer
+    return () => {
+      clearTimeout(timer)
+      if (pendingSaveTimerRef.current === timer) pendingSaveTimerRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoSaveLibrary, editFilamentModalOpen, editingFilament, dirty, brand, name, filamentType, customType, td, owned, colorR, colorG, colorB])
+
+  // Flushes (rather than discards) a still-pending debounced save — used
+  // both when the dialog is closed without waiting out the debounce and
+  // when the tab itself is closing (the `pagehide` listener below).
+  const flushPendingSave = React.useCallback(() => {
+    if (!pendingSaveTimerRef.current) return
+    clearTimeout(pendingSaveTimerRef.current)
+    pendingSaveTimerRef.current = null
+    persistRef.current({ reloadLibrary: false })
+  }, [])
+
+  React.useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.addEventListener('pagehide', flushPendingSave)
+    return () => window.removeEventListener('pagehide', flushPendingSave)
+  }, [flushPendingSave])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

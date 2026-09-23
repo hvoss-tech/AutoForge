@@ -21,8 +21,12 @@ async def get_project_state():
         try:
             with open(path) as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                # A non-object top level (e.g. an old-format file that was a
+                # bare list) — nothing to restore from.
+                raise TypeError("project_state.json is not an object")
             _state = ProjectState(**data)
-        except (json.JSONDecodeError, IOError, ValueError):
+        except (json.JSONDecodeError, IOError, ValueError, TypeError):
             # ValueError: pydantic validation of an outdated/invalid file.
             pass
     return _state.model_dump()

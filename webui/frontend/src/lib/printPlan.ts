@@ -81,7 +81,11 @@ export function buildPrintPlan(sliders: ColorSliderConfig[], filaments: Filament
   const bands = getPlanBands(sliders, filaments, settings)
   const lh = settings.layer_height || 0.04
   const base = settings.background_height || 0
-  const key = (b: PlanBand) => b.filamentUuid || `unassigned-${b.storeIndex}`
+  // A single constant key for every unassigned band, not one keyed by
+  // storeIndex — adjacent unassigned bands are visually and physically the
+  // same (no filament, no swap needed between them), but distinct per-band
+  // keys made them always compare unequal, inflating the swap count.
+  const key = (b: PlanBand) => b.filamentUuid || 'unassigned'
 
   // Adjacent bands with the same filament are one continuous color: no swap.
   const swapsList: PlanSwap[] = []

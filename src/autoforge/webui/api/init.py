@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse
 from ..config import config
 from ..models import OptimizationSettings
 from ..services.filament_service import get_filament_service
+from ..services.optimization_service import get_optimization_service
 from ..helpers.pipeline_runner import build_init_preview, friendly_error_message
 from ..helpers.colored_mesh import generate_colored_preview_mesh
 from ..helpers.gpu_memory import release_pipeline_result
@@ -32,6 +33,15 @@ router = APIRouter()
 _state: dict[str, Any] = {"status": "idle", "preview_image": None, "error": None, "range": None}
 _pipeline_result: Optional[dict[str, Any]] = None
 _lock = threading.RLock()
+
+# The build currently in flight (or None). ``generation`` distinguishes it
+# from every build that started later: when a reset lands mid-build, the
+# build's completion handler must NOT publish its result (it belongs to the
+# image that was just replaced) — and the next /api/init/run must not start
+# a *second* build on top of it, which is what OOM'd when switching between
+# images on a nearly-full GPU.
+_in_flight: Optional[dict[str, Any]] = None
+_generation: int = 0
 
 
 def _init_dir() -> str:
@@ -51,6 +61,26 @@ def get_init_pipeline_result() -> Optional[dict[str, Any]]:
     the auto-preview state when there's no completed optimization job yet."""
     with _lock:
         return _pipeline_result
+
+
+def release_init_result() -> None:
+    """Release the auto-preview's retained optimizer (its GPU memory)
+    without disturbing anything else about its displayed state.
+
+    Called when a real optimization run is about to start: the auto-preview
+    optimizer built by /api/init/run otherwise stays resident on the GPU for
+    the whole training run that follows, on top of whatever
+    clear_all_pipeline_results() already released."""
+    global _pipeline_result
+    with _lock:
+        if _state["status"] == "initializing":
+            # A build is in flight; it isn't safe to rip its result out from
+            # under it here, and run_init's own GPU-mutex check (above)
+            # already stops a new optimization/pruning job from starting
+            # while a build is running.
+            return
+        result, _pipeline_result = _pipeline_result, None
+    release_pipeline_result(result)
 
 
 def _run_init_sync(input_image_path: str, filament_dicts: list[dict], settings_dict: dict) -> dict:
@@ -103,13 +133,29 @@ def _run_init_sync(input_image_path: str, filament_dicts: list[dict], settings_d
 
 @router.post("/run")
 async def run_init(settings: OptimizationSettings):
-    global _state, _pipeline_result
+    global _state, _pipeline_result, _in_flight, _generation
 
     with _lock:
         if _state["status"] == "initializing":
+            # A build is in flight. The reset that replaced it (if any)
+            # keeps the status "initializing" until that build's worker
+            # finishes, so a new build cannot start a second, concurrent
+            # GPU job on top of it.
             raise HTTPException(400, "Already initializing")
+        # The auto-preview build and a real optimization/pruning run all
+        # drive the same GPU (optimization/pruning already gate each other
+        # via the same check) — without this, uploading a new image while a
+        # run is in progress started a second, concurrent GPU job.
+        busy = get_optimization_service().get_any_active_job()
+        if busy is not None:
+            raise HTTPException(
+                409,
+                f"An optimization is {busy.status}. Let it finish or cancel it before starting a new preview.",
+            )
         _state = {"status": "initializing", "preview_image": None, "error": None}
         superseded, _pipeline_result = _pipeline_result, None
+        my_gen = _generation
+        _in_flight = {"event": threading.Event(), "generation": my_gen}
 
     # The previous image's init optimizer is dead the moment this one starts
     # — and releasing it *before* building the new one halves the peak, which
@@ -120,13 +166,19 @@ async def run_init(settings: OptimizationSettings):
     active = filament_svc.get_active()
     if not active:
         with _lock:
-            _state = {"status": "idle", "preview_image": None, "error": None}
+            if _in_flight and _in_flight.get("generation") == my_gen:
+                _in_flight = None
+            if _generation == my_gen:
+                _state = {"status": "idle", "preview_image": None, "error": None}
         raise HTTPException(400, "Add at least one active filament first.")
 
     input_image_path = settings.input_image or ""
     if not input_image_path:
         with _lock:
-            _state = {"status": "idle", "preview_image": None, "error": None}
+            if _in_flight and _in_flight.get("generation") == my_gen:
+                _in_flight = None
+            if _generation == my_gen:
+                _state = {"status": "idle", "preview_image": None, "error": None}
         raise HTTPException(400, "Upload an input image first.")
 
     if not os.path.exists(input_image_path):
@@ -135,7 +187,10 @@ async def run_init(settings: OptimizationSettings):
             input_image_path = abs_path
         else:
             with _lock:
-                _state = {"status": "idle", "preview_image": None, "error": None}
+                if _in_flight and _in_flight.get("generation") == my_gen:
+                    _in_flight = None
+                if _generation == my_gen:
+                    _state = {"status": "idle", "preview_image": None, "error": None}
             raise HTTPException(404, f"Input image not found: {settings.input_image}")
 
     filament_dicts = [
@@ -146,14 +201,40 @@ async def run_init(settings: OptimizationSettings):
     ]
     settings_dict = settings.model_dump()
 
+    box: dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            box["built"] = _run_init_sync(input_image_path, filament_dicts, settings_dict)
+        finally:
+            _in_flight["event"].set()
+
     try:
-        built = await asyncio.to_thread(_run_init_sync, input_image_path, filament_dicts, settings_dict)
+        await asyncio.to_thread(_worker)
     except Exception as e:
         logger.exception("Auto-preview (init) failed")
         with _lock:
-            _state = {"status": "idle", "preview_image": None, "error": friendly_error_message(e)}
+            if _in_flight and _in_flight.get("generation") == my_gen:
+                _in_flight = None
+            if _generation == my_gen:
+                _state = {"status": "idle", "preview_image": None, "error": friendly_error_message(e)}
+        release_pipeline_result(box.get("built", {}).get("result"))
         raise HTTPException(500, friendly_error_message(e))
 
+    with _lock:
+        if _in_flight and _in_flight.get("generation") == my_gen:
+            _in_flight = None
+        superseded_by_reset = _generation != my_gen
+
+    if superseded_by_reset:
+        # A reset landed mid-build: this result belongs to the image that was
+        # just replaced. Hand its GPU memory back and tell the (now-stale)
+        # caller so it doesn't publish state for a picture nobody is looking
+        # at anymore.
+        release_pipeline_result(box.get("built", {}).get("result"))
+        raise HTTPException(409, "Auto-preview was reset while it was being prepared.")
+
+    built = box["built"]
     with _lock:
         _pipeline_result = built["result"]
         _state = {
@@ -219,20 +300,45 @@ async def reset_init():
     shown as the new image's heightmap preview. Clearing it up front means
     the panel shows "building the preview" instead of something wrong, and
     the old optimizer's device memory is handed back at the same time.
+
+    If a build is still in flight, this waits for it to finish: the
+    replacement build must not run on the GPU next to it (that's what OOM'd
+    when switching images), and the replaced build's result must be released
+    before the reset is complete.
     """
-    reset_init_state()
+    global _state
+    in_flight_event = reset_init_state()
+    if in_flight_event is not None:
+        await asyncio.to_thread(in_flight_event.wait)
+        # The replaced build's completion handler deliberately leaves the
+        # status "initializing" while it is still running (that's what kept
+        # a second build from starting); now that it is done, hand the state
+        # back to idle.
+        with _lock:
+            if _state["status"] == "initializing":
+                _state = {"status": "idle", "preview_image": None, "error": None}
     return {"status": "idle"}
 
 
 def reset_init_state():
-    """Drop the auto-preview: its state, its mesh file and its GPU memory."""
-    global _state, _pipeline_result
+    """Drop the auto-preview: its state, its mesh file and its GPU memory.
+
+    Returns the in-flight build's completion event (or ``None`` when no build
+    is running) so the caller can wait it out before starting a new one."""
+    global _state, _pipeline_result, _generation, _in_flight
     with _lock:
+        _generation += 1
+        in_flight_event = _in_flight["event"] if _in_flight is not None else None
         superseded, _pipeline_result = _pipeline_result, None
-        _state = {"status": "idle", "preview_image": None, "error": None}
+        if in_flight_event is None:
+            _state = {"status": "idle", "preview_image": None, "error": None}
+        # Build in flight: the status stays "initializing" until its worker
+        # finishes — that is what makes /api/init/run refuse to start a
+        # second, concurrent build.
     release_pipeline_result(superseded)
     try:
         os.remove(_mesh_path())
     except OSError:
         # Never written, already gone, or not ours to delete — all fine.
         pass
+    return in_flight_event

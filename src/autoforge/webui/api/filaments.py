@@ -68,9 +68,11 @@ def list_filament_types():
 
 
 @router.get("/brands")
-def list_filament_brands():
+def list_filament_brands(filament_type: Optional[str] = None):
+    # The frontend sends the selected type tab's filter; without it the
+    # tabbed brand lists showed every type's brands.
     svc = get_filament_service()
-    return svc.get_brands()
+    return svc.get_brands(filament_type)
 
 
 @router.post("/import-csv")

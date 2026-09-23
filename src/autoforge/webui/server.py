@@ -1,10 +1,13 @@
+import logging
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import config
+from .helpers.telemetry import capture_exception, flush as flush_telemetry
 
 FRONTEND_DIST = os.path.abspath(
     os.path.join(
@@ -53,12 +56,12 @@ async def lifespan(app: FastAPI):
                 csv_content = f.read()
             imported = fs.import_csv(csv_content, _mark_user_import=False)
             if imported:
-                import logging
                 logging.getLogger(__name__).info(
                     "Seeded %d filaments from %s", len(imported), default_csv
                 )
 
     yield
+    flush_telemetry()
 
 
 def create_app() -> FastAPI:
@@ -73,6 +76,15 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(request: Request, exc: Exception):
+        # Background job threads (optimization/pruning) catch their own
+        # exceptions and report separately — this only sees errors raised
+        # directly out of a request handler.
+        logging.getLogger(__name__).exception("Unhandled error in %s", request.url.path)
+        capture_exception(exc, {"path": request.url.path})
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
     # API routes (imported here to avoid circular imports during module setup)
     from .api.filaments import router as filaments_router
@@ -110,8 +122,6 @@ def create_app() -> FastAPI:
     if os.path.isdir(FRONTEND_DIST):
         app.mount("/", SPAStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
     else:
-        import logging
-
         logging.getLogger(__name__).warning(
             "Frontend build not found at %s. Run `./run_webui.sh` to build it.",
             FRONTEND_DIST,

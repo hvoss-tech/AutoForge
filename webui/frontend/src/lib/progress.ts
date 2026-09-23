@@ -9,14 +9,26 @@ export interface ProgressState {
 const PROGRESS_THRESHOLD = 0.0015  // 0.15%
 const TIME_THRESHOLD = 120         // ms
 const STALL_THRESHOLD = 30000      // 30s
-const DEFAULT_DECAY = 0.7
+// A time constant, not a per-call decay: the caller here (TopBar) samples on
+// a steady 1s interval, but nothing guarantees that — a caller driven
+// straight off websocket messages can call update() every 100ms during a
+// burst and every 2s during a lull. A fixed per-call decay (the old
+// `smoothedRate * 0.7 + sampleRate * 0.3`) implicitly assumes evenly-spaced
+// calls: a burst of frequent samples barely moves the average (fine), but a
+// single call after a long gap is *also* only weighted 0.3 even though far
+// more real time — and therefore real information — has passed since the
+// last one, which is backwards. Converting to `alpha = 1 - exp(-dt / TAU)`
+// below makes the blend weight follow elapsed wall-clock time instead of
+// call count, so the same underlying rate signal comes out equally smooth
+// whether update() is polled once a second or fed every websocket message.
+const RATE_TIME_CONSTANT_MS = 4000
 
 export interface ProgressTracker {
   update(progress: number, now: number): ProgressState
   reset(): void
 }
 
-export function createProgressTracker(decay: number = DEFAULT_DECAY): ProgressTracker {
+export function createProgressTracker(timeConstantMs: number = RATE_TIME_CONSTANT_MS): ProgressTracker {
   let lastProgress = 0
   let lastTime = 0
   let smoothedRate = 0
@@ -41,9 +53,10 @@ export function createProgressTracker(decay: number = DEFAULT_DECAY): ProgressTr
       if (Math.abs(dp) > PROGRESS_THRESHOLD || dt > TIME_THRESHOLD) {
         if (dp > 0) lastChangeTime = now
         const sampleRate = dt > 0 ? dp / (dt / 1000) : 0
+        const alpha = dt > 0 ? 1 - Math.exp(-dt / timeConstantMs) : 1
         smoothedRate = smoothedRate === 0
           ? sampleRate
-          : smoothedRate * decay + sampleRate * (1 - decay)
+          : smoothedRate * (1 - alpha) + sampleRate * alpha
 
         lastProgress = progress
         lastTime = now

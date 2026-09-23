@@ -44,6 +44,10 @@ export function restoredImage(
   return { url, changed: url !== current.inputImage }
 }
 
+// Mirrors api/preview.py's INIT_JOB_SENTINEL / useSliderPreviewRender's
+// INIT_JOB_SENTINEL: the pre-run (no optimization job yet) preview channel.
+const INIT_JOB_SENTINEL = '__init__'
+
 /** Whether a /ws/preview broadcast is meant for this tab.
  *
  * The channel is shared by every connected tab and carries no per-connection
@@ -52,16 +56,51 @@ export function restoredImage(
  * job's id) rewrite the color layers of a history step the user had just
  * returned to, and what let one image's colors land on another's.
  *
- * A tab that has never tracked a job is the one case where an unknown job is
- * worth taking: that's how a run started from the API, or in another tab,
- * gets noticed at all. */
+ * The pre-run sentinel is always accepted when there's no current job: it's
+ * how slider-assignment previews (made before ever clicking Run) reach the
+ * panel, and `hasTrackedAnyJob` being permanently true after the *first*
+ * job this tab ever saw — even a since-abandoned one from a completed run,
+ * a new project, or a fresh upload — must not gate it out forever.
+ *
+ * Otherwise, a tab that has never tracked a job is the one case where an
+ * unknown (non-sentinel) job is worth taking: that's how a run started from
+ * the API, or in another tab, gets noticed at all. */
 export function acceptsPreviewUpdate(
   broadcastJobId: string | undefined,
   currentJobId: string | undefined,
   hasTrackedAnyJob: boolean,
 ): boolean {
   if (currentJobId) return broadcastJobId === currentJobId
+  if (broadcastJobId === INIT_JOB_SENTINEL) return true
   return !hasTrackedAnyJob
+}
+
+/** Whether a job fetched on page load ("the latest job") belongs to the
+ * image currently open in this session.
+ *
+ * `/api/optimize/latest` has no notion of "this browser tab" — it is
+ * whatever job most recently ran against the backend, from any session.
+ * Restoring a *completed* one whose image differs from what's on screen
+ * showed a different image's PLY under the current photo, with its STL/PLY
+ * export enabled too. A job recorded before the backend carried
+ * `input_image` has nothing to compare against — "we don't know" is treated
+ * as "yes", matching the prior behavior, rather than silently refusing to
+ * ever restore older jobs.
+ *
+ * The caller is always evaluated *after* the current project's settings
+ * have loaded (see loadCurrentJob), so `currentInputImage` missing there
+ * means something different: this project genuinely has no image (e.g.
+ * "Start new project" was the last thing that happened before an F5
+ * reload), not "we haven't checked yet". Treating that the same as the
+ * legacy-job case restored the previous project's finished output — an old
+ * job's image — into a project that had just been reset to have none. */
+export function jobBelongsToImage(
+  jobInputImage: string | null | undefined,
+  currentInputImage: string | null | undefined,
+): boolean {
+  if (!jobInputImage) return true
+  if (!currentInputImage) return false
+  return jobInputImage === currentInputImage
 }
 
 export type RestoredJob =

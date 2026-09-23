@@ -50,7 +50,18 @@ export const BottomPanel: React.FC = () => {
           )}
         </span>
       </div>
-      <div className="flex-1 min-h-0">{tab === 'layers' ? <ColorSliders /> : <PrintPlanPanel />}</div>
+      {/* Both tabs stay mounted (hidden via display:none rather than
+          conditionally rendered) so switching tabs doesn't lose
+          ColorSliders' row filter, scroll position, or an uncommitted
+          number-field draft. */}
+      <div className="flex-1 min-h-0 relative">
+        <div className={`absolute inset-0 ${tab === 'layers' ? '' : 'hidden'}`}>
+          <ColorSliders />
+        </div>
+        <div className={`absolute inset-0 ${tab === 'plan' ? '' : 'hidden'}`}>
+          <PrintPlanPanel />
+        </div>
+      </div>
     </div>
   )
 }

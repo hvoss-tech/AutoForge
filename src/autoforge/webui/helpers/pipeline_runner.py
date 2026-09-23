@@ -512,6 +512,7 @@ def export_results(
     result: Dict[str, Any],
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
+    apply_spike_removal: bool = True,
 ) -> Dict[str, Any]:
     """Generate STL, preview PNG, swap instructions, project file and
     colored PLY mesh from the state dict produced by ``run_pipeline()``.
@@ -609,6 +610,7 @@ def export_results(
                     fast_pruning_percent=args.fast_pruning_percent,
                     cancel_event=cancel_event,
                     pause_event=pause_event,
+                    apply_spike_removal=apply_spike_removal,
                 )
 
             disc_global, disc_height_image = optimizer.get_discretized_solution(

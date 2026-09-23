@@ -156,8 +156,21 @@ export const Preview3DPanel: React.FC = () => {
         // resets the server's auto-preview, the store must stop claiming
         // "ready" — that flag is what points the 3D panel at
         // /api/init/mesh, which no longer has anything to serve.
-        setInitState({ status: data.status })
-        if (data.base) useAppStore.getState().setResolvedBase(data.base)
+        //
+        // Both writes are skipped when nothing actually changed: this poll
+        // runs every second for as long as an image is open, and an
+        // unconditional `set()` re-renders the whole panel (and anything
+        // else subscribed to these fields) once a second even while the
+        // status has been sitting at "ready" the entire time.
+        if (data.status !== lastStatus) {
+          setInitState({ status: data.status })
+        }
+        if (data.base) {
+          const currentBase = useAppStore.getState().resolvedBase
+          if (JSON.stringify(currentBase) !== JSON.stringify(data.base)) {
+            useAppStore.getState().setResolvedBase(data.base)
+          }
+        }
 
         // Only on the transition into "ready" — this used to refetch the
         // preview image and re-apply /api/sliders/from-optimizer every

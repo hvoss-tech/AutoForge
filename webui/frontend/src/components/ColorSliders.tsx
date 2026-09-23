@@ -259,7 +259,12 @@ export const ColorSliders: React.FC = () => {
     // The optimizer only sees active filaments; a slider pointing at an
     // inactive one would silently not survive the next run.
     if (!activeFilaments.some((f) => f.uuid === filament.uuid)) addActiveFilament(filament)
-    updateSlider(index, { filament_uuid: filament.uuid, enabled: true, td: filament.td })
+    // Only reset TD to the filament's default when the band is actually
+    // switching filaments — otherwise a manual TD override on a band gets
+    // silently discarded any time this is called with the same filament.
+    const current = colorSliders[index]
+    const td = current && current.filament_uuid === filament.uuid ? current.td : filament.td
+    updateSlider(index, { filament_uuid: filament.uuid, enabled: true, td })
   }
 
   const readDroppedFilament = (e: React.DragEvent): Filament | null => {
@@ -382,6 +387,19 @@ export const ColorSliders: React.FC = () => {
               onDragOver={(e) => {
                 handleDragOver(e)
                 if (e.dataTransfer.types.includes(BAND_DRAG_TYPE)) {
+                  // Unplaced columns (layer 0) always stay at the end,
+                  // unordered by layer — reordering a band onto one has
+                  // nothing to do. Showing the same drop indicator here as
+                  // everywhere else invited a drop that silently did
+                  // nothing, with no sign it had been rejected.
+                  if (slider.layer === 0) {
+                    // No indicator here — a drop still fires the rejection
+                    // toast below (in onDrop), but forcing dropEffect to
+                    // 'none' would stop the browser from firing `drop` at
+                    // all, silently swallowing the rejection along with it.
+                    setDropTarget(null)
+                    return
+                  }
                   e.dataTransfer.dropEffect = 'move'
                   setDropTarget(i)
                 }
@@ -392,6 +410,10 @@ export const ColorSliders: React.FC = () => {
                 const from = e.dataTransfer.getData(BAND_DRAG_TYPE)
                 if (from !== '') {
                   e.preventDefault()
+                  if (slider.layer === 0) {
+                    pushToast('Drop onto a placed band to reorder — this column has no layer yet.', 'warning')
+                    return
+                  }
                   if (Number(from) !== i) moveBand(Number(from), i)
                   return
                 }

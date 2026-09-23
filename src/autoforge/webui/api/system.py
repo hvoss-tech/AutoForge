@@ -18,6 +18,9 @@ from autoforge.Helper.DeviceUtils import (
 )
 from fastapi import APIRouter
 
+from ..config import config
+from ..helpers.telemetry import anon_distinct_id
+
 router = APIRouter()
 
 _GITHUB_REPO = "hvoss-techfak/AutoForge"
@@ -84,16 +87,11 @@ async def get_version():
     return {"version": _current_version(), "repo": _GITHUB_REPO}
 
 
-@router.get("/update-check")
-async def check_for_update():
-    """Best-effort check against GitHub's latest-release API. Never raises —
-    a network hiccup or rate limit just means no update badge, not a broken
-    page. Cached briefly so repeated page loads don't hammer the API."""
-    now = time.time()
-    cached = _update_cache["data"]
-    if cached is not None and (now - _update_cache["checked_at"]) < _UPDATE_CACHE_TTL:
-        return cached
-
+def _check_latest_release() -> dict:
+    """The (blocking) GitHub API call. Runs in a worker thread via
+    ``asyncio.to_thread`` — doing it inline in the async handler stalled the
+    whole event loop (every other request and websocket, including live job
+    progress) for up to the 5 s urlopen timeout on the first page load."""
     current = _current_version()
     result = {
         "current_version": current,
@@ -116,6 +114,22 @@ async def check_for_update():
             result["update_available"] = _version_tuple(latest_tag) > _version_tuple(current)
     except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
         result["error"] = str(e)
+    return result
+
+
+@router.get("/update-check")
+async def check_for_update():
+    """Best-effort check against GitHub's latest-release API. Never raises —
+    a network hiccup or rate limit just means no update badge, not a broken
+    page. Cached briefly so repeated page loads don't hammer the API."""
+    import asyncio
+
+    now = time.time()
+    cached = _update_cache["data"]
+    if cached is not None and (now - _update_cache["checked_at"]) < _UPDATE_CACHE_TTL:
+        return cached
+
+    result = await asyncio.to_thread(_check_latest_release)
 
     _update_cache["data"] = result
     _update_cache["checked_at"] = now
@@ -138,6 +152,27 @@ async def system_info():
         "backend": backend_of(device),
         "device": str(device),
         "deviceDescription": describe_device(device),
+    }
+
+
+@router.get("/telemetry")
+async def telemetry_config():
+    """Tells the frontend whether/how to initialize PostHog. Disabled
+    server-side (via --no-telemetry / AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false)
+    or with no project key configured, the frontend never loads PostHog at
+    all — not just a suppressed capture call.
+
+    ``distinctId`` is the same anonymous per-install id the backend uses for
+    its own capture_exception() calls (helpers/telemetry.py). The frontend
+    calls posthog.identify() with it so a page ping and a backend exception
+    from the same install group under one PostHog person instead of two
+    unrelated anonymous ids."""
+    enabled = config.telemetry_enabled and bool(config.posthog_key)
+    return {
+        "enabled": enabled,
+        "apiKey": config.posthog_key if enabled else None,
+        "host": config.posthog_host if enabled else None,
+        "distinctId": anon_distinct_id() if enabled else None,
     }
 
 

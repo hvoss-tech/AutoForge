@@ -92,18 +92,25 @@ const App: React.FC = () => {
 
   useEffect(() => {
     const loadInitial = async () => {
+      // loadProjectState/loadActiveFilaments/loadCurrentJob each swallow their
+      // own fetch errors internally (falling back to defaults/empty state) so
+      // they never reject — a try/catch around them can never see a backend
+      // that isn't up yet. Probe a real endpoint directly instead, so a
+      // frontend that loads before the backend is accepting connections
+      // (e.g. a Docker Compose stack without a healthcheck dependency)
+      // actually retries instead of silently settling into "no project".
       for (let attempt = 0; attempt < 20; attempt++) {
         try {
-          await loadProjectState()
-          await loadActiveFilaments()
-          await loadCurrentJob()
-          // If the responses succeeded, we're done
-          break
+          const response = await fetch('/api/project/state')
+          if (response.ok) break
         } catch {
-          // Backend not ready yet – retry
-          await new Promise(r => setTimeout(r, 1000))
+          // Backend not reachable yet – retry
         }
+        await new Promise(r => setTimeout(r, 1000))
       }
+      await loadProjectState()
+      await loadActiveFilaments()
+      await loadCurrentJob()
       // After the job is known: whether the image needs a new preview depends on it.
       await restoreSessionImage()
     }

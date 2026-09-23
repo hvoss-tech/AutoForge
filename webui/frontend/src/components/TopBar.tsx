@@ -424,23 +424,43 @@ export const TopBar: React.FC = () => {
   const jobId = currentJob?.job_id
   const isActive = currentJob?.status === 'running' || currentJob?.status === 'paused' || currentJob?.status === 'pending'
 
+  // The websocket pushes a fresh `currentJob` object on every progress
+  // update — far more often than once a second, and at irregular intervals
+  // (a burst of iterations can land within milliseconds of each other).
+  // `latestProgressRef` decouples "how often we hear about progress" from
+  // "how often we sample it": only the ref updates on every message, while
+  // the tracker itself is fed from a steady 1s interval below.
+  const latestProgressRef = useRef(0)
+  useEffect(() => {
+    latestProgressRef.current = (currentJob?.progress || 0) / 100
+  }, [currentJob?.progress])
+
   useEffect(() => {
     if (!isActive || !jobId) {
       trackerRef.current = null
       setElapsedEta(null)
       return
     }
-    if (!trackerRef.current) trackerRef.current = createProgressTracker()
+    // Regression: this used to depend on `currentJob` itself, so the
+    // interval was torn down and rebuilt on every single progress message —
+    // `createProgressTracker`'s EMA assumes evenly-spaced ~1s samples to
+    // smooth over, and instead got fed samples at whatever irregular
+    // cadence the websocket happened to deliver at, which is what made the
+    // "Xs left" estimate visibly jump around every iteration. Keying this
+    // effect on the stable (isActive, jobId) pair instead means the
+    // interval — and its 1s cadence — survives for the whole run; only
+    // `latestProgressRef` above tracks each new message.
+    trackerRef.current = createProgressTracker()
     const tick = () => {
       const tracker = trackerRef.current
-      if (!tracker || !currentJob) return
-      const state = tracker.update((currentJob.progress || 0) / 100, Date.now())
+      if (!tracker) return
+      const state = tracker.update(latestProgressRef.current, Date.now())
       setElapsedEta({ elapsed: state.elapsed, eta: state.eta, stalled: state.stalled })
     }
     tick()
     const interval = setInterval(tick, 1000)
     return () => clearInterval(interval)
-  }, [isActive, jobId, currentJob])
+  }, [isActive, jobId])
 
   // A "can't start" message is about the state at click time; once that's
   // fixed it shouldn't linger next to an enabled Run button.

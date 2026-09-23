@@ -23,6 +23,7 @@ const itemClass =
 export const FileMenu: React.FC = () => {
   const [open, setOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [flatforgeStlFiles, setFlatforgeStlFiles] = useState<string[]>([])
   const menuRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -133,6 +134,32 @@ export const FileMenu: React.FC = () => {
   }
 
   const jobId = currentJob?.job_id
+  const isFlatforge = !!currentJob?.flatforge
+
+  // FlatForge runs write one STL per material (no final_model.stl), so the
+  // single-file `/api/outputs/stl/{jobId}` endpoint has nothing to serve —
+  // without this, the STL entry just 404'd and the "Everything (.zip)"
+  // bundle (which does contain them) was the only way to get the print
+  // files out of the UI at all. Fetched lazily, only while the menu holding
+  // it is actually open.
+  useEffect(() => {
+    if (!open || !canExport || !isFlatforge || !jobId) {
+      setFlatforgeStlFiles([])
+      return
+    }
+    let cancelled = false
+    fetch(`/api/outputs/stl-list/${jobId}`)
+      .then((r) => (r.ok ? r.json() : { files: [] }))
+      .then((data) => {
+        if (!cancelled) setFlatforgeStlFiles(Array.isArray(data.files) ? data.files : [])
+      })
+      .catch(() => {
+        if (!cancelled) setFlatforgeStlFiles([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, canExport, isFlatforge, jobId])
 
   return (
     <div className="relative" ref={menuRef}>
@@ -170,9 +197,29 @@ export const FileMenu: React.FC = () => {
           <button onClick={() => jobId && downloadFromServer(`/api/outputs/export/${jobId}`, `${jobId}_export.zip`)} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="file-menu-export">
             <PackageOpen className="w-3.5 h-3.5" /> Everything (.zip)
           </button>
-          <button onClick={() => jobId && downloadFromServer(`/api/outputs/stl/${jobId}`, 'final_model.stl')} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="download-stl">
-            <Box className="w-3.5 h-3.5" /> 3D model (.stl)
-          </button>
+          {isFlatforge ? (
+            flatforgeStlFiles.length > 0 ? (
+              flatforgeStlFiles.map((name) => (
+                <button
+                  key={name}
+                  onClick={() => jobId && downloadFromServer(`/api/outputs/file/${jobId}/${encodeURIComponent(name)}`, name)}
+                  className={itemClass}
+                  role="menuitem"
+                  data-testid="download-stl-flatforge"
+                >
+                  <Box className="w-3.5 h-3.5" /> {name}
+                </button>
+              ))
+            ) : (
+              <button disabled title="FlatForge writes one STL per material — use “Everything (.zip)” above" className={itemClass} role="menuitem" data-testid="download-stl">
+                <Box className="w-3.5 h-3.5" /> 3D model (.stl)
+              </button>
+            )
+          ) : (
+            <button onClick={() => jobId && downloadFromServer(`/api/outputs/stl/${jobId}`, 'final_model.stl')} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="download-stl">
+              <Box className="w-3.5 h-3.5" /> 3D model (.stl)
+            </button>
+          )}
           <button onClick={handleInstructions} disabled={!hasBands} title={hasBands ? undefined : 'Add color layers first'} className={itemClass} role="menuitem" data-testid="download-instructions">
             <FileText className="w-3.5 h-3.5" /> Swap instructions (.txt)
           </button>

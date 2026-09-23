@@ -56,6 +56,8 @@ The easiest way to use AutoForge is the web UI — a local app (like ComfyUI) wi
    - Windows: double-click `run_webui.bat`
 
    This starts the server and opens the web UI in your browser automatically (usually at `http://localhost:8000`).
+
+   The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports — unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace — so bugs can get fixed faster. No image data, filament data, or personal information is sent. To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
 4. **Update to the latest release** whenever you want, from the project folder:
    - Linux/macOS: `./update.sh`
    - Windows: double-click `update.bat`

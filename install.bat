@@ -42,3 +42,7 @@ echo.
 echo === Install complete ===
 echo Start AutoForge with:   run_webui.bat
 echo Check for updates with: update.bat
+echo.
+echo Note: the web UI sends anonymous usage telemetry (PostHog) by default.
+echo   Disable it with run_webui.bat --no-telemetry, or permanently via
+echo   AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false. See README.md for details.

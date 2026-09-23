@@ -37,8 +37,10 @@ def release_pipeline_result(result: Optional[dict[str, Any]]) -> None:
     if optimizer is not None:
         # The optimizer may still own a captured CUDA graph and its private
         # memory pool; that pool is not reclaimed by empty_cache() while the
-        # graph object is reachable (see Optimizer._release_graph).
-        for release in ("_release_graph", "release_graph"):
+        # graph object is reachable. `release_cuda_graph` is the real method
+        # (Modules/Optimizer.py); the other names are kept for the fakes the
+        # tests use.
+        for release in ("release_cuda_graph", "_release_graph", "release_graph"):
             fn = getattr(optimizer, release, None)
             if callable(fn):
                 try:

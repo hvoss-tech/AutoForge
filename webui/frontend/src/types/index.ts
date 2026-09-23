@@ -87,6 +87,12 @@ export interface JobStatus {
   pruning_max_passes?: number | null
   /** The loss pruning started from; `loss` carries the live value. */
   pruning_start_loss?: number | null
+  /** The input image this job ran on, and whether it's a FlatForge run (see
+   * models.JobStatus) — both absent on jobs recorded before these fields
+   * existed. Used to tell whether a restored/latest job actually belongs to
+   * the image currently on screen. */
+  input_image?: string | null
+  flatforge?: boolean | null
 }
 
 export interface PruningSettings {

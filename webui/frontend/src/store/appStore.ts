@@ -5,6 +5,7 @@ import {
   acceptsPreviewUpdate,
   describeSettingsChange,
   describeSliderEdit,
+  jobBelongsToImage,
   mergeHistoryLabels,
   resolveRestoredJob,
   restoredImage,
@@ -38,6 +39,7 @@ function snapshotToHistoryEntry(s: Snapshot): HistoryEntry {
 }
 
 let pruningPollTimer: ReturnType<typeof setTimeout> | null = null
+const MAX_TOASTS = 5
 
 // POST /api/init/run requests from this page still waiting for an answer.
 // While one is out, the server's init status describes the *previous* image
@@ -353,7 +355,7 @@ interface AppState {
   setActiveFilaments: (filaments: Filament[]) => void
   addActiveFilament: (filament: Filament) => void
   removeActiveFilament: (uuid: string) => void
-  setSliders: (sliders: ColorSliderConfig[], label?: string) => void
+  setSliders: (sliders: ColorSliderConfig[], label?: string, opts?: { handEdited?: boolean }) => void
   addBand: (filament?: Filament) => void
   removeBand: (index: number) => void
   requestConfirm: (request: Omit<ConfirmRequest, 'id'>) => Promise<boolean>
@@ -413,7 +415,7 @@ interface AppState {
   loadActiveFilaments: () => Promise<void>
   loadCurrentJob: () => Promise<void>
   loadProjectFromFile: (data: unknown, fileName?: string) => Promise<void>
-  loadBaseColor: () => Promise<void>
+  loadBaseColor: (jobId?: string) => Promise<void>
   setResolvedBase: (base: ResolvedBase | null) => void
   setBaseFilament: (filament: Filament) => void
   setTutorialOpen: (open: boolean) => void
@@ -565,6 +567,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       inputImage: null,
       settings: { ...state.settings, input_image: '' },
       colorSliders: [],
+      sliderLayerRange: { min: 0, max: state.settings.max_layers || 75 },
       currentJob: null,
       stlFile: null,
       previewImage: null,
@@ -643,12 +646,16 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   pushToast: (message, level = 'error') => {
     const id = nextToastId++
-    set((state) => ({ toasts: [...state.toasts, { id, message, level }] }))
-    // Errors stay until dismissed (they may need to be read/copied); info
-    // and warning toasts self-clear so they don't pile up.
-    if (level !== 'error') {
-      setTimeout(() => get().dismissToast(id), 6000)
-    }
+    set((state) => {
+      const toasts = [...state.toasts, { id, message, level }]
+      // A repeated error source (a flaky connection, a retried failing
+      // request) used to stack toasts forever since only info/warning ones
+      // self-cleared — cap how many stay on screen at once.
+      return { toasts: toasts.length > MAX_TOASTS ? toasts.slice(toasts.length - MAX_TOASTS) : toasts }
+    })
+    // Errors stay longer (they may need to be read/copied) but still clear
+    // eventually; info and warning toasts self-clear quickly.
+    setTimeout(() => get().dismissToast(id), level === 'error' ? 20000 : 6000)
   },
   dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
 
@@ -658,7 +665,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   setFilamentTypes: (types) => set({ filamentTypes: types }),
   setFilamentBrands: (brands) => set({ filamentBrands: brands }),
   setActiveFilaments: (filaments) => { set({ activeFilaments: filaments }); queueCaptureSnapshot('Active filaments changed') },
-  setSliders: (sliders, label) => { set({ colorSliders: sliders, slidersEditedByHand: true }); queueCaptureSnapshot(label ?? 'Edited color layers') },
+  setSliders: (sliders, label, opts) => {
+    // A slider's TD following a library filament's edited TD (see
+    // EditFilamentModal) is a sync, not something the user laid out by
+    // hand — marking it hand-edited made an unrelated library edit trigger
+    // "Replace your color layers?" on the next Run, and queued a
+    // misleading "Edited color layers" undo entry for a change the user
+    // never made to the sliders themselves.
+    const handEdited = opts?.handEdited ?? true
+    set({ colorSliders: sliders, ...(handEdited ? { slidersEditedByHand: true } : {}) })
+    queueCaptureSnapshot(label ?? 'Edited color layers')
+  },
   applySliders: (sliders, range) => {
     set((state) => {
       // The optimizer/pruner can legitimately produce more or fewer bands
@@ -755,7 +772,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (job && job.status === 'completed' && prevStatus !== 'completed') {
       // The run is what resolves the base color (auto-selection happens
       // inside the pipeline), so pick it up now that there's a result.
-      get().loadBaseColor()
+      get().loadBaseColor(job.job_id)
       queueCaptureSnapshot('Optimization completed')
     }
   },
@@ -803,11 +820,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!response.ok) return
       const job: JobStatus = await response.json()
       if (!shouldRestoreJobOnLoad(job.status)) return
+      // Called after loadProjectState() (App.tsx), so settings.input_image
+      // already reflects the persisted project's image, if any.
+      if (job.status === 'completed' && !jobBelongsToImage(job.input_image, get().settings.input_image)) {
+        return
+      }
       markJobTracked()
       set({ currentJob: job })
       if (job.status === 'completed') {
         set({ stlFile: job.job_id })
-        get().loadBaseColor()
+        get().loadBaseColor(job.job_id)
       }
     } catch {
       // No jobs yet, or backend unreachable — start with none
@@ -824,6 +846,33 @@ export const useAppStore = create<AppState>((set, get) => ({
     }>
 
     const state = get()
+
+    // A loaded project's image is a different one than whatever was on
+    // screen (definitely — it's a different project), so every result
+    // derived from the *previous* image must go, the same way
+    // applyUploadedImage() clears it for a fresh upload. Leaving any of it
+    // in place is what showed the previous project's PLY under the loaded
+    // one, and re-rendered the new project's colors onto the old heightmap.
+    if (pruningPollTimer) clearTimeout(pruningPollTimer)
+    await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
+    set({
+      currentJob: null,
+      stlFile: null,
+      previewImage: null,
+      initState: { status: 'idle', preview_image: null },
+      initSkipImage: null,
+      hasRenderedInitPreview: false,
+      pruningJob: null,
+      pruningBaseline: null,
+      resolvedBase: null,
+      lossHistory: [],
+      lossJobId: null,
+      imageView: 'original',
+      hoveredBand: null,
+      // The loaded sliders may themselves reflect someone's earlier hand
+      // work, but nothing has been hand-edited in *this* session yet.
+      slidersEditedByHand: false,
+    })
 
     // Sync the backend's active-filament list to match the file — clear
     // what's active now, then re-add what the file specifies. A filament
@@ -870,9 +919,13 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setResolvedBase: (base) => set({ resolvedBase: base }),
 
-  loadBaseColor: async () => {
+  loadBaseColor: async (jobId) => {
     try {
-      const response = await fetch('/api/sliders/base')
+      // Pinned to a specific job when the caller knows which result is on
+      // screen — without it this answered for "the newest completed job",
+      // which showed the wrong base color after undoing to an older result.
+      const url = jobId ? `/api/sliders/base?job_id=${encodeURIComponent(jobId)}` : '/api/sliders/base'
+      const response = await fetch(url)
       if (!response.ok) return
       const data = await response.json()
       if (data && data.base) set({ resolvedBase: data.base as ResolvedBase })
@@ -923,6 +976,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       settings,
       inputImage: displayUrl,
+      // The previous image's heightmap bounds must not keep clamping band
+      // edits until the new init lands and reports its own range.
+      sliderLayerRange: { min: 0, max: settings.max_layers || 75 },
       initState: { status: 'idle', preview_image: null },
       initSkipImage: null,
       hasRenderedInitPreview: false,
@@ -944,8 +1000,19 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   runInit: async () => {
     const state = get()
+    // Captured now, not read again after the await: settings.input_image
+    // can change while this request is in flight (a new upload, a history
+    // step), and this response must not be applied under a different photo
+    // than the one it was built for.
+    const forImage = state.settings.input_image
     set({ initState: { status: 'initializing', preview_image: null } })
     initRequestsInFlight += 1
+    // Whether *this* call is the only one out. If a sibling init request is
+    // also in flight, it owns resolving `initState` when it settles — this
+    // call forcing it back to 'idle' on its own rejection raced the sibling,
+    // flapped the status, and let useAutoPreviewInit's effect (which only
+    // remembers 'error' outcomes in `failedFor`) re-fire into a request loop.
+    const isOnlyRequest = () => initRequestsInFlight <= 1
     try {
       // /api/init/run used to take no body at all and read a settings
       // singleton the rest of the app never writes to (POST /api/optimize/
@@ -959,16 +1026,28 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!response.ok) {
         const detail = describeApiError(await response.json().catch(() => null), response.status)
         console.error('[store] Init rejected:', detail)
-        set({ initState: { status: 'idle', preview_image: null } })
+        if (isOnlyRequest()) set({ initState: { status: 'idle', preview_image: null } })
         // "Already initializing" is a benign race (see the comment on
-        // ActiveFilamentsPanel's effect) — not worth alarming the user
-        // about; anything else (including an OOM from heightmap init,
-        // which runs real GPU work) is not.
-        if (detail.includes('Already initializing')) return 'busy'
+        // ActiveFilamentsPanel's effect); a 409 for a build superseded by a
+        // reset (image changed mid-build) is exactly as benign — the image
+        // that mattered just changed out from under this call, and
+        // useAutoPreviewInit will already have kicked off (or will kick
+        // off) the build that actually matters. Neither is worth alarming
+        // the user about; anything else (including an OOM from heightmap
+        // init, which runs real GPU work) is not.
+        if (detail.includes('Already initializing') || detail.includes('reset while it was being prepared')) {
+          return 'busy'
+        }
         get().pushToast(`Failed to prepare preview: ${detail}`)
         return 'error'
       }
       const result = await response.json()
+      if (get().settings.input_image !== forImage) {
+        // The image changed while this request was out — this result is
+        // for a photo that's no longer on screen. Applying it would show
+        // one image's heightmap/base color under a different one.
+        return 'busy'
+      }
       set({ initState: { status: 'ready', preview_image: result.preview_image ?? null } })
       if (Number.isFinite(result.min_layer) && Number.isFinite(result.max_layer)) {
         set({ sliderLayerRange: { min: result.min_layer, max: result.max_layer } })
@@ -979,7 +1058,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       return 'ready'
     } catch (e) {
       console.error('[store] Failed to run init:', e)
-      set({ initState: { status: 'idle', preview_image: null } })
+      if (isOnlyRequest()) set({ initState: { status: 'idle', preview_image: null } })
       get().pushToast(`Failed to prepare preview: ${e instanceof Error ? e.message : String(e)}`)
       return 'error'
     } finally {
@@ -1070,6 +1149,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     const data = await response.json()
     set({ pruningJob: { ...data, progress: 0, iteration: 0, loss: null, error: null, started_at: new Date().toISOString(), completed_at: null, preview_image: null } })
 
+    // The pruning job's own id (`data.job_id`, e.g. "prune-xxxx") gets its
+    // own real, independent output directory and pipeline result once it
+    // completes (see api/pruning.py) — it is no longer just a progress
+    // tracker for the original optimization job. Once that happens, this
+    // becomes the active job: every subsequent action (viewing the result,
+    // a follow-up prune, a history snapshot captured from here on) must
+    // point at this id, not the one pruning started from — that job's own
+    // files stop changing once this prune begins, so anything still
+    // pointing at it would keep showing the *pre-this-prune* result.
     const jobId = data.job_id
     if (pruningPollTimer) clearTimeout(pruningPollTimer)
     const poll = async () => {
@@ -1079,7 +1167,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           const job = await res.json()
           set({ pruningJob: job })
           if (job.status === 'completed') {
-            get().loadBaseColor()
+            set({ currentJob: job, stlFile: job.job_id })
+            get().loadBaseColor(job.job_id)
             queueCaptureSnapshot('Pruning completed')
           }
           if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') return
@@ -1240,8 +1329,19 @@ export const useAppStore = create<AppState>((set, get) => ({
 // actions that call queueCaptureSnapshot).
 let snapshotTimer: ReturnType<typeof setTimeout> | null = null
 let pendingLabel: string | undefined
+// Set for the whole duration of an undo/redo/restoreToIndex — see
+// applySnapshot(). An edit's debounced snapshot must not fire while a
+// restore is in flight: applySnapshot's own final setState would land after
+// it and silently overwrite the edit right back out of the visible state,
+// leaving a history entry that doesn't match what's on screen.
+let applyInFlight = false
+let deferredCaptureLabel: string | undefined
 
 function queueCaptureSnapshot(label?: string) {
+  if (applyInFlight) {
+    if (label) deferredCaptureLabel = mergeHistoryLabels(deferredCaptureLabel, label)
+    return
+  }
   if (label) pendingLabel = mergeHistoryLabels(pendingLabel, label)
   if (snapshotTimer) clearTimeout(snapshotTimer)
   snapshotTimer = setTimeout(() => {
@@ -1299,9 +1399,34 @@ async function applySnapshot(index: number) {
   const target = UNDO_STACK[index]
   if (!target) return
   const store = useAppStore.getState()
-  UNDO_INDEX = index
-  useAppStore.setState({ historyIndex: index })
+  // UNDO_INDEX (and the store's historyIndex) move only right before the
+  // final setState below, after every await here has settled — not here.
+  // A captureSnapshot debounce that fires during one of those awaits reads
+  // UNDO_INDEX to decide where to splice/append; moving it this early made
+  // it act as if the restore had already landed while the visible state
+  // (and the network calls it depends on) hadn't, so a concurrent edit's
+  // snapshot was spliced in at the wrong spot and then clobbered by this
+  // function's own restore a moment later — the edit vanished from the
+  // screen even though a (mismatched) history entry for it remained.
+  //
+  // Belt and suspenders: also hold off the debounce itself for the whole
+  // restore (not just the index update), so an edit mid-restore can't be
+  // captured — and clobbered by this function's own final setState — at
+  // all. It replays once this restore has fully landed.
+  applyInFlight = true
+  try {
+    return await applySnapshotBody(index, target, store)
+  } finally {
+    applyInFlight = false
+    if (deferredCaptureLabel !== undefined) {
+      const label = deferredCaptureLabel
+      deferredCaptureLabel = undefined
+      queueCaptureSnapshot(label)
+    }
+  }
+}
 
+async function applySnapshotBody(index: number, target: Snapshot, store: AppState) {
   if (target.activeFilaments) {
     try {
       await syncActiveFilamentsToServer(target.activeFilaments)
@@ -1334,9 +1459,22 @@ async function applySnapshot(index: number) {
   // the wrong photo — and it is still marked "ready", so the status poll
   // would hand the 3D panel the previous image's heightmap. Dropped before
   // the store changes, because that is what starts the new init.
-  if (imageChanged) await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
+  //
+  // Skipped when the destination already has its own completed job result:
+  // that step doesn't use the auto-preview at all (useAutoPreviewInit bails
+  // out whenever hasResult is true), so resetting it here only cost time —
+  // and, worse, could *block* on releasing/rebuilding some *other* image's
+  // auto-preview if one happened to be mid-build (the concurrent-init fix
+  // makes /api/init/reset wait out an in-flight build before it returns),
+  // stalling a plain history jump for as long as an unrelated heightmap
+  // init took to finish. The stale auto-preview is harmless left alone: the
+  // next *real* init request still releases it before building anew.
+  const destinationHasResult = jobUpdate.currentJob?.status === 'completed'
+  if (imageChanged && !destinationHasResult) await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
 
+  UNDO_INDEX = index
   useAppStore.setState((prev) => ({
+    historyIndex: index,
     activeFilaments: target.activeFilaments ?? prev.activeFilaments,
     colorSliders: target.colorSliders ?? prev.colorSliders,
     settings: target.settings ?? prev.settings,
@@ -1361,9 +1499,14 @@ async function applySnapshot(index: number) {
       : {}),
     selectedBand: null,
     hoveredBand: null,
+    // Nothing has been hand-edited *since arriving at this point in
+    // history* — leaving the old value in place kept the "Replace your
+    // color layers?" confirmation showing on the next Run even after
+    // undoing away from the hand edit that had set it.
+    slidersEditedByHand: false,
   }))
   useAppStore.getState().bumpPreviewVersion()
-  if (jobUpdate.currentJob) useAppStore.getState().loadBaseColor()
+  if (jobUpdate.currentJob) useAppStore.getState().loadBaseColor(jobUpdate.currentJob.job_id)
   persistProjectState(useAppStore.getState())
 }
 

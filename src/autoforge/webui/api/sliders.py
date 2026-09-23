@@ -13,13 +13,22 @@ _DEFAULTS = {"sliders": [], "min_layer": 0, "max_layer": 75}
 
 
 @router.get("/from-optimizer")
-async def get_sliders_from_optimizer():
-    """Return the slider stack derived from the most recent completed job.
+async def get_sliders_from_optimizer(job_id: str | None = None):
+    """Return the slider stack derived from a completed job.
 
     The response shape is ``{"sliders": [...], "min_layer": int, "max_layer":
     int}`` where ``sliders`` use snake_case keys matching the frontend
     ``ColorSliderConfig`` type, and ``min_layer``/``max_layer`` bound the
     per-pixel height layers of the solution.
+
+    With ``job_id`` it answers for *that* job's result — mirroring
+    ``/api/sliders/base``'s ``job_id`` param: ``set_pipeline_result`` only
+    ever retains the newest job's result, so without pinning to the job the
+    UI is actually looking at, navigating back to an older (still
+    "completed") job via undo/history left this endpoint returning the
+    newest job's sliders while ``/base`` correctly answered for the older
+    one — base color and slider colors visibly disagreed. Without it: falls
+    back to the most recent completed job with a retained result.
 
     Falls back to the post-upload auto-preview state (api/init.py) when
     there's no completed job yet — but only for ``min_layer``/``max_layer``
@@ -30,6 +39,15 @@ async def get_sliders_from_optimizer():
     explicitly the user's job, not an auto-derived guess.
     """
     svc = get_optimization_service()
+
+    if job_id:
+        job = svc.get_job(job_id)
+        if job and job.status == "completed":
+            result = svc.get_pipeline_result(job.job_id)
+            if result:
+                return derive_sliders_from_result(result) or _DEFAULTS
+        return _DEFAULTS
+
     for job in svc.get_history():
         if job.status != "completed":
             continue
@@ -51,7 +69,7 @@ async def get_sliders_from_optimizer():
 
 
 @router.get("/base")
-async def get_base_color():
+async def get_base_color(job_id: str | None = None):
     """The base/background slab as it was actually built: its resolved color,
     its height, and which active filament that color belongs to.
 
@@ -61,10 +79,20 @@ async def get_base_color():
     active filament closest to the image's dominant color, and only the
     pipeline result knows which one that was.
 
-    Answers for the newest completed job, else the auto-preview, else
-    ``null`` — the caller then falls back to its own settings.
+    With ``job_id`` it answers for *that* job's result (the one the UI is
+    looking at — undoing back to an older result must not show the newest
+    run's base). Without it: the newest completed job, else the auto-preview,
+    else ``null`` — the caller then falls back to its own settings.
     """
     svc = get_optimization_service()
+    if job_id:
+        job = svc.get_job(job_id)
+        if job and job.status == "completed":
+            result = svc.get_pipeline_result(job.job_id)
+            if result:
+                return {"base": derive_base_from_result(result), "source": job.job_id}
+        return {"base": None, "source": None}
+
     for job in svc.get_history():
         if job.status != "completed":
             continue

@@ -73,6 +73,16 @@ export const ColorCore: React.FC = () => {
   const handleRefs = useRef(new Map<number, HTMLDivElement>())
   const [focusedHandle, setFocusedHandle] = useState<number | null>(null)
   const [draggingHandle, setDraggingHandle] = useState<number | null>(null)
+  // The stable identity of the band being dragged. `draggingHandle` is an
+  // index into the layer-sorted `handles` array, which can reorder mid-drag
+  // (dragging a band onto the same layer as a neighbor ties them, and the
+  // stable sort then orders the pair by storeIndex) — tracking storeIndex
+  // instead means the drag always follows the same band even if its index
+  // in that array shifts underneath it.
+  const draggingStoreIndexRef = useRef<number | null>(null)
+  // The drag track's vertical scale, frozen for the duration of one drag —
+  // see the effect below.
+  const dragTrackTopLayerRef = useRef<number | null>(null)
   const [hoveredHandle, setHoveredHandle] = useState<number | null>(null)
   const [viewportHeight, setViewportHeight] = useState(300)
   const [zoom, setZoom] = useState(1)
@@ -214,14 +224,28 @@ export const ColorCore: React.FC = () => {
     return result
   }, [activeHandles])
 
+  // While dragging, the track's vertical scale is frozen (dragTrackTopLayerRef)
+  // to avoid the "runaway" feedback loop documented on that ref. Rendering
+  // handle/segment positions off the *live* top layer instead — as before —
+  // made the topmost handle visibly detach from the cursor mid-drag (its own
+  // movement kept rescaling the track under it) and reflowed every other
+  // handle even though their layers hadn't changed. Rendering off the same
+  // frozen scale keeps the whole track visually stable for the drag's
+  // duration; it re-syncs to the live top layer as soon as the drag ends.
+  const displayMaxLayer =
+    draggingHandle !== null && dragTrackTopLayerRef.current !== null
+      ? dragTrackTopLayerRef.current
+      : handles.length > 0
+        ? handles[handles.length - 1].value
+        : 0
+
   const layerToY = useCallback(
     (layer: number): number => {
-      if (handles.length === 0) return 0
-      const maxLayer = handles[handles.length - 1].value
-      const segmentHeight = containerHeight / maxLayer
-      return segmentHeight * (maxLayer - layer) + segmentHeight / 2
+      if (handles.length === 0 || displayMaxLayer === 0) return 0
+      const segmentHeight = containerHeight / displayMaxLayer
+      return segmentHeight * (displayMaxLayer - layer) + segmentHeight / 2
     },
-    [handles, containerHeight],
+    [handles, containerHeight, displayMaxLayer],
   )
 
   /** Pointing at a handle selects its band everywhere (row, strip, 3D). */
@@ -242,17 +266,19 @@ export const ColorCore: React.FC = () => {
       e.preventDefault()
       handleRefs.current.get(handleIndex)?.focus({ preventScroll: true })
       selectHandle(handleIndex)
+      draggingStoreIndexRef.current = handles[handleIndex]?.storeIndex ?? null
       setDraggingHandle(handleIndex)
     },
-    [selectHandle],
+    [selectHandle, handles],
   )
 
   const handleTouchStart = useCallback(
     (handleIndex: number) => () => {
       selectHandle(handleIndex)
+      draggingStoreIndexRef.current = handles[handleIndex]?.storeIndex ?? null
       setDraggingHandle(handleIndex)
     },
-    [selectHandle],
+    [selectHandle, handles],
   )
 
   /** Arrow keys move a handle one layer (Shift: five), within the same
@@ -293,18 +319,30 @@ export const ColorCore: React.FC = () => {
   }, [selectedBand, zoom])
 
   useEffect(() => {
-    if (draggingHandle === null) return
+    if (draggingHandle === null) {
+      // Reset so the next drag captures a fresh value at its own start.
+      dragTrackTopLayerRef.current = null
+      draggingStoreIndexRef.current = null
+      return
+    }
 
     const activeSliders = colorSliders
       .map((s, idx) => ({ ...s, storeIndex: idx }))
       .filter((s) => s.enabled && s.layer > 0)
       .sort((a, b) => a.layer - b.layer)
 
-    const handle = activeSliders[draggingHandle]
+    // Re-derive the dragged band's position by its stable storeIndex, not
+    // by trusting the `draggingHandle` array index — a tie with a neighbor
+    // reorders `activeSliders` underneath an in-progress drag.
+    const dragIdx = activeSliders.findIndex((s) => s.storeIndex === draggingStoreIndexRef.current)
+    if (dragIdx === -1) return
+    if (dragIdx !== draggingHandle) setDraggingHandle(dragIdx)
+
+    const handle = activeSliders[dragIdx]
     if (!handle) return
 
-    const prevHandle = draggingHandle > 0 ? activeSliders[draggingHandle - 1] : null
-    const nextHandle = draggingHandle < activeSliders.length - 1 ? activeSliders[draggingHandle + 1] : null
+    const prevHandle = dragIdx > 0 ? activeSliders[dragIdx - 1] : null
+    const nextHandle = dragIdx < activeSliders.length - 1 ? activeSliders[dragIdx + 1] : null
 
     // Sliders may now be dragged onto the exact same layer as a neighbor
     // (that's how "move over one another" works) — bounds are inclusive of
@@ -314,11 +352,26 @@ export const ColorCore: React.FC = () => {
     const minLayer = prevHandle ? prevHandle.layer : 1
     const maxLayer = nextHandle ? nextHandle.layer : sliderLayerRange.max
 
+    // The vertical scale of the drag track is fixed once, at the start of
+    // this drag — not recomputed from the live `colorSliders` on every one
+    // of this effect's re-runs (which `updateSlider` below triggers, since
+    // colorSliders is a dependency). For every handle but the topmost, that
+    // recomputed value happens to equal the frozen one anyway (a neighbor's
+    // layer doesn't move during this drag). For the topmost handle it does
+    // NOT: `activeSliders[last]` *is* the handle being dragged, so its
+    // "scale" changed on the previous update — shrinking the denominator as
+    // the handle rose, which made the next mousemove event (same pixel
+    // delta) compute a larger layer jump than the last one, and the handle
+    // ran away toward the layer max within a few pixels of jitter.
+    if (dragTrackTopLayerRef.current === null) {
+      dragTrackTopLayerRef.current = activeSliders[activeSliders.length - 1].layer
+    }
+    const currentMaxLayer = dragTrackTopLayerRef.current
+
     const handleMove = (clientY: number) => {
       if (!contentRef.current) return
       const rect = contentRef.current.getBoundingClientRect()
       const relativeY = clientY - rect.top
-      const currentMaxLayer = activeSliders[activeSliders.length - 1].layer
       const segmentHeight = rect.height / currentMaxLayer
       const rawLayer = Math.round((rect.height - relativeY) / segmentHeight)
       const clampedLayer = Math.max(minLayer, Math.min(maxLayer, Math.max(1, rawLayer)))
@@ -359,11 +412,18 @@ export const ColorCore: React.FC = () => {
       e.preventDefault()
       try {
         const filament: Filament = JSON.parse(e.dataTransfer.getData('application/json'))
-        const firstDisabled = colorSliders.findIndex((s) => !s.enabled)
-        addActiveFilament(filament)
+        // Mirror addBand's own criterion for a reusable column: disabled AND
+        // never positioned. A disabled column that still has a layer is a
+        // deliberately hidden (eye-off) band — reusing it here clobbered its
+        // filament/TD/layer and silently re-enabled it instead of adding a
+        // new band.
+        const firstDisabled = colorSliders.findIndex((s) => !s.enabled && s.layer === 0)
+        if (!activeFilaments.some((f) => f.uuid === filament.uuid)) addActiveFilament(filament)
         if (firstDisabled >= 0) {
           const top = Math.max(0, ...colorSliders.filter((s) => s.enabled).map((s) => s.layer))
-          updateSlider(firstDisabled, { filament_uuid: filament.uuid, enabled: true, td: filament.td, layer: Math.min(sliderLayerRange.max, top + 5) || 5 })
+          const slot = colorSliders[firstDisabled]
+          const td = slot && slot.filament_uuid === filament.uuid ? slot.td : filament.td
+          updateSlider(firstDisabled, { filament_uuid: filament.uuid, enabled: true, td, layer: Math.min(sliderLayerRange.max, top + 5) || 5 })
         } else {
           // No free column (e.g. a fresh project): add a band instead of
           // overwriting the last one (or crashing on an empty stack).
@@ -373,7 +433,7 @@ export const ColorCore: React.FC = () => {
         // ignore
       }
     },
-    [colorSliders, updateSlider, addActiveFilament, sliderLayerRange.max],
+    [colorSliders, updateSlider, addActiveFilament, activeFilaments, sliderLayerRange.max],
   )
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -381,7 +441,7 @@ export const ColorCore: React.FC = () => {
     e.dataTransfer.dropEffect = 'copy'
   }, [])
 
-  const maxLayer = handles.length > 0 ? handles[handles.length - 1].value : 0
+  const maxLayer = displayMaxLayer
 
   // Hover shows the tooltip; so do keyboard focus and dragging.
   const tipIndex = draggingHandle ?? hoveredHandle ?? focusedHandle
@@ -465,7 +525,7 @@ export const ColorCore: React.FC = () => {
                     aria-valuemin={1}
                     aria-valuemax={sliderLayerRange.max}
                     className="absolute left-0 flex items-center cursor-grab active:cursor-grabbing select-none outline-none"
-                    style={{ top: `${yPos}px`, transform: 'translateY(-50%)', opacity: isOverlapDisabled ? 0.45 : 1, zIndex: (showLabel && !roomForLabel) || isLinked ? 30 : undefined }}
+                    style={{ top: `${yPos}px`, transform: 'translateY(-50%)', opacity: isOverlapDisabled ? 0.45 : 1, zIndex: (showLabel && !roomForLabel) || isLinked ? 30 : undefined, touchAction: 'none' }}
                     onMouseDown={handleMouseDown(idx)}
                     onMouseEnter={() => {
                       setHoveredHandle(idx)

@@ -62,7 +62,11 @@ def test_pruning_start_rejects_unfinished_job(client):
     svc.create_job({"iterations": 1}, job_id="still-running")
     svc.update_status("still-running", "running")
     resp = client.post("/api/pruning/start", json={"job_id": "still-running"})
-    assert resp.status_code == 400
+    # The GPU-mutex busy check (any non-terminal job, including this one)
+    # is now evaluated before the "target must be completed" check, so a
+    # still-running target is rejected as "busy" (409) rather than
+    # "not completed" (400).
+    assert resp.status_code == 409
 
 
 def test_pruning_of_result_without_pipeline_fails_cleanly(client):

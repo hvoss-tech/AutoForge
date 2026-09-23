@@ -1068,6 +1068,7 @@ class FilamentOptimizer:
         pruning_batch_size: int = 0,
         cancel_event: Optional[threading.Event] = None,
         pause_event: Optional[threading.Event] = None,
+        apply_spike_removal: bool = True,
     ) -> bool:
         """Run the pruning pipeline (optional seed search and height polish
         -> color -> swap -> layer -> swap-position -> spike removal).
@@ -1285,7 +1286,14 @@ class FilamentOptimizer:
         if _wait_if_paused():
             return False
 
-        if getattr(self.args, "spike_removal", False):
+        # `apply_spike_removal=False` lets a caller that repeats prune() in a
+        # loop (webui auto-repeat pruning) skip this on every intermediate
+        # pass and run it only once the loop has actually converged:
+        # cleaning up spikes after each pass, only to keep grinding the
+        # color/swap/layer counts down again next pass, wasted the work and
+        # (via allow_regression on the very first pass) paid its accuracy
+        # cost on results that were about to be superseded anyway.
+        if apply_spike_removal and getattr(self.args, "spike_removal", False):
             self._current_prune_phase = "Removing spikes"
             # Only the first prune of this result may trade accuracy for
             # printability; see post_remove_spikes. Without this, pruning the
