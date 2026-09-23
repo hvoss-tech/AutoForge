@@ -46,6 +46,21 @@ export function useElementHeight(ref: React.RefObject<HTMLElement>): number {
   return height
 }
 
+/** Width of an element, kept up to date. */
+export function useElementWidth(ref: React.RefObject<HTMLElement>): number {
+  const [width, setWidth] = useState(0)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const update = () => setWidth(el.clientWidth)
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [ref])
+  return width
+}
+
 /** Briefly true after `trigger()` — for pointing at the panel a click refers to. */
 export function useFlash(ms = 1200): [boolean, () => void] {
   const [on, setOn] = useState(false)

@@ -3,6 +3,7 @@ import { BookOpen, Check, ChevronLeft, ChevronRight, X } from 'lucide-react'
 import { useAppStore } from '../store/appStore'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
 import { LARGE_STL_SIZE_MM, NOTICEABLE_DETAIL_SIZE_MM } from '../lib/stlSize'
+import { DEFAULT_FOCUS_STRENGTH, MAX_FOCUS_STRENGTH, MIN_FOCUS_STRENGTH } from '../lib/focusMask'
 
 interface Step {
   id: string
@@ -54,6 +55,37 @@ export const TUTORIAL_STEPS: Step[] = [
           As soon as there's an image and one active filament, the right panel builds a quick 3D preview of the shape.
           That preview is just the heights — the colours come next.
         </p>
+      </>
+    ),
+  },
+  {
+    id: 'focus',
+    title: 'Optional · Mark what matters most',
+    body: (
+      <>
+        <p>
+          The optimizer spreads its effort over the whole picture. If some parts matter more than the rest — a face,
+          the eyes, some lettering — you can tell it so by painting <strong>focus areas</strong>.
+        </p>
+        <p>
+          Click <strong>Focus</strong> in the image panel and paint over those parts with the brush. Use{' '}
+          <strong>Erase</strong> (or press <strong>E</strong>) to take paint away, <strong>[</strong> and{' '}
+          <strong>]</strong> to change the brush size, scroll to zoom in for detail and right-drag to move around.
+          Press <strong>Done</strong> when you're finished — the focus areas are saved with the project and used from
+          the next run.
+        </p>
+        <p>
+          <strong>How much they count</strong> is up to you: the <em>Painted areas count … more</em> slider under the
+          picture goes from {MIN_FOCUS_STRENGTH}× to {MAX_FOCUS_STRENGTH}× (default {DEFAULT_FOCUS_STRENGTH}×) and
+          applies to all painted areas at once. The rest of the picture still counts, just less — so if the focus areas
+          still come out off, raise it; if the background suffers too much, lower it.
+        </p>
+        <p>
+          Not sure where to paint? After a run, switch the image panel to <strong>Differences</strong>: it lights up
+          where the print strays from the picture, brightest where it's furthest off. Paint the bright parts you care
+          about, and run again.
+        </p>
+        <p>Keep it to the few areas that really matter: painting everything is the same as painting nothing.</p>
       </>
     ),
   },

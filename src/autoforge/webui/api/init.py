@@ -22,6 +22,7 @@ from ..config import config
 from ..models import OptimizationSettings
 from ..services.filament_service import get_filament_service
 from ..services.optimization_service import get_optimization_service
+from ..services.image_service import get_image_service
 from ..helpers.pipeline_runner import build_init_preview, friendly_error_message
 from ..helpers.colored_mesh import generate_colored_preview_mesh
 from ..helpers.gpu_memory import release_pipeline_result
@@ -181,17 +182,20 @@ async def run_init(settings: OptimizationSettings):
                 _state = {"status": "idle", "preview_image": None, "error": None}
         raise HTTPException(400, "Upload an input image first.")
 
-    if not os.path.exists(input_image_path):
-        abs_path = os.path.join(config.uploads_path, input_image_path)
-        if os.path.exists(abs_path):
-            input_image_path = abs_path
-        else:
-            with _lock:
-                if _in_flight and _in_flight.get("generation") == my_gen:
-                    _in_flight = None
-                if _generation == my_gen:
-                    _state = {"status": "idle", "preview_image": None, "error": None}
-            raise HTTPException(404, f"Input image not found: {settings.input_image}")
+    # Only files under uploads/, resolved the same guarded way as
+    # /api/optimize/start. This used to try the name as a path first: any
+    # existing server path (absolute, or "../..") was accepted, and a file
+    # of the same name in the server's working directory (the repo ships an
+    # input.png) silently replaced the uploaded image in the preview.
+    resolved_path = get_image_service().get_path(input_image_path)
+    if resolved_path is None:
+        with _lock:
+            if _in_flight and _in_flight.get("generation") == my_gen:
+                _in_flight = None
+            if _generation == my_gen:
+                _state = {"status": "idle", "preview_image": None, "error": None}
+        raise HTTPException(404, f"Input image not found: {settings.input_image}")
+    input_image_path = resolved_path
 
     filament_dicts = [
         {"color": f.color, "td": f.td, "name": f"{f.brand} - {f.name}",
@@ -200,6 +204,10 @@ async def run_init(settings: OptimizationSettings):
         for f in active
     ]
     settings_dict = settings.model_dump()
+    # The preview only estimates heights; the focus-area mask weights the
+    # optimizer's loss and plays no part in it. It is also an uploads/ file
+    # name here, not a path the pipeline could open.
+    settings_dict["priority_mask"] = ""
 
     box: dict[str, Any] = {}
 

@@ -404,6 +404,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional path to a priority mask image (same dimensions as input image). Non-empty: apply weighted loss (0.1 outside, 1.0 at max inside).",
     )
+    parser.add_argument(
+        "--priority_mask_strength",
+        type=float,
+        default=10.0,
+        help="How many times more a fully white pixel of --priority_mask counts than a black one (>= 1; default 10).",
+    )
 
     args = parser.parse_args()
     return args
@@ -615,7 +621,22 @@ def _load_priority_mask(
             os.path.join(args.output_folder, "priority_mask_resized.png"),
             (pm_float * 255).astype(np.uint8),
         )
+        focus_map_full = focus_map_full * priority_mask_scale(
+            getattr(args, "priority_mask_strength", DEFAULT_PRIORITY_MASK_STRENGTH)
+        )
     return focus_map_full
+
+
+DEFAULT_PRIORITY_MASK_STRENGTH = 10.0
+
+
+def priority_mask_scale(strength: float) -> float:
+    """Factor for a 0..1 priority mask so a fully masked pixel counts
+    `strength` times an unmasked one under compute_loss's weighting
+    (0.1 + 0.9 * mask): (0.1 + 0.9 * k) / 0.1 = strength. The default
+    strength of 10 gives exactly 1, i.e. the mask as loaded."""
+    strength = max(1.0, float(strength))
+    return (strength - 1.0) / 9.0
 
 
 def _initialize_heightmap(

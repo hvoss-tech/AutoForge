@@ -10,6 +10,9 @@ interface FilamentSwatchProps {
   onClick?: () => void
   onDragStart?: (e: React.DragEvent) => void
   selected?: boolean
+  /** Print the TD value inside the swatch. Off where a TD column already
+   * shows it next to the swatch. */
+  showTd?: boolean
 }
 
 const sizeMap = {
@@ -25,6 +28,7 @@ export const FilamentSwatch: React.FC<FilamentSwatchProps> = ({
   onClick,
   onDragStart,
   selected = false,
+  showTd = true,
 }) => {
   const sizeStyle = sizeMap[size]
   const textColor = contrastTextColor(filament.color)
@@ -43,6 +47,7 @@ export const FilamentSwatch: React.FC<FilamentSwatchProps> = ({
         width: `${widthRem}px`,
         height: `${heightRem}px`,
         borderRadius: '4px',
+        boxShadow: 'inset 0 0 0 1px rgba(128,128,128,0.35)',
         overflow: 'hidden',
         flexShrink: 0,
       }}
@@ -50,7 +55,7 @@ export const FilamentSwatch: React.FC<FilamentSwatchProps> = ({
       onDragStart={onDragStart}
       onClick={onClick}
     >
-      {filament.td !== undefined && (
+      {showTd && filament.td !== undefined && (
         <span
           className={`font-mono font-bold ${sizeStyle.text}`}
           style={{ color: textColor }}

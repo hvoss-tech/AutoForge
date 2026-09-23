@@ -1009,7 +1009,8 @@ test.describe('Settings Modal', () => {
   })
 
   test('basic settings are shown; advanced ones are behind a toggle', async ({ page }) => {
-    for (const key of ['iterations', 'max_layers', 'layer_height', 'background_height', 'stl_output_size', 'background_color', 'auto_background_color', 'init_heightmap_method']) {
+    // With auto-pick on (the default), the base color shows what is picked, not a color well.
+    for (const key of ['iterations', 'max_layers', 'layer_height', 'background_height', 'stl_output_size', 'background_color-auto', 'auto_background_color', 'init_heightmap_method']) {
       await expect(page.locator(`[data-testid="setting-${key}"]`)).toBeVisible()
     }
     await expect(page.locator('[data-testid="setting-learning_rate"]')).toHaveCount(0)
@@ -1117,7 +1118,13 @@ test.describe('Settings Modal', () => {
     await expect(methodSelect.locator('option:checked')).toHaveText('Color clustering')
   })
 
-  test('color picker renders for background color', async ({ page }) => {
+  test('base color: automatic shows what is picked, Choose switches to a picker', async ({ page }) => {
+    // Auto-selection is on by default: no (misleading, disabled) color well.
+    await expect(page.locator('[data-testid="setting-background_color-auto"]')).toBeVisible()
+    await expect(page.locator('[data-testid="setting-background_color"]')).toHaveCount(0)
+    await page.locator('[data-testid="setting-background_color-choose"]').click()
+    await expect(page.locator('[data-testid="setting-auto_background_color"]')).toHaveAttribute('aria-checked', 'false')
+    await expect(page.locator('[data-testid="setting-base-filament"]')).toBeVisible()
     await expect(page.locator('[data-testid="setting-background_color"]')).toBeVisible()
   })
 

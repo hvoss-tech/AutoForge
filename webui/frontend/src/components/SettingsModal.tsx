@@ -5,6 +5,8 @@ import { NumberInput } from './ui/number-input'
 import type { OptimizationSettings as SettingsType } from '../types'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
 import { QUALITY_PRESETS, presetForIterations } from '../lib/settingsPresets'
+import { FilamentPicker } from './FilamentPicker'
+import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 
 type FieldType = 'number' | 'boolean' | 'select' | 'color'
 
@@ -29,7 +31,7 @@ const BASIC_FIELDS: Field[] = [
   { key: 'background_height', label: 'Base height', unit: 'mm', help: 'Solid base printed in the background color before any color layer.', type: 'number', step: 0.01, min: 0 },
   { key: 'stl_output_size', label: 'Size', unit: 'mm', help: 'Length of the longest side of the print.', type: 'number', step: 1, min: 10, integer: true },
   { key: 'auto_background_color', label: 'Pick base color automatically', help: 'Let the optimizer choose the base color from your filaments. Turn off to set it yourself.', type: 'boolean' },
-  { key: 'background_color', label: 'Base color', help: 'Used when the base color is not picked automatically.', type: 'color' },
+  { key: 'background_color', label: 'Base color', help: 'The filament the solid base is printed in.', type: 'color' },
   {
     key: 'init_heightmap_method',
     label: 'Height estimate',
@@ -66,6 +68,10 @@ export const SettingsModal: React.FC = () => {
   const setSettings = useAppStore((s) => s.setSettings)
   const currentJob = useAppStore((s) => s.currentJob)
   const requestConfirm = useAppStore((s) => s.requestConfirm)
+  const resolvedBase = useAppStore((s) => s.resolvedBase)
+  const setBaseFilament = useAppStore((s) => s.setBaseFilament)
+  const knownFilaments = useAppStore((s) => s.filaments)
+  const activeFilaments = useAppStore((s) => s.activeFilaments)
   const [advancedOpen, setAdvancedOpen] = React.useState(() => {
     try {
       return localStorage.getItem(ADVANCED_KEY) === '1'
@@ -102,6 +108,76 @@ export const SettingsModal: React.FC = () => {
   const jobActive = !!currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
   const activePreset = presetForIterations(settings.iterations)
 
+  /** The base color, as what it is: automatic (showing what was picked, or
+   * that it's picked at the next run), or a filament/custom color you chose.
+   * A disabled black color well on a dark dialog read as "the base is
+   * black" when auto-selection was on. */
+  const renderBaseColor = () => {
+    if (settings.auto_background_color) {
+      const pickedUuid = resolvedBase?.auto ? effectiveBaseFilamentUuid(resolvedBase) : ''
+      const picked = pickedUuid ? [...activeFilaments, ...knownFilaments].find((f) => f.uuid === pickedUuid) : undefined
+      const pickedColor = resolvedBase?.auto ? resolvedBase.color : null
+      return (
+        <div className="flex items-center gap-2 min-h-7 px-2 py-1 rounded border border-dashed border-gray-600 text-xs" data-testid="setting-background_color-auto">
+          {pickedColor ? (
+            <>
+              <span className="w-4 h-4 rounded-full border border-gray-500 flex-shrink-0" style={{ backgroundColor: pickedColor }} />
+              <span className="text-gray-200 truncate" title={picked ? `${picked.brand} · ${picked.name}` : pickedColor}>{picked ? picked.name : pickedColor}</span>
+              <span className="text-gray-500 truncate">picked for this picture</span>
+            </>
+          ) : (
+            <span className="text-gray-400">Picked when you run — the filament closest to the picture's main color</span>
+          )}
+          <button
+            // Start from what auto-selection picked, so switching to manual
+            // doesn't suddenly change the base to some other color.
+            onClick={() => (picked ? setBaseFilament(picked) : updateSetting('auto_background_color', false))}
+            className="ml-auto flex-shrink-0 text-blue-400 hover:text-blue-300 hover:underline"
+            data-testid="setting-background_color-choose"
+          >
+            Choose
+          </button>
+        </div>
+      )
+    }
+    // A base chosen by color (or restored from a result) still gets its
+    // filament's name when one in the library has exactly that color.
+    const manualUuid =
+      (resolvedBase && !resolvedBase.auto ? effectiveBaseFilamentUuid(resolvedBase) : '') ||
+      [...activeFilaments, ...knownFilaments].find((f) => f.color.toLowerCase() === (settings.background_color || '').toLowerCase())?.uuid ||
+      ''
+    return (
+      <div className="flex items-center gap-2 min-w-0" data-testid="setting-background_color-manual">
+        <div className="flex-1 min-w-0 px-2 py-0.5 rounded border border-gray-600 bg-gray-800 hover:border-gray-500">
+          <FilamentPicker
+            value={manualUuid}
+            fallbackColor={settings.background_color}
+            onChange={setBaseFilament}
+            label="Filament for the base"
+            testId="setting-base-filament"
+          />
+        </div>
+        <span className="text-[11px] text-gray-500 flex-shrink-0">or custom</span>
+        <input
+          id="setting-background_color"
+          type="color"
+          value={settings.background_color}
+          onChange={(e) => {
+            // A custom color belongs to no filament; the base row and the
+            // print plan read the resolved base first, so it follows too.
+            const color = e.target.value
+            if (resolvedBase) useAppStore.setState({ resolvedBase: { ...resolvedBase, color, filament_uuid: '', auto: false } })
+            updateSetting('background_color', color)
+          }}
+          className="w-9 h-7 rounded cursor-pointer flex-shrink-0 bg-transparent"
+          title="A custom color that isn't in your library"
+          aria-label="Custom base color"
+          data-testid="setting-background_color"
+        />
+      </div>
+    )
+  }
+
   const renderField = (field: Field, showHelp: boolean) => (
     <div key={field.key} className="flex flex-col gap-1">
       <label className="flex items-center gap-1 text-xs text-gray-300" htmlFor={`setting-${field.key}`}>
@@ -136,13 +212,14 @@ export const SettingsModal: React.FC = () => {
             <option key={opt.value} value={opt.value}>{opt.label}</option>
           ))}
         </select>
+      ) : field.key === 'background_color' ? (
+        renderBaseColor()
       ) : field.type === 'color' ? (
         <input
           id={`setting-${field.key}`}
           type="color"
           value={settings[field.key] as string}
           onChange={(e) => updateSetting(field.key, e.target.value)}
-          disabled={field.key === 'background_color' && settings.auto_background_color}
           className="w-12 h-7 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
           data-testid={`setting-${field.key}`}
         />

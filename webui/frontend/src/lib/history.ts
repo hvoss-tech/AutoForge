@@ -2,6 +2,18 @@ import type { JobStatus, Snapshot } from '../types'
 
 export const ACTIVE_JOB_STATUSES: ReadonlyArray<string> = ['pending', 'running', 'paused']
 
+/** Whether slider edits must not be re-rendered on the server right now.
+ * While an optimization runs its broadcasts are the rendered state; while
+ * pruning runs it rewrites the result's optimizer in place — a render then
+ * read that optimizer mid-mutation, once for every pass it broadcast. */
+export function sliderRenderPaused(
+  currentJob: { status: string } | null | undefined,
+  pruningJob: { status: string } | null | undefined,
+): boolean {
+  return (!!currentJob && ACTIVE_JOB_STATUSES.includes(currentJob.status))
+    || (!!pruningJob && ACTIVE_JOB_STATUSES.includes(pruningJob.status))
+}
+
 /** The image a history snapshot belongs to.
  *
  * `settings.input_image` is the authority — it is the file the server would
@@ -201,6 +213,8 @@ const SETTING_NAMES: Record<string, string> = {
   num_init_cluster_layers: 'cluster layers',
   init_heightmap_method: 'heightmap method',
   processing_reduction_factor: 'processing reduction',
+  priority_mask: 'focus areas',
+  priority_mask_strength: 'focus strength',
 }
 
 /** Plain-language name of a settings key ("layer height"). */

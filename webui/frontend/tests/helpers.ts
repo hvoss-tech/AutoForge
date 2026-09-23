@@ -1,7 +1,12 @@
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
 import { cleanupTestFilaments, resetProjectState } from './reset-state'
+
+/** Where the isolated test server looks for HueForge's personal library
+ * (see tests/test-server.mjs). Absent unless a spec writes it. */
+export const HUEFORGE_TEST_LIBRARY = path.join(os.tmpdir(), 'autoforge-webui-e2e-hueforge', 'personal_library.json')
 
 export const FIXTURE_IMAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'cat_128x72.png')
 

@@ -57,6 +57,10 @@ The easiest way to use AutoForge is the web UI — a local app (like ComfyUI) wi
 
    This starts the server and opens the web UI in your browser automatically (usually at `http://localhost:8000`).
 
+   To make some parts of the picture come out closer than the rest (a face, the eyes, lettering), click **Focus** in the image panel and paint over them; a slider sets how much more they count (2× to 100×, default 10×). After a run, the **Differences** view shows where the print strays furthest from the picture.
+
+   If HueForge is installed on the same computer, the web UI finds your HueForge personal filament library and offers to import it once, on its first start. It is always available afterwards as the highlighted option under **Import** in the filament library. It looks in `%APPDATA%\HueForge\Filaments\personal_library.json` on Windows, `~/Library/Application Support/HueForge/Filaments/` on macOS and `~/.local/share/HueForge/Filaments/` on Linux; set `AUTOFORGE_WEBUI_HUEFORGE_LIBRARY` to use a different file.
+
    The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports — unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace — so bugs can get fixed faster. No image data, filament data, or personal information is sent. To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
 4. **Update to the latest release** whenever you want, from the project folder:
    - Linux/macOS: `./update.sh`
@@ -162,6 +166,8 @@ This will generate separate STL files for each color, allowing you to print face
 - `--nozzle_diameter` Diameter of the printer nozzle in millimeters (default: 0.4).  
   **Note:** Details smaller than half this value will be ignored.
 - `--early_stopping` Number of steps without improvement before stopping (default: 10000).
+- `--priority_mask` *(Optional)* Path to a greyscale image the size of the input that marks the parts that matter most: white areas are matched more closely, black areas still count, just less.
+- `--priority_mask_strength` How many times more a white pixel of `--priority_mask` counts than a black one (default: 10; must be at least 1). Raise it if the marked areas still come out off, lower it for a gentler nudge.
 
 - `--flatforge` Enable FlatForge mode to generate separate STL files for each color (default: False).  
   **Note:** FlatForge creates flat prints where each color is its own STL file, allowing face-down printing for smooth, resin-like finishes. Requires a multi-material printer (AMS, MMU, or tool changer).

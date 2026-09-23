@@ -17,6 +17,10 @@ export function useJobWebSocket(jobId: string | null) {
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const mountedRef = useRef(true)
   const setCurrentJob = useAppStore((s) => s.setCurrentJob)
+  const setServerConnection = useAppStore((s) => s.setServerConnection)
+  // "Try again" on the connection-lost banner: reconnect from scratch, with
+  // a fresh reconnect budget.
+  const retryNonce = useAppStore((s) => s.connectionRetryNonce)
 
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current) {
@@ -32,18 +36,31 @@ export function useJobWebSocket(jobId: string | null) {
         try {
           const response = await fetch(`/api/optimize/status/${polledJobId}`)
           if (!mountedRef.current) return
+          // The server is back but doesn't know this job: it was restarted,
+          // and the run died with the old process. Polling on would leave
+          // the progress bar frozen forever.
+          if (response.status === 404) {
+            stopPolling()
+            setServerConnection('ok')
+            setCurrentJob(null)
+            useAppStore.getState().pushToast('The server was restarted and this run was lost. Press Run to start it again.', 'warning')
+            return
+          }
           if (!response.ok) return
           const data: JobStatus = await response.json()
+          setServerConnection('ok')
           setCurrentJob(data)
           if (['completed', 'failed', 'cancelled'].includes(data.status)) {
             stopPolling()
           }
         } catch {
-          // Transient network error — keep polling, same as before.
+          // Unreachable: keep polling (it may come back), but say so — a
+          // progress bar that silently stops moving looked like a slow run.
+          if (mountedRef.current) setServerConnection('lost')
         }
       }, POLL_FALLBACK_INTERVAL)
     },
-    [setCurrentJob, stopPolling]
+    [setCurrentJob, setServerConnection, stopPolling]
   )
 
   const connect = useCallback(() => {
@@ -71,7 +88,6 @@ export function useJobWebSocket(jobId: string | null) {
     let closeHandled = false
 
     ws.onopen = () => {
-      reconnectAttemptsRef.current = 0
       stopPolling()
     }
 
@@ -98,6 +114,12 @@ export function useJobWebSocket(jobId: string | null) {
         // who just clicked Run is likely looking. A toast surfaces the
         // same failure (including an OOM's message) regardless of what's
         // currently on screen.
+        // Only a status that actually arrives proves the server is back: a
+        // socket that opens and drops again straight away (a server going
+        // down, or restarting in a loop) must use up the reconnect budget,
+        // not reset it on every open.
+        reconnectAttemptsRef.current = 0
+        setServerConnection('ok')
         const previousStatus = useAppStore.getState().currentJob?.status
         if (data.status === 'failed' && previousStatus !== 'failed') {
           // Only the summary line(s) — friendly_error_message() (backend)
@@ -127,6 +149,7 @@ export function useJobWebSocket(jobId: string | null) {
       if (!mountedRef.current) return
       if (intentionalClose) return
       if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+        setServerConnection('reconnecting')
         const delay = Math.min(
           Math.pow(2, reconnectAttemptsRef.current) * BASE_RECONNECT_DELAY,
           10000
@@ -137,20 +160,26 @@ export function useJobWebSocket(jobId: string | null) {
         }, delay)
       } else {
         // Reconnects exhausted: don't leave the progress bar frozen with no
-        // feedback for the rest of a long run — poll instead.
+        // feedback for the rest of a long run — poll instead, and tell the
+        // user the server can't be reached (it most likely stopped). The
+        // first successful poll clears this again.
+        setServerConnection('lost')
         startPolling(currentJobId)
       }
     }
 
     ws.onclose = handleClose
     ws.onerror = handleClose
-  }, [jobId, setCurrentJob, startPolling, stopPolling])
+  }, [jobId, setCurrentJob, setServerConnection, startPolling, stopPolling])
 
   useEffect(() => {
     mountedRef.current = true
+    reconnectAttemptsRef.current = 0
     connect()
     return () => {
       mountedRef.current = false
+      // Nothing is being followed any more, so nothing is disconnected.
+      useAppStore.getState().setServerConnection('ok')
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current)
         reconnectTimerRef.current = null
@@ -164,7 +193,7 @@ export function useJobWebSocket(jobId: string | null) {
         wsRef.current = null
       }
     }
-  }, [jobId, connect, stopPolling])
+  }, [jobId, connect, stopPolling, retryNonce])
 
   return wsRef.current
 }

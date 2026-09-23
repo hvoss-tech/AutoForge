@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { Minus, Plus } from 'lucide-react'
 import { useAppStore } from '../store/appStore'
 import type { Filament } from '../types'
-import { filterActiveHandles } from '../lib/colorStack'
+import { FULL_HANDLE_SPACING, compactHandleHeight, filterActiveHandles, nearestNeighborGaps } from '../lib/colorStack'
 import { getPlanBands } from '../lib/printPlan'
 
 interface HandleData {
@@ -457,6 +457,13 @@ export const ColorCore: React.FC = () => {
     : undefined
   const tipRect = tipIndex !== null ? handleRefs.current.get(tipIndex)?.getBoundingClientRect() : undefined
 
+  // Distance from each handle to its nearest neighbour, in pixels. With
+  // dozens of bands the full arrow handles stacked into an unreadable pile;
+  // where they don't fit, a slim marker is drawn instead, and the one
+  // being pointed at, selected or dragged grows back to full size on top.
+  const handleGaps = nearestNeighborGaps(handles.map((h) => layerToY(h.value)))
+  const anyCompact = handleGaps.some((g) => g < FULL_HANDLE_SPACING)
+
   const zoomButton = 'p-0.5 rounded text-gray-400 hover:text-gray-100 hover:bg-gray-700 disabled:opacity-30 disabled:hover:bg-transparent'
 
   return (
@@ -480,7 +487,14 @@ export const ColorCore: React.FC = () => {
           <button onClick={() => setZoom(1)} className="text-[10px] text-gray-400 tabular-nums hover:text-gray-100" title="Reset zoom" data-testid="color-core-zoom-level">
             {zoom.toFixed(zoom < 10 && zoom % 1 ? 1 : 0)}×
           </button>
-          <button onClick={() => setZoom((z) => Math.min(MAX_ZOOM, z * 1.5))} disabled={zoom >= MAX_ZOOM} className={zoomButton} aria-label="Zoom in the color column" data-testid="color-core-zoom-in">
+          <button
+            onClick={() => setZoom((z) => Math.min(MAX_ZOOM, z * 1.5))}
+            disabled={zoom >= MAX_ZOOM}
+            className={`${zoomButton} ${anyCompact && zoom < MAX_ZOOM ? 'text-cyan-400' : ''}`}
+            title={anyCompact ? 'Bands are packed tightly here — zoom in to grab them one by one' : 'Zoom in'}
+            aria-label="Zoom in the color column"
+            data-testid="color-core-zoom-in"
+          >
             <Plus className="w-3 h-3" />
           </button>
         </div>
@@ -508,7 +522,9 @@ export const ColorCore: React.FC = () => {
                 // or for the handle being hovered/dragged.
                 const neighbors = [handles[idx - 1], handles[idx + 1]].filter(Boolean).map((h) => Math.abs(layerToY(h.value) - yPos))
                 const roomForLabel = neighbors.every((d) => d >= MIN_LABEL_SPACING)
-                const showLabel = roomForLabel || isFocused || isLinked || hoveredHandle === idx || draggingHandle === idx
+                const active = isFocused || isLinked || hoveredHandle === idx || draggingHandle === idx
+                const showLabel = roomForLabel || active
+                const compact = handleGaps[idx] < FULL_HANDLE_SPACING && !active
                 const info = bandInfo.get(handle.storeIndex)
 
                 return (
@@ -524,8 +540,8 @@ export const ColorCore: React.FC = () => {
                     aria-valuenow={handle.value}
                     aria-valuemin={1}
                     aria-valuemax={sliderLayerRange.max}
-                    className="absolute left-0 flex items-center cursor-grab active:cursor-grabbing select-none outline-none"
-                    style={{ top: `${yPos}px`, transform: 'translateY(-50%)', opacity: isOverlapDisabled ? 0.45 : 1, zIndex: (showLabel && !roomForLabel) || isLinked ? 30 : undefined, touchAction: 'none' }}
+                    className={`absolute flex items-center cursor-grab active:cursor-grabbing select-none outline-none ${compact ? 'right-1.5' : 'left-0'}`}
+                    style={{ top: `${yPos}px`, transform: 'translateY(-50%)', opacity: isOverlapDisabled ? 0.45 : 1, zIndex: active ? 30 : undefined, touchAction: 'none' }}
                     onMouseDown={handleMouseDown(idx)}
                     onMouseEnter={() => {
                       setHoveredHandle(idx)
@@ -543,9 +559,17 @@ export const ColorCore: React.FC = () => {
                     data-layer={handle.value}
                     data-selected={handle.storeIndex === selectedBand || undefined}
                     data-overlap-disabled={isOverlapDisabled || undefined}
+                    data-compact={compact || undefined}
                   >
-                    {/* The border and outline keep white and black handles
-                        visible against both the dark panel and the track. */}
+                    {compact ? (
+                      <div
+                        className="w-5 rounded-l-sm border border-black/60 outline outline-1 outline-white/20"
+                        style={{ height: compactHandleHeight(handleGaps[idx]), backgroundColor: handle.color }}
+                        data-testid={`color-core-marker-${idx}`}
+                      />
+                    ) : (
+                    /* The border and outline keep white and black handles
+                       visible against both the dark panel and the track. */
                     <div
                       className={`flex items-center pl-1 pr-0.5 py-0.5 rounded-l text-xs font-mono font-bold shadow transition-all border border-black/50 outline outline-1 outline-white/25 ${
                         isFocused ? 'ring-2 ring-white ring-offset-1 ring-offset-gray-800' : isLinked ? 'ring-2 ring-cyan-400' : ''
@@ -561,6 +585,7 @@ export const ColorCore: React.FC = () => {
                         <polygon points="12,7 0,0 0,14" fill={readableTextColor(handle.color)} />
                       </svg>
                     </div>
+                    )}
                   </div>
                 )
               })}

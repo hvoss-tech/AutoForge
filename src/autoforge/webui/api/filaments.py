@@ -1,7 +1,14 @@
+import json
+import os
 from typing import Optional
 from fastapi import APIRouter, HTTPException
+from ..config import config
 from ..models import Filament
-from ..services.filament_service import get_filament_service
+from ..services.filament_service import (
+    get_filament_service,
+    looks_like_filament,
+    normalize_filament_record,
+)
 
 router = APIRouter()
 
@@ -93,7 +100,48 @@ async def import_csv(body: dict | None = None, contents: str | None = None, mode
         raise HTTPException(400, "Empty contents")
     if mode not in ("merge", "replace"):
         raise HTTPException(400, "mode must be 'merge' or 'replace'")
-    result = svc.import_csv(contents, mode=mode)
+    try:
+        result = svc.import_csv(contents, mode=mode)
+    except ValueError as e:
+        # A row the Filament model rejects (e.g. a color that isn't hex) —
+        # parsing happens before the library is touched, so nothing changed.
+        raise HTTPException(400, f"The CSV has an invalid row: {_first_error_line(e)}")
+    return {
+        "status": "ok",
+        "message": f"Imported {len(result)} filaments" + (" (library replaced)" if mode == "replace" else ""),
+        "count": len(result),
+    }
+
+
+def _first_error_line(e: ValueError) -> str:
+    lines = str(e).splitlines()
+    return " ".join(s.strip() for s in (lines[1:3] or lines[:1]))
+
+
+def _import_filament_records(data, mode: str) -> dict:
+    """Validate every record, then import them all (or nothing)."""
+    svc = get_filament_service()
+    if mode not in ("merge", "replace"):
+        raise HTTPException(400, "mode must be 'merge' or 'replace'")
+    # HueForge's personal_library.json is {"Filaments": [...]}, which is what
+    # the CLI's --json_file reads.
+    if isinstance(data, dict):
+        data = data.get("Filaments", data.get("filaments", [data]))
+    if not isinstance(data, list) or not data:
+        raise HTTPException(400, "No filaments found in that file.")
+    for i, item in enumerate(data):
+        if not isinstance(item, dict) or not looks_like_filament(item):
+            # Filament(**item) accepts any dict (unknown keys are ignored),
+            # so a wrapper object or an unrelated JSON file used to import as
+            # a nameless white filament and report success.
+            raise HTTPException(400, f"Entry {i + 1} is not a filament (no brand, name, color or TD).")
+        try:
+            Filament(**normalize_filament_record(item))
+        except ValueError as e:
+            # Validate everything before touching the library, so a bad
+            # entry can't leave a "replace" half-applied (or crash with 500).
+            raise HTTPException(400, f"Entry {i + 1} is not a valid filament: {_first_error_line(e)}")
+    result = svc.import_json(data, mode=mode)
     return {
         "status": "ok",
         "message": f"Imported {len(result)} filaments" + (" (library replaced)" if mode == "replace" else ""),
@@ -102,24 +150,58 @@ async def import_csv(body: dict | None = None, contents: str | None = None, mode
 
 
 @router.post("/import-json")
-async def import_json(data: list[dict], mode: str = "merge"):
-    svc = get_filament_service()
-    if mode not in ("merge", "replace"):
-        raise HTTPException(400, "mode must be 'merge' or 'replace'")
-    for i, item in enumerate(data):
-        try:
-            Filament(**item)
-        except ValueError as e:
-            # Validate everything before touching the library, so a bad
-            # entry can't leave a "replace" half-applied (or crash with 500).
-            first = str(e).splitlines()[1:3]
-            raise HTTPException(400, f"Entry {i + 1} is not a valid filament: {' '.join(s.strip() for s in first)}")
-    result = svc.import_json(data, mode=mode)
+async def import_json(data: list[dict] | dict, mode: str = "merge"):
+    return _import_filament_records(data, mode)
+
+
+def _read_hueforge_library() -> tuple[str | None, list | None, str | None]:
+    """(path, filaments, error). ``filaments`` is None when the file is
+    missing or unreadable; ``error`` says why for a file that exists."""
+    path = config.hueforge_library_path
+    if not path or not os.path.isfile(path):
+        return path, None, None
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return path, None, f"HueForge's library file could not be read: {e}"
+    records = data.get("Filaments") if isinstance(data, dict) else data
+    if not isinstance(records, list):
+        return path, None, "HueForge's library file has no filament list."
+    return path, records, None
+
+
+@router.get("/hueforge-library")
+def hueforge_library():
+    """Whether HueForge's personal filament library exists on this machine
+    (the server's — the webui normally runs where HueForge is installed),
+    and whether the one-time startup offer to import it was made yet."""
+    path, records, error = _read_hueforge_library()
     return {
-        "status": "ok",
-        "message": f"Imported {len(result)} filaments" + (" (library replaced)" if mode == "replace" else ""),
-        "count": len(result),
+        "found": records is not None,
+        "path": path,
+        "count": len(records) if records is not None else 0,
+        "error": error,
+        "offered": get_filament_service().hueforge_offered(),
     }
+
+
+@router.post("/hueforge-library/offered")
+def mark_hueforge_library_offered():
+    get_filament_service().mark_hueforge_offered()
+    return {"ok": True}
+
+
+@router.post("/import-hueforge")
+def import_hueforge(mode: str = "merge"):
+    path, records, error = _read_hueforge_library()
+    if error:
+        raise HTTPException(400, error)
+    if records is None:
+        raise HTTPException(404, "HueForge's personal filament library was not found on this computer.")
+    result = _import_filament_records(records, mode)
+    get_filament_service().mark_hueforge_offered()
+    return result
 
 
 @router.get("/has-custom-library")

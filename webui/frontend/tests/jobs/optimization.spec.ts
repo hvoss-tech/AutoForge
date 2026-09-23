@@ -40,7 +40,9 @@ test('a run from the UI: progress, result view, and a single history step for it
   const labelsBefore = await historyLabels(page)
 
   await byTestId(page, 'top-start-btn').click()
-  await expect(byTestId(page, 'job-iteration-count').or(byTestId(page, 'three-d-view'))).toBeVisible({ timeout: 30000 })
+  // The iteration count itself is only shown on very wide screens (it's in
+  // the progress details); the progress chip is always there.
+  await expect(byTestId(page, 'job-progress').or(byTestId(page, 'three-d-view'))).toBeVisible({ timeout: 30000 })
 
   // One optimization at a time.
   const second = await request.post('/api/optimize/start', { data: { input_image: 'x.png' } })
@@ -62,6 +64,12 @@ test('a run from the UI: progress, result view, and a single history step for it
   await expect(byTestId(page, 'image-view-split')).toHaveAttribute('aria-pressed', 'true')
   await expect(byTestId(page, 'result-image')).toBeVisible()
   await expect.poll(() => byTestId(page, 'result-image').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0)
+  // The Differences view compares the result with the picture and says how close it is.
+  await byTestId(page, 'image-view-difference').click()
+  await expect(byTestId(page, 'difference-summary')).toBeVisible({ timeout: 15000 })
+  expect(Number(await byTestId(page, 'difference-summary').getAttribute('data-mean'))).toBeGreaterThan(0)
+  await expect.poll(() => byTestId(page, 'difference-image').evaluate((c: HTMLCanvasElement) => c.width)).toBeGreaterThan(0)
+  await byTestId(page, 'image-view-split').click()
   for (const id of ['view-top-btn', 'view-angled-btn', 'view-reset-btn']) await byTestId(page, id).click()
   await expect(byTestId(page, 'workflow-step-export')).toHaveAttribute('data-state', 'current')
   // The print plan reflects the optimizer's stack.
@@ -226,7 +234,8 @@ test('pause, resume and cancel from the UI', async ({ page, request }) => {
 
   await byTestId(page, 'top-start-btn').click()
   await expect(byTestId(page, 'top-pause-btn')).toBeVisible({ timeout: 30000 })
-  await expect(byTestId(page, 'job-iteration-count')).toBeVisible()
+  await expect(byTestId(page, 'job-progress')).toBeVisible()
+  await expect(byTestId(page, 'job-iteration-count')).toHaveText(/^\(\d+\/\d+\)$/)
 
   await byTestId(page, 'top-pause-btn').click()
   await expect(byTestId(page, 'top-resume-btn')).toBeVisible()

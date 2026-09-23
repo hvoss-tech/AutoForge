@@ -68,6 +68,9 @@ async def start_optimization(settings: OptimizationSettings):
     input_image_path = settings_dict.get("input_image", "")
     if not input_image_path:
         raise HTTPException(400, "Upload an input image before running optimization.")
+    base_error = settings.base_height_error()
+    if base_error:
+        raise HTTPException(400, base_error)
 
     filament_dicts = [
         {"color": f.color, "td": f.td, "name": f"{f.brand} - {f.name}",
@@ -133,6 +136,21 @@ async def start_optimization(settings: OptimizationSettings):
                 svc.update_status(job.job_id, "failed", error=err)
                 return
             input_image_path = resolved_path
+
+            # The focus-area mask painted in the image panel is uploaded like
+            # an image and referenced by its uploads/ file name. Resolve it the
+            # same guarded way: only files under uploads/ are accepted.
+            run_settings = dict(settings_dict)
+            mask_name = run_settings.get("priority_mask") or ""
+            if mask_name:
+                mask_path = get_image_service().get_path(mask_name)
+                if mask_path is None:
+                    err = (f"Focus-area mask not found: {mask_name}. "
+                           "Clear the focus areas in the image panel, or paint them again.")
+                    logger.error(err)
+                    svc.update_status(job.job_id, "failed", error=err)
+                    return
+                run_settings["priority_mask"] = mask_path
 
             logger.info("Optimization starting: image=%s, filaments=%d, iters=%d",
                         input_image_path, len(filament_dicts), settings.iterations)
@@ -202,7 +220,7 @@ async def start_optimization(settings: OptimizationSettings):
                 input_image_path=input_image_path,
                 active_filaments=filament_dicts,
                 output_dir=output_dir,
-                settings=settings_dict,
+                settings=run_settings,
                 preview_callback=_preview_callback,
                 progress_callback=_progress_callback,
                 cancel_event=cancel_event,

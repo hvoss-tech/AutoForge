@@ -9,6 +9,10 @@ from ..helpers.gpu_memory import release_pipeline_result
 
 TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
+# Key in a pipeline result dict naming the job whose solution its optimizer
+# currently holds — see get_pipeline_result.
+OWNER_KEY = "_owner_job_id"
+
 # Cap on retained *terminal* job records (mirrors ProjectService.MAX_SNAPSHOTS).
 # Without this, _results/history.json grew by one entry per finished job
 # forever, and _save_history() rewrites the whole file on every completion.
@@ -103,6 +107,7 @@ class OptimizationService:
                 self._pipeline_results.pop(jid, None)
             previous = self._pipeline_results.get(job_id)
             self._pipeline_results[job_id] = result
+            result[OWNER_KEY] = job_id
         # Outside the lock: releasing touches the GPU and can block, and no
         # other call needs to wait for that to read an unrelated job.
         for _jid, res in stale:
@@ -111,8 +116,33 @@ class OptimizationService:
             release_pipeline_result(previous)
 
     def get_pipeline_result(self, job_id: str) -> dict | None:
+        """The live pipeline result for ``job_id`` — only while its
+        optimizer still holds *that job's* solution.
+
+        Pruning mutates the one optimizer in place and then aliases it under
+        the prune job's id, so the job it started from kept resolving to the
+        same, now-pruned optimizer: undoing back to the unpruned result and
+        editing a color re-rendered the *pruned* heights into the unpruned
+        job's folder, its slider/base lookups answered with pruned data, and
+        pruning it "again" started from the already-pruned solution. Once
+        another job has claimed the optimizer (see claim_pipeline_result),
+        the older id gets nothing, exactly like a result lost to a restart.
+        """
         with self._lock:
-            return self._pipeline_results.get(job_id)
+            result = self._pipeline_results.get(job_id)
+            if result and result.get(OWNER_KEY, job_id) != job_id:
+                return None
+            return result
+
+    def claim_pipeline_result(self, new_owner_job_id: str, job_id: str) -> dict | None:
+        """Hand ``job_id``'s result over to ``new_owner_job_id`` before
+        mutating it (pruning). Returns the result, or None when ``job_id``
+        doesn't currently own one."""
+        with self._lock:
+            result = self.get_pipeline_result(job_id)
+            if result is not None:
+                result[OWNER_KEY] = new_owner_job_id
+            return result
 
     def alias_pipeline_result(self, new_job_id: str, existing_job_id: str) -> None:
         """Make ``new_job_id`` resolve to the same live pipeline result as
@@ -136,6 +166,7 @@ class OptimizationService:
             result = self._pipeline_results.get(existing_job_id)
             if result is not None:
                 self._pipeline_results[new_job_id] = result
+                result[OWNER_KEY] = new_job_id
 
     def clear_pipeline_result(self, job_id: str):
         with self._lock:

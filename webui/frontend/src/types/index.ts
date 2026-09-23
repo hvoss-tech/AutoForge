@@ -62,6 +62,8 @@ export interface OptimizationSettings {
   cap_layers: number
   init_heightmap_method: string
   priority_mask: string
+  /** How many times more a painted focus-area pixel counts (2–100 in the UI). */
+  priority_mask_strength: number
   visualize: boolean
 }
 

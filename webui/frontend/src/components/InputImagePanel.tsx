@@ -3,13 +3,49 @@ import { useAppStore } from '../store/appStore'
 import { describeApiError } from '../lib/apiError'
 import { IDENTITY_ZOOM, zoomAt, type ZoomTransform } from '../lib/layout'
 import { onUiCommand } from '../lib/uiEvents'
-import { useFlash } from '../hooks/usePersistentState'
-import { AlertTriangle, Image as ImageIcon, RefreshCw, Upload, X, ZoomIn } from 'lucide-react'
+import { useElementWidth, useFlash, usePersistentState } from '../hooks/usePersistentState'
+import { type ImageView as View } from '../store/appStore'
+import {
+  AlertTriangle,
+  Brush,
+  Check,
+  Columns2,
+  Crosshair,
+  Eraser,
+  Flame,
+  Image as ImageIcon,
+  Layers,
+  Loader2,
+  RefreshCw,
+  SplitSquareHorizontal,
+  Trash2,
+  Upload,
+  X,
+  ZoomIn,
+} from 'lucide-react'
+import { FocusMaskOverlay, useFocusMask, type FocusTool } from './FocusMask'
+import { DifferenceImage, DifferenceLegend, useDifferenceMap } from './DifferenceView'
+import { DEFAULT_FOCUS_STRENGTH, sliderFromStrength, strengthFromSlider } from '../lib/focusMask'
 
-type View = 'original' | 'result' | 'split' | 'compare'
-
-const VIEW_LABELS: Record<View, string> = { original: 'Original', result: 'Result', split: 'Side by side', compare: 'Compare' }
-const VIEW_HINTS: Partial<Record<View, string>> = { compare: 'One image with a divider you can drag' }
+const VIEWS: View[] = ['original', 'result', 'split', 'compare', 'difference']
+const VIEW_LABELS: Record<View, string> = { original: 'Original', result: 'Result', split: 'Side by side', compare: 'Compare', difference: 'Differences' }
+const VIEW_HINTS: Record<View, string> = {
+  original: 'The picture you uploaded',
+  result: 'What the print will look like',
+  split: 'Picture and result next to each other',
+  compare: 'One image with a divider you can drag',
+  difference: 'Where the print differs from the picture — bright areas differ most',
+}
+const VIEW_ICONS: Record<View, React.FC<{ className?: string }>> = {
+  original: ImageIcon,
+  result: Layers,
+  split: Columns2,
+  compare: SplitSquareHorizontal,
+  difference: Flame,
+}
+/** Header width from which every view button shows its label (below it,
+ * icons only, except the selected one). */
+const WIDE_HEADER = 640
 
 /** Wheel to zoom (about the cursor), drag to pan, double-click to reset.
  * Children position themselves with `transformStyle(zoom)`; viewports given
@@ -20,7 +56,10 @@ const ZoomViewport: React.FC<{
   setZoom: React.Dispatch<React.SetStateAction<ZoomTransform>>
   children: React.ReactNode
   testId?: string
-}> = ({ zoom, setZoom, children, testId }) => {
+  /** Left button paints (the focus-area brush): pan with the middle or
+   * right button instead, and don't reset on double-click. */
+  paintMode?: boolean
+}> = ({ zoom, setZoom, children, testId, paintMode = false }) => {
   const ref = useRef<HTMLDivElement>(null)
   const pan = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null)
 
@@ -40,9 +79,11 @@ const ZoomViewport: React.FC<{
   return (
     <div
       ref={ref}
-      className={`relative w-full h-full overflow-hidden ${zoom.scale > 1 ? 'cursor-grab active:cursor-grabbing' : 'cursor-zoom-in'}`}
+      className={`relative w-full h-full overflow-hidden ${paintMode ? '' : zoom.scale > 1 ? 'cursor-grab active:cursor-grabbing' : 'cursor-zoom-in'}`}
+      onContextMenu={paintMode ? (e) => e.preventDefault() : undefined}
       onPointerDown={(e) => {
-        if (e.button !== 0 || zoom.scale === 1) return
+        if (paintMode ? e.button !== 1 && e.button !== 2 : e.button !== 0) return
+        if (zoom.scale === 1) return
         e.currentTarget.setPointerCapture(e.pointerId)
         pan.current = { x: e.clientX, y: e.clientY, tx: zoom.x, ty: zoom.y }
       }}
@@ -53,7 +94,7 @@ const ZoomViewport: React.FC<{
       onPointerUp={() => {
         pan.current = null
       }}
-      onDoubleClick={() => setZoom(IDENTITY_ZOOM)}
+      onDoubleClick={paintMode ? undefined : () => setZoom(IDENTITY_ZOOM)}
       data-testid={testId}
     >
       {children}
@@ -80,6 +121,25 @@ export const InputImagePanel: React.FC = () => {
   const [divider, setDivider] = useState(50)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [flashing, flash] = useFlash()
+  const headerRef = useRef<HTMLDivElement>(null)
+  const headerWidth = useElementWidth(headerRef)
+  // Narrow panels (laptop screens) keep every control on one row by
+  // dropping labels, the least important ones first.
+  const viewLabels = headerWidth === 0 || headerWidth >= 560
+  const focusLabel = headerWidth === 0 || headerWidth >= 480
+  const changeLabel = headerWidth === 0 || headerWidth >= 700
+
+  // Focus areas: painting mode, tool and brush size.
+  const focusMask = useFocusMask()
+  const hasFocusAreas = useAppStore((s) => !!s.settings.priority_mask)
+  const focusStrength = useAppStore((s) => s.settings.priority_mask_strength || DEFAULT_FOCUS_STRENGTH)
+  const setFocusStrength = (strength: number) => {
+    const settings = useAppStore.getState().settings
+    if (settings.priority_mask_strength !== strength) useAppStore.getState().setSettings({ ...settings, priority_mask_strength: strength })
+  }
+  const [painting, setPainting] = useState(false)
+  const [tool, setTool] = useState<FocusTool>('paint')
+  const [brushPercent, setBrushPercent] = usePersistentState<number>('autoforge-focus-brush-size', 6)
 
   const jobActive = !!currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
   // The printed result, next to the original: the optimizer's image (or the
@@ -89,7 +149,38 @@ export const InputImagePanel: React.FC = () => {
     : jobActive && previewImage
       ? previewImage
       : null
-  const effectiveView: View = resultSrc ? view : 'original'
+  const effectiveView: View = painting ? 'original' : resultSrc ? view : 'original'
+  // Only compared while the Differences view is on screen.
+  const diff = useDifferenceMap(effectiveView === 'difference' ? inputImage : null, effectiveView === 'difference' ? resultSrc : null)
+
+  const startPainting = useCallback(() => {
+    setTool('paint')
+    setPainting(true)
+  }, [])
+
+  // A new picture ends painting (its mask starts empty).
+  useEffect(() => setPainting(false), [inputImage])
+
+  // Keys while painting: Esc or Enter finishes, B/E switch brush and
+  // eraser, [ and ] change the brush size.
+  useEffect(() => {
+    if (!painting) return
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null
+      if (target && (target.tagName === 'INPUT' && (target as HTMLInputElement).type !== 'range' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return
+      if (e.ctrlKey || e.metaKey || e.altKey) return
+      const key = e.key.toLowerCase()
+      if (key === 'escape' || key === 'enter') setPainting(false)
+      else if (key === 'b') setTool('paint')
+      else if (key === 'e') setTool('erase')
+      else if (key === '[') setBrushPercent(Math.max(1, brushPercent - 1))
+      else if (key === ']') setBrushPercent(Math.min(25, brushPercent + 1))
+      else return
+      e.preventDefault()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [painting, brushPercent, setBrushPercent])
 
   // Switch to side by side when a run finishes, so the result isn't hidden.
   const prevStatus = useRef(currentJob?.status)
@@ -270,52 +361,165 @@ export const InputImagePanel: React.FC = () => {
     </ZoomViewport>
   )
 
-  return (
-    <div className={`flex flex-col h-full bg-gray-800 rounded-lg overflow-hidden ${flashing ? 'ring-2 ring-cyan-500' : ''}`} data-testid="image-panel">
-      <div className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-gray-700 min-h-9">
-        <h3 className="text-xs font-semibold text-gray-300 flex items-center gap-1">
-          <ImageIcon className="w-3.5 h-3.5" />
-          Image
-        </h3>
-        {inputImage && (
-          <div className="flex items-center gap-2 min-w-0">
-            {zoomed && (
-              <button
-                onClick={() => setZoom(IDENTITY_ZOOM)}
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs text-gray-300 hover:bg-gray-700 tabular-nums"
-                title="Reset zoom (or double-click the image)"
-                data-testid="image-zoom-reset"
-              >
-                <ZoomIn className="w-3 h-3" />
-                {zoom.scale.toFixed(1)}×
-              </button>
-            )}
-            <div className="flex rounded border border-gray-600 overflow-hidden text-xs" role="group" aria-label="Image view" data-testid="image-view-toggle">
-              {(['original', 'result', 'split', 'compare'] as View[]).map((v) => (
-                <button
-                  key={v}
-                  onClick={() => setView(v)}
-                  disabled={v !== 'original' && !resultSrc}
-                  aria-pressed={effectiveView === v}
-                  title={v !== 'original' && !resultSrc ? 'Run the optimizer to see the result' : VIEW_HINTS[v]}
-                  className={`px-2 py-0.5 whitespace-nowrap ${effectiveView === v ? 'bg-gray-600 text-gray-100' : 'text-gray-400 hover:text-gray-200'} disabled:opacity-40 disabled:hover:text-gray-400`}
-                  data-testid={`image-view-${v}`}
-                >
-                  {VIEW_LABELS[v]}
-                </button>
-              ))}
-            </div>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="flex items-center gap-1 px-2 py-0.5 rounded text-xs text-gray-300 hover:bg-gray-700 border border-gray-600"
-              title="Upload a different image"
-              data-testid="change-image-btn"
-            >
-              <RefreshCw className="w-3 h-3" />
-              Change
-            </button>
+  const paintView = (
+    <div className="w-full h-full flex flex-col min-h-0" data-testid="focus-paint-view">
+      <div className="flex-1 min-h-0">
+        <ZoomViewport zoom={zoom} setZoom={setZoom} paintMode testId="focus-paint-viewport">
+          <div className="absolute inset-0" style={transformStyle(zoom)}>
+            {originalImg}
+            <FocusMaskOverlay mask={focusMask} painting tool={tool} brushPercent={brushPercent} />
           </div>
-        )}
+        </ZoomViewport>
+      </div>
+      <div className="flex flex-col gap-1 px-3 py-1.5 border-t border-gray-700 text-[11px] text-gray-400" data-testid="focus-hint">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span className="text-gray-300">Paint over what matters most — faces, eyes, lettering.</span>
+          <label
+            className="flex items-center gap-1.5 text-gray-300"
+            title="How many times more a painted area counts than the rest when the result is compared with your picture (2× to 100×, default 10×). The rest still counts, just less. Applies to the whole picture and is used from the next run."
+          >
+            Painted areas count
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={sliderFromStrength(focusStrength)}
+              onChange={(e) => setFocusStrength(strengthFromSlider(Number(e.target.value)))}
+              className="w-20 xl:w-24 accent-cyan-500"
+              aria-label="Focus strength"
+              aria-valuetext={`${focusStrength} times`}
+              data-testid="focus-strength"
+            />
+            <span className="w-8 text-right font-medium text-cyan-300 tabular-nums" data-testid="focus-strength-value">{focusStrength}×</span>
+            more
+          </label>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3">
+          <span>Scroll to zoom · right-drag to pan · B / E brush and eraser · [ ] size</span>
+          <span className="ml-auto tabular-nums" data-testid="focus-share">
+            {focusMask.saving ? 'Saving…' : focusMask.share > 0 ? `${Math.max(1, Math.round(focusMask.share * 100))}% marked · used from the next run` : 'Nothing marked yet'}
+          </span>
+        </div>
+      </div>
+    </div>
+  )
+
+  const segButton = (on: boolean) =>
+    `flex items-center gap-1 px-2 py-0.5 whitespace-nowrap ${on ? 'bg-gray-600 text-gray-100' : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700/60'} disabled:opacity-40 disabled:hover:text-gray-400 disabled:hover:bg-transparent`
+  const outlineButton = 'flex items-center gap-1 px-2 py-0.5 rounded text-xs text-gray-300 hover:bg-gray-700 border border-gray-600 whitespace-nowrap'
+
+  const paintToolbar = (
+    <div className="flex items-center gap-2 min-w-0" data-testid="focus-toolbar">
+      <div className="flex rounded border border-gray-600 overflow-hidden text-xs" role="group" aria-label="Focus brush">
+        <button onClick={() => setTool('paint')} aria-pressed={tool === 'paint'} className={segButton(tool === 'paint')} title="Paint focus areas (B)" data-testid="focus-tool-paint">
+          <Brush className="w-3.5 h-3.5" />
+          {focusLabel && 'Paint'}
+        </button>
+        <button onClick={() => setTool('erase')} aria-pressed={tool === 'erase'} className={segButton(tool === 'erase')} title="Erase focus areas (E)" data-testid="focus-tool-erase">
+          <Eraser className="w-3.5 h-3.5" />
+          {focusLabel && 'Erase'}
+        </button>
+      </div>
+      <label className="flex items-center gap-1.5 text-xs text-gray-400" title="Brush size ([ and ] keys)">
+        Size
+        <input
+          type="range"
+          min={1}
+          max={25}
+          value={brushPercent}
+          onChange={(e) => setBrushPercent(Number(e.target.value))}
+          className="w-16 xl:w-20 accent-cyan-500"
+          aria-label="Brush size"
+          data-testid="focus-brush-size"
+        />
+      </label>
+      <button
+        onClick={focusMask.clear}
+        disabled={focusMask.share === 0 && !hasFocusAreas}
+        className={`${outlineButton} disabled:opacity-40 disabled:hover:bg-transparent`}
+        title="Remove all focus areas"
+        data-testid="focus-clear-btn"
+      >
+        <Trash2 className="w-3 h-3" />
+        {changeLabel && 'Clear'}
+      </button>
+      <button
+        onClick={() => setPainting(false)}
+        className="flex items-center gap-1 px-2.5 py-0.5 rounded text-xs font-medium bg-cyan-600 hover:bg-cyan-500 text-white whitespace-nowrap"
+        title="Finish painting (Esc)"
+        data-testid="focus-done-btn"
+      >
+        <Check className="w-3.5 h-3.5" />
+        Done
+      </button>
+    </div>
+  )
+
+  const viewControls = (
+    <div className="flex items-center gap-2 min-w-0">
+      {zoomed && (
+        <button
+          onClick={() => setZoom(IDENTITY_ZOOM)}
+          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs text-gray-300 hover:bg-gray-700 tabular-nums"
+          title="Reset zoom (or double-click the image)"
+          data-testid="image-zoom-reset"
+        >
+          <ZoomIn className="w-3 h-3" />
+          {zoom.scale.toFixed(1)}×
+        </button>
+      )}
+      <div className="flex rounded border border-gray-600 overflow-hidden text-xs" role="group" aria-label="Image view" data-testid="image-view-toggle">
+        {VIEWS.map((v) => {
+          const Icon = VIEW_ICONS[v]
+          const selected = effectiveView === v
+          return (
+            <button
+              key={v}
+              onClick={() => setView(v)}
+              disabled={v !== 'original' && !resultSrc}
+              aria-pressed={selected}
+              aria-label={VIEW_LABELS[v]}
+              title={v !== 'original' && !resultSrc ? 'Run the optimizer to see the result' : `${VIEW_LABELS[v]} — ${VIEW_HINTS[v]}`}
+              className={segButton(selected)}
+              data-testid={`image-view-${v}`}
+            >
+              {!viewLabels && <Icon className="w-3.5 h-3.5" />}
+              {(viewLabels || selected) && VIEW_LABELS[v]}
+            </button>
+          )
+        })}
+      </div>
+      <button
+        onClick={startPainting}
+        className={`relative ${outlineButton} ${hasFocusAreas ? 'border-cyan-600 text-cyan-300' : ''}`}
+        title={
+          hasFocusAreas
+            ? 'Focus areas are set — the optimizer works hardest there. Click to change them.'
+            : 'Mark the parts of the picture that matter most (faces, eyes, text)'
+        }
+        aria-label="Focus areas"
+        data-testid="focus-areas-btn"
+        data-active={hasFocusAreas || undefined}
+      >
+        <Crosshair className="w-3 h-3" />
+        {focusLabel && 'Focus'}
+        {hasFocusAreas && <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" aria-hidden data-testid="focus-areas-dot" />}
+      </button>
+      <button onClick={() => fileInputRef.current?.click()} className={outlineButton} title="Upload a different image" aria-label="Change image" data-testid="change-image-btn">
+        <RefreshCw className="w-3 h-3" />
+        {changeLabel && 'Change'}
+      </button>
+    </div>
+  )
+
+  return (
+    <div className={`flex flex-col h-full bg-gray-800 rounded-lg overflow-hidden ${flashing ? 'ring-2 ring-cyan-500' : ''} ${painting ? 'ring-1 ring-cyan-600' : ''}`} data-testid="image-panel">
+      <div ref={headerRef} className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-gray-700 min-h-9">
+        <h3 className="text-xs font-semibold text-gray-300 flex items-center gap-1 flex-shrink-0">
+          {painting ? <Crosshair className="w-3.5 h-3.5 text-cyan-400" /> : <ImageIcon className="w-3.5 h-3.5" />}
+          {painting ? 'Focus areas' : 'Image'}
+        </h3>
+        {inputImage && (painting ? paintToolbar : viewControls)}
       </div>
 
       <div
@@ -324,12 +528,12 @@ export const InputImagePanel: React.FC = () => {
         onDragOver={handleDragOver}
         onDragEnter={handleDragEnter}
         onDragLeave={() => setIsDragging(false)}
-        title={inputImage ? 'Scroll to zoom, drag to pan, double-click to reset' : undefined}
+        title={inputImage && !painting ? 'Scroll to zoom, drag to pan, double-click to reset' : undefined}
       >
         {fileInput}
         {inputImage ? (
           <>
-            {effectiveView === 'original' && viewport(originalImg)}
+            {effectiveView === 'original' && (painting ? paintView : viewport(originalImg))}
             {effectiveView === 'result' && viewport(resultImg)}
             {effectiveView === 'split' && (
               <div className="w-full h-full grid grid-cols-2 gap-2">
@@ -344,6 +548,19 @@ export const InputImagePanel: React.FC = () => {
               </div>
             )}
             {effectiveView === 'compare' && compareView}
+            {effectiveView === 'difference' && (
+              <div className="w-full h-full flex flex-col min-h-0" data-testid="image-difference">
+                <div className="flex-1 min-h-0 relative">
+                  {viewport(<DifferenceImage canvas={diff.canvas} version={diff.version} />)}
+                  {diff.status === 'working' && !diff.canvas && (
+                    <div className="absolute inset-0 flex items-center justify-center text-xs text-gray-400 gap-1.5">
+                      <Loader2 className="w-4 h-4 animate-spin" /> Comparing…
+                    </div>
+                  )}
+                </div>
+                <DifferenceLegend status={diff.status} stats={diff.stats} onPaintFocus={startPainting} />
+              </div>
+            )}
             {uploadError && <div className="absolute left-2 right-2 bottom-2">{errorBox}</div>}
           </>
         ) : (

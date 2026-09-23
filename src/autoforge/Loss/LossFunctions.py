@@ -78,9 +78,11 @@ def compute_loss(
     """
     Compute loss between composite and target.
 
-    If focus_map (priority mask) is provided (shape [H,W] normalized 0..1), we apply per-pixel weights:
+    If focus_map (priority mask) is provided (shape [H,W], >= 0), we apply per-pixel weights:
         weight = 0.1 + 0.9 * focus_map
-    (So outside mask -> 0.1, fully prioritized -> 1.0, gradients respected.)
+    (So outside mask -> 0.1, a plain 0..1 mask at full -> 1.0, gradients respected.)
+    Values above 1 weight a pixel more than 10x the unmasked ones: that is how
+    --priority_mask_strength is applied (see auto_forge._load_priority_mask).
 
     If alpha is provided (shape [H,W] or [H,W,1], values 0-255), transparent pixels
     (alpha < 128) are masked out entirely (weight = 0). When both focus_map and alpha
@@ -121,7 +123,7 @@ def compute_loss(
                 focus_map_proc = focus_map.squeeze(-1)
             else:
                 focus_map_proc = focus_map
-            focus_map_proc = torch.clamp(focus_map_proc, 0.0, 1.0)
+            focus_map_proc = torch.clamp(focus_map_proc, min=0.0)
             weights = weights * (0.1 + 0.9 * focus_map_proc)
 
         if alpha is not None:

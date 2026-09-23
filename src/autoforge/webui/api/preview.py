@@ -71,8 +71,9 @@ async def render_preview(data: dict):
         if not pipeline_result:
             raise HTTPException(
                 409,
-                "This result can't be re-colored anymore (the server was restarted "
-                "since it was computed). Run the optimization again to edit its colors.",
+                "This result can't be re-colored anymore: it was pruned since, or the "
+                "server was restarted after it was computed. Go to the newest result, "
+                "or run the optimization again, to edit its colors.",
             )
         effective_job_id = job.job_id
         output_dir = os.path.join(config.checkpoints_path, job.job_id)

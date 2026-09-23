@@ -2,10 +2,19 @@ import React from 'react'
 import { useAppStore } from '../store/appStore'
 import { refreshLibrary } from '../services/filamentService'
 import { describeApiError } from '../lib/apiError'
-import { X, Upload, FileJson, FileText, AlertTriangle } from 'lucide-react'
+import { X, Upload, FileJson, FileText, AlertTriangle, Library } from 'lucide-react'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from './ui/dialog'
 
-type PendingFile = { ext: 'json' | 'csv'; text: string }
+// 'hueforge' is HueForge's own personal library, read by the server from
+// where HueForge keeps it (see GET /api/filaments/hueforge-library).
+type PendingFile = { ext: 'json' | 'csv' | 'hueforge'; text: string }
+
+interface HueforgeLibrary {
+  found: boolean
+  path: string | null
+  count: number
+  error: string | null
+}
 
 // A page's first second fires a dozen-plus requests (every panel's own
 // on-mount fetch, project/filament/history loads, the preview WebSocket
@@ -59,6 +68,9 @@ export const ImportModal: React.FC = () => {
   const importModalOpen = useAppStore((s) => s.importModalOpen)
   const setImportModalOpen = useAppStore((s) => s.setImportModalOpen)
   const setCustomLibraryLoaded = useAppStore((s) => s.setCustomLibraryLoaded)
+  // Opened by the first-start offer (useHueforgeOffer) rather than the button.
+  const hueforgeOffer = useAppStore((s) => s.importModalHueforgeOffer)
+  const [hueforge, setHueforge] = React.useState<HueforgeLibrary | null>(null)
   // The store's `filaments` is only the current tab's list; the replace
   // warning must state how many filaments the whole library really loses.
   const [existingCount, setExistingCount] = React.useState<number | null>(null)
@@ -69,6 +81,30 @@ export const ImportModal: React.FC = () => {
   const [confirmingReplace, setConfirmingReplace] = React.useState(false)
   const [importing, setImporting] = React.useState(false)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
+
+  React.useEffect(() => {
+    if (!importModalOpen) return
+    let cancelled = false
+    fetch('/api/filaments/hueforge-library')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (!cancelled) setHueforge(data) })
+      .catch(() => { if (!cancelled) setHueforge(null) })
+    return () => { cancelled = true }
+  }, [importModalOpen])
+
+  const fetchExistingCount = () => {
+    fetch('/api/filaments')
+      .then((r) => r.json())
+      .then((all) => setExistingCount(Array.isArray(all) ? all.length : null))
+      .catch(() => setExistingCount(null))
+  }
+
+  const chooseHueforge = () => {
+    setImportStatus(null)
+    setPending({ ext: 'hueforge', text: '' })
+    setConfirmingReplace(false)
+    fetchExistingCount()
+  }
 
   const readFile = (file: File) => {
     const ext = file.name.split('.').pop()?.toLowerCase()
@@ -82,10 +118,7 @@ export const ImportModal: React.FC = () => {
     reader.onload = () => {
       setPending({ ext, text: reader.result as string })
       setConfirmingReplace(false)
-      fetch('/api/filaments')
-        .then((r) => r.json())
-        .then((all) => setExistingCount(Array.isArray(all) ? all.length : null))
-        .catch(() => setExistingCount(null))
+      fetchExistingCount()
     }
     reader.readAsText(file)
   }
@@ -96,19 +129,24 @@ export const ImportModal: React.FC = () => {
     setImportStatus(null)
     try {
       let response: Response
-      if (pending.ext === 'csv') {
+      if (pending.ext === 'hueforge') {
+        response = await fetchWithRetry(`/api/filaments/import-hueforge?mode=${mode}`, { method: 'POST' })
+      } else if (pending.ext === 'csv') {
         response = await fetchWithRetry('/api/filaments/import-csv', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ contents: pending.text, mode }),
         })
       } else {
+        // Sent as parsed: the server unwraps HueForge's personal_library.json
+        // ({"Filaments": [...]}). Wrapping every object in an array here sent
+        // that whole file as a single "filament" — imported as one nameless
+        // white entry.
         const data = JSON.parse(pending.text)
-        const arr = Array.isArray(data) ? data : [data]
         response = await fetchWithRetry(`/api/filaments/import-json?mode=${mode}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(arr),
+          body: JSON.stringify(data),
         })
       }
 
@@ -176,6 +214,32 @@ export const ImportModal: React.FC = () => {
         </div>
 
         <div className="p-4 space-y-4">
+          {hueforge?.found && (
+            <div className="p-3 rounded-lg border-2 border-cyan-500 bg-cyan-500/10 space-y-2" data-testid="hueforge-import-option">
+              <p className="flex items-center gap-2 text-sm font-medium text-gray-100">
+                <Library className="w-4 h-4 text-cyan-400" />
+                {hueforgeOffer ? 'Found your HueForge filament library' : 'HueForge filament library'}
+              </p>
+              <p className="text-xs text-gray-300">
+                {hueforge.count} {hueforge.count === 1 ? 'filament' : 'filaments'} in
+                {' '}<code className="text-gray-400 break-all" data-testid="hueforge-library-path">{hueforge.path}</code>
+                {hueforgeOffer ? '. Import them so you can use your own filaments here?' : '.'}
+              </p>
+              <button
+                type="button"
+                onClick={chooseHueforge}
+                disabled={importing || pending?.ext === 'hueforge'}
+                className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 rounded text-xs text-white font-medium"
+                data-testid="hueforge-import-btn"
+              >
+                Import HueForge library
+              </button>
+            </div>
+          )}
+          {hueforge && !hueforge.found && hueforge.error && (
+            <p className="text-xs text-yellow-500" data-testid="hueforge-library-error">{hueforge.error}</p>
+          )}
+
           <div
             onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
             onDragLeave={() => setDragOver(false)}
@@ -225,7 +289,7 @@ export const ImportModal: React.FC = () => {
           {pending && !confirmingReplace && (
             <div className="p-3 bg-gray-800 rounded space-y-3" data-testid="import-mode-choice">
               <p className="text-xs text-gray-300">
-                File ready ({pending.ext.toUpperCase()}). Add these filaments to your existing library, or replace the entire library with just this file?
+                {pending.ext === 'hueforge' ? 'HueForge library ready' : `File ready (${pending.ext.toUpperCase()})`}. Add these filaments to your existing library, or replace the entire library with just this file?
               </p>
               <div className="flex gap-2">
                 <button
@@ -256,7 +320,7 @@ export const ImportModal: React.FC = () => {
             <div className="p-3 bg-red-900/30 border border-red-700 rounded space-y-3" data-testid="import-replace-confirm">
               <p className="text-xs text-red-200 flex items-start gap-2">
                 <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-                This deletes {existingCount === null ? 'all the' : `all ${existingCount}`} filaments currently in your library and replaces them with the ones from this file. This can't be undone. Are you sure?
+                This deletes {existingCount === null ? 'all the' : `all ${existingCount}`} filaments currently in your library and replaces them with the ones from {pending.ext === 'hueforge' ? 'your HueForge library' : 'this file'}. This can't be undone. Are you sure?
               </p>
               <div className="flex gap-2">
                 <button

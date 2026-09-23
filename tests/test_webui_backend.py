@@ -28,6 +28,7 @@ def _isolated_webui_storage():
     mp.setattr(config, "checkpoints_dir", os.path.join(tmp_dir, "checkpoints"))
     mp.setattr(config, "uploads_dir", os.path.join(tmp_dir, "uploads"))
     mp.setattr(config, "library_dir", os.path.join(tmp_dir, "filament_library"))
+    mp.setattr(config, "hueforge_library", os.path.join(tmp_dir, "hueforge", "personal_library.json"))
     try:
         yield
     finally:

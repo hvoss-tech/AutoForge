@@ -162,7 +162,7 @@ export const FileMenu: React.FC = () => {
   }, [open, canExport, isFlatforge, jobId])
 
   return (
-    <div className="relative" ref={menuRef}>
+    <div className="relative flex-shrink-0" ref={menuRef}>
       <button
         onClick={() => {
           setOpen((o) => !o)

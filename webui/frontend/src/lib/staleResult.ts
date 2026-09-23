@@ -26,8 +26,12 @@ export function staleReasons(
   activeFilamentUuids: string[],
 ): string[] {
   if (!run) return []
+  // The focus-area strength only matters when there are focus areas, in
+  // the run or now.
+  const noMask = !run.settings.priority_mask && !settings.priority_mask
   const reasons = Object.keys(settings)
     .filter((key) => !IGNORED.has(key) && key in run.settings && run.settings[key] !== settings[key])
+    .filter((key) => !(noMask && key === 'priority_mask_strength'))
   const before = [...run.filamentUuids].sort().join(',')
   const after = [...activeFilamentUuids].sort().join(',')
   if (before !== after) reasons.push('active_filaments')
@@ -56,4 +60,13 @@ export function storeRunInputs(all: Record<string, RunInputs>, jobId: string, in
     // not remembered — the result just can't be flagged as out of date later
   }
   return next
+}
+
+/** A pruned result is built from its source run's settings and filaments, so
+ * it inherits that run's inputs. Without an entry of its own, staleReasons()
+ * got `undefined` for it and a pruned result could never be "Out of date". */
+export function inheritRunInputs(all: Record<string, RunInputs>, fromJobId: string, toJobId: string): Record<string, RunInputs> {
+  const source = all[fromJobId]
+  if (!source || fromJobId === toJobId) return all
+  return storeRunInputs(all, toJobId, source)
 }

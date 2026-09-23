@@ -16,6 +16,7 @@ import {
   Square,
   Sun,
   Undo2,
+  WifiOff,
 } from 'lucide-react'
 import { PruningModal } from './PruningModal'
 import { FileMenu } from './FileMenu'
@@ -64,13 +65,17 @@ const WorkflowSteps: React.FC = () => {
   )
   const current = steps.find((s) => s.state === 'current')
   // Once there's a result the first three steps are just history: keep their
-  // checkmarks but drop the labels to make room.
+  // checkmarks but drop the labels to make room. While a run is going the
+  // progress readout needs the room too, so only the current step keeps its
+  // label — without this the bar overflowed and the project name was drawn
+  // on top of the undo buttons.
+  const running = jobStatus === 'running' || jobStatus === 'paused' || jobStatus === 'pending'
   const compact = jobStatus === 'completed'
 
   return (
-    <ol className="flex items-center gap-1 text-xs" data-testid="workflow-steps" title={current?.hint}>
+    <ol className="flex items-center gap-1 text-xs flex-shrink-0" data-testid="workflow-steps" title={current?.hint}>
       {steps.map((step, i) => {
-        const hideLabel = compact && step.state === 'done'
+        const hideLabel = running ? step.state !== 'current' : compact && step.state === 'done'
         return (
           <li key={step.id} className="flex items-center gap-1" data-testid={`workflow-step-${step.id}`} data-state={step.state}>
             {i > 0 && <span className="w-3 h-px bg-gray-600" aria-hidden />}
@@ -113,7 +118,7 @@ const HistoryControls: React.FC = () => {
   const canRedo = historyIndex < historyLength - 1
 
   return (
-    <div className="flex items-center gap-0.5 px-1 border-x border-gray-700" role="group" aria-label="Undo history">
+    <div className="flex items-center gap-0.5 px-1 border-x border-gray-700 flex-shrink-0" role="group" aria-label="Undo history">
       <button
         onClick={() => undo()}
         disabled={!canUndo}
@@ -158,7 +163,7 @@ const ProjectTitle: React.FC = () => {
   const dirty = hasUnsavedChanges(saved, fingerprint, hasContent)
 
   return (
-    <div className="flex items-center gap-1 min-w-0">
+    <div className="flex items-center gap-1 min-w-[4.5rem] w-40 shrink">
       <input
         value={projectName}
         onChange={(e) => setProjectName(e.target.value)}
@@ -167,7 +172,7 @@ const ProjectTitle: React.FC = () => {
         }}
         placeholder="Untitled project"
         aria-label="Project name"
-        className="w-36 px-1.5 py-1 rounded text-xs bg-transparent border border-transparent hover:border-gray-700 focus:border-gray-600 focus:bg-gray-800 text-gray-100 placeholder:text-gray-500 outline-none truncate"
+        className="flex-1 min-w-0 w-full px-1.5 py-1 rounded text-xs bg-transparent border border-transparent hover:border-gray-700 focus:border-gray-600 focus:bg-gray-800 text-gray-100 placeholder:text-gray-500 outline-none truncate"
         data-testid="project-name-input"
       />
       {dirty && (
@@ -191,6 +196,7 @@ const JobProgress: React.FC<{ elapsedEta: { elapsed: number; eta: number; stalle
   const currentJob = useAppStore((s) => s.currentJob)
   const lossHistory = useAppStore((s) => s.lossHistory)
   const lossJobId = useAppStore((s) => s.lossJobId)
+  const connection = useAppStore((s) => s.serverConnection)
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
 
@@ -212,33 +218,47 @@ const JobProgress: React.FC<{ elapsedEta: { elapsed: number; eta: number; stalle
   const phase = currentJob.status === 'paused' ? 'Paused' : currentJob.phase || 'Optimizing'
   const points = lossJobId === currentJob.job_id ? lossHistory : []
   const bestLoss = points.length ? Math.min(...points.map((p) => p.loss)) : null
+  const disconnected = connection !== 'ok'
+  // "Stalled" only means something while the server is reachable; a lost
+  // connection gets its own, louder state (and the banner under the bar).
+  const stalled = !disconnected && currentJob.status === 'running' && !!elapsedEta?.stalled
   const timing = currentJob.status === 'running' && elapsedEta
-    ? `${formatDuration(elapsedEta.elapsed)}${elapsedEta.stalled ? ' · stalled' : elapsedEta.eta > 0 ? ` · ${formatDuration(elapsedEta.eta)} left` : ''}`
+    ? `${formatDuration(elapsedEta.elapsed)}${!elapsedEta.stalled && elapsedEta.eta > 0 ? ` · ${formatDuration(elapsedEta.eta)} left` : ''}`
     : null
+  const barColor = disconnected ? '#6b7280' : currentJob.status === 'paused' ? '#eab308' : '#3b82f6'
 
   return (
     <div className="relative" ref={ref}>
       <button
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
-        className="flex items-center gap-2 px-3 py-1 bg-gray-800 hover:bg-gray-700 rounded"
+        className={`flex items-center gap-2 px-3 py-1 rounded whitespace-nowrap ${
+          connection === 'lost' ? 'bg-red-600/15 border border-red-600/40 hover:bg-red-600/25' : 'bg-gray-800 hover:bg-gray-700'
+        }`}
         title="Show progress details"
         data-testid="job-progress"
+        data-connection={connection}
       >
-        {currentJob.status === 'paused' ? (
+        {connection === 'lost' ? (
+          <WifiOff className="w-3.5 h-3.5 text-red-500" />
+        ) : connection === 'reconnecting' ? (
+          <Loader2 className="w-3.5 h-3.5 text-amber-500 animate-spin" />
+        ) : currentJob.status === 'paused' ? (
           <Pause className="w-3.5 h-3.5 text-yellow-500" />
         ) : (
           <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin" />
         )}
-        <span className="text-xs text-gray-200" data-testid="job-phase">{phase}</span>
-        <div className="w-24 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+        <span className={`text-xs ${connection === 'lost' ? 'text-red-400 font-medium' : connection === 'reconnecting' ? 'text-amber-500' : 'text-gray-200'}`} data-testid="job-phase">
+          {connection === 'lost' ? 'Disconnected' : connection === 'reconnecting' ? 'Reconnecting…' : phase}
+        </span>
+        <div className="w-16 xl:w-24 h-1.5 bg-gray-700 rounded-full overflow-hidden">
           <div
             className="h-full rounded-full transition-all duration-300"
-            style={{ width: `${currentJob.progress}%`, backgroundColor: currentJob.status === 'paused' ? '#eab308' : '#3b82f6' }}
+            style={{ width: `${currentJob.progress}%`, backgroundColor: barColor }}
           />
         </div>
         <span className="text-xs text-gray-300 tabular-nums">{currentJob.progress.toFixed(1)}%</span>
-        <span className="text-xs text-gray-400 tabular-nums" data-testid="job-iteration-count">
+        <span className="hidden 2xl:inline text-xs text-gray-400 tabular-nums" data-testid="job-iteration-count">
           ({currentJob.iteration}/{currentJob.total_iterations})
         </span>
         {currentJob.loss !== null && (
@@ -246,9 +266,19 @@ const JobProgress: React.FC<{ elapsedEta: { elapsed: number; eta: number; stalle
             Loss: {currentJob.loss.toFixed(4)}
           </span>
         )}
-        {timing && (
+        {timing && !disconnected && (
           <span className="text-xs text-gray-400 tabular-nums" data-testid="job-elapsed-eta">
             {timing}
+          </span>
+        )}
+        {stalled && (
+          <span
+            className="flex items-center gap-1 text-xs text-amber-500"
+            title="No progress has arrived for over 30 seconds. Some steps are slow, but if this lasts, check the server's console."
+            data-testid="job-stalled"
+          >
+            <AlertTriangle className="w-3 h-3" />
+            No progress
           </span>
         )}
       </button>
@@ -265,6 +295,9 @@ const JobProgress: React.FC<{ elapsedEta: { elapsed: number; eta: number; stalle
             <div className="flex justify-between"><span className="text-gray-400">Lowest so far</span><span className="text-gray-100 tabular-nums">{bestLoss.toFixed(4)}</span></div>
           )}
           {timing && <div className="flex justify-between"><span className="text-gray-400">Time</span><span className="text-gray-100 tabular-nums">{timing}</span></div>}
+          {disconnected && (
+            <div className="flex justify-between"><span className="text-gray-400">Server</span><span className={connection === 'lost' ? 'text-red-400' : 'text-amber-500'}>{connection === 'lost' ? 'not reachable' : 'reconnecting…'}</span></div>
+          )}
           <div>
             <div className="text-[11px] text-gray-400 mb-1">Loss over the run</div>
             {points.length >= 2 ? (
@@ -363,6 +396,7 @@ export const TopBar: React.FC = () => {
   const runInputsByJob = useAppStore((s) => s.runInputsByJob)
   const pushToast = useAppStore((s) => s.pushToast)
   const requestConfirm = useAppStore((s) => s.requestConfirm)
+  const serverLost = useAppStore((s) => s.serverConnection === 'lost')
 
   const trackerRef = useRef<ProgressTracker | null>(null)
   const runButtonRef = useRef<HTMLButtonElement>(null)
@@ -509,6 +543,13 @@ export const TopBar: React.FC = () => {
     try {
       await cancelOptimization(currentJob.job_id)
     } catch (e) {
+      // With the server gone there is nothing to cancel any more; stop
+      // showing a run that can't be followed instead of an error.
+      if (useAppStore.getState().serverConnection === 'lost') {
+        useAppStore.getState().setCurrentJob(null)
+        pushToast('The server can\'t be reached, so the run was cleared from this page.', 'info')
+        return
+      }
       pushToast(`Failed to cancel: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
@@ -532,8 +573,11 @@ export const TopBar: React.FC = () => {
       data-testid="top-bar"
     >
       <div className="flex items-center gap-3 min-w-0">
-        <h1 className="text-sm font-bold text-gray-100">AutoForge</h1>
-        {currentVersion && <span className="text-xs text-gray-500" data-testid="app-version">v{currentVersion}</span>}
+        <h1 className="text-sm font-bold text-gray-100 flex-shrink-0">AutoForge</h1>
+        {/* Hidden during a run below very wide screens: the progress readout needs the room. */}
+        {currentVersion && (
+          <span className={`${isActive ? 'hidden 2xl:inline' : ''} text-xs text-gray-500 flex-shrink-0`} data-testid="app-version">v{currentVersion}</span>
+        )}
         <FileMenu />
         <ProjectTitle />
         <HistoryControls />
@@ -590,7 +634,13 @@ export const TopBar: React.FC = () => {
         )}
 
         {currentJob?.status === 'running' ? (
-          <button onClick={handlePause} className={outlineButton('border-yellow-600 text-yellow-500 hover:bg-yellow-600/15')} data-testid="top-pause-btn">
+          <button
+            onClick={handlePause}
+            disabled={serverLost}
+            title={serverLost ? "The server can't be reached" : undefined}
+            className={outlineButton('border-yellow-600 text-yellow-500 hover:bg-yellow-600/15')}
+            data-testid="top-pause-btn"
+          >
             <Pause className="w-3.5 h-3.5" />
             Pause
           </button>
@@ -615,12 +665,20 @@ export const TopBar: React.FC = () => {
         )}
 
         {isActive && (
-          <button onClick={handleCancel} className={outlineButton('border-red-600 text-red-500 hover:bg-red-600/15')} data-testid="top-cancel-btn">
+          <button
+            onClick={handleCancel}
+            title={serverLost ? 'Stop showing this run (the server that ran it is gone)' : undefined}
+            className={outlineButton('border-red-600 text-red-500 hover:bg-red-600/15')}
+            data-testid="top-cancel-btn"
+          >
             <Square className="w-3.5 h-3.5" />
             Cancel
           </button>
         )}
 
+        {/* Nothing to prune while a run is going (it's disabled then), and
+            the bar needs the room for the progress readout. */}
+        {!isActive && (
         <button
           onClick={() => setPruningModalOpen(true)}
           disabled={!canPrune}
@@ -631,6 +689,7 @@ export const TopBar: React.FC = () => {
           <Scissors className="w-3.5 h-3.5" />
           Pruning
         </button>
+        )}
 
         {updateInfo && (
           <a

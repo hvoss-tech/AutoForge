@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react'
-import { ChevronsRight, History, X } from 'lucide-react'
+import { ChevronsRight, History, Loader2, RefreshCw, WifiOff, X } from 'lucide-react'
 import { TopBar } from './components/TopBar'
 import { FilamentLibrary } from './components/FilamentLibrary'
 import { InputImagePanel } from './components/InputImagePanel'
@@ -18,6 +18,7 @@ import { ResizeHandle } from './components/ui/resize-handle'
 import { useAppStore } from './store/appStore'
 import { useJobWebSocket } from './hooks/useJobWebSocket'
 import { useAutoPreviewInit } from './hooks/useAutoPreviewInit'
+import { useHueforgeOffer } from './hooks/useHueforgeOffer'
 import { useElementHeight, usePersistentState } from './hooks/usePersistentState'
 import { historyShortcut } from './lib/history'
 import { clampSize } from './lib/layout'
@@ -64,6 +65,66 @@ const SessionBanner: React.FC = () => {
   )
 }
 
+/** Shown while a run is on screen but its server can't be reached. The
+ * progress bar used to just freeze (with a quiet "stalled" at most) when the
+ * server stopped or crashed mid-run, so the run looked slow, not gone. */
+const ConnectionBanner: React.FC = () => {
+  const jobId = useAppStore((s) => s.currentJob?.job_id ?? null)
+  const retry = useAppStore((s) => s.retryServerConnection)
+  const [checking, setChecking] = React.useState(false)
+  const [stillDown, setStillDown] = React.useState(false)
+
+  const tryAgain = async () => {
+    setChecking(true)
+    setStillDown(false)
+    try {
+      const response = await fetch(jobId ? `/api/optimize/status/${jobId}` : '/api/project/state')
+      // Any answer means the server is up; the socket sorts out the rest
+      // (including a job the restarted server no longer knows).
+      if (response.status < 500) retry()
+      else setStillDown(true)
+    } catch {
+      setStillDown(true)
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  return (
+    <div
+      className="flex items-start gap-2.5 mx-2 mt-2 px-3 py-2 rounded bg-red-600/10 border border-red-600/40 text-xs text-gray-200"
+      role="alert"
+      data-testid="connection-lost-banner"
+    >
+      <WifiOff className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+      <div className="flex-1 min-w-0">
+        <div className="font-medium text-gray-100">Lost connection to the AutoForge server</div>
+        <div className="text-gray-400 mt-0.5">
+          The run's progress can't be shown. If the server was stopped or crashed, the run stopped with it — start the
+          server again, then press Run. This page keeps checking in the background.
+          {stillDown && <span className="text-red-400" data-testid="connection-still-down"> Still not reachable.</span>}
+        </div>
+      </div>
+      <button
+        onClick={tryAgain}
+        disabled={checking}
+        className="flex items-center gap-1 px-2 py-1 rounded border border-gray-600 hover:bg-gray-700 disabled:opacity-60 flex-shrink-0"
+        data-testid="connection-retry-btn"
+      >
+        {checking ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+        Try again
+      </button>
+      <button
+        onClick={() => window.location.reload()}
+        className="px-2 py-1 rounded border border-gray-600 hover:bg-gray-700 flex-shrink-0"
+        data-testid="connection-reload-btn"
+      >
+        Reload page
+      </button>
+    </div>
+  )
+}
+
 const App: React.FC = () => {
   const loadProjectState = useAppStore((s) => s.loadProjectState)
   const loadActiveFilaments = useAppStore((s) => s.loadActiveFilaments)
@@ -71,6 +132,7 @@ const App: React.FC = () => {
   const restoreSessionImage = useAppStore((s) => s.restoreSessionImage)
   const currentJob = useAppStore((s) => s.currentJob)
   const sessionRestored = useAppStore((s) => s.sessionRestored)
+  const connectionLost = useAppStore((s) => s.serverConnection === 'lost')
 
   const [sidebarWidth, setSidebarWidth] = usePersistentState<number>('autoforge-sidebar-width', SIDEBAR_DEFAULT)
   const [sidebarCollapsed, setSidebarCollapsed] = usePersistentState<boolean>('autoforge-sidebar-collapsed', false)
@@ -86,6 +148,7 @@ const App: React.FC = () => {
     ? currentJob.job_id
     : null
   useJobWebSocket(activeJobId)
+  useHueforgeOffer()
   useAutoPreviewInit()
 
   useEffect(() => onUiCommand('focus-library', () => setSidebarCollapsed(false)), [setSidebarCollapsed])
@@ -198,6 +261,7 @@ const App: React.FC = () => {
         )}
 
         <main ref={mainRef} style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          {connectionLost && <ConnectionBanner />}
           {sessionRestored && <SessionBanner />}
           <div style={{ flex: 1, display: 'flex', gap: 8, padding: '8px 8px 0', minHeight: 0 }}>
             <div style={{ flex: 1, minWidth: 0 }}>

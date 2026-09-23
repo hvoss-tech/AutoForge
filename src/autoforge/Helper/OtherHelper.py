@@ -47,6 +47,9 @@ def perform_basic_check(args):
             file=sys.stderr,
         )
         sys.exit(1)
+    if getattr(args, "priority_mask_strength", 10.0) < 1:
+        print("Error: --priority_mask_strength must be at least 1.", file=sys.stderr)
+        sys.exit(1)
 
 
 def get_device(args=None) -> torch.device:

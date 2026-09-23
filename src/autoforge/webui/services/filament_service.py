@@ -6,8 +6,55 @@ import threading
 import tempfile
 import shutil
 import uuid
-from typing import Optional
+import logging
+from typing import Any, Optional
 from ..models import Filament
+
+logger = logging.getLogger(__name__)
+
+# Spellings of each Filament field in the files people import: our own
+# export (snake/camelCase), HueForge's CSV header and HueForge's
+# personal_library.json (PascalCase, "Transmissivity"). Only the first
+# spelling present is used.
+_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "brand": ("brand", "Brand"),
+    "name": ("name", "Name"),
+    "color": ("color", "Color"),
+    "td": ("td", "TD", "Transmissivity", "transmissivity"),
+    "owned": ("owned", "Owned"),
+    "uuid": ("uuid", "UUID", "Uuid"),
+    "filament_type": ("filament_type", "filamentType", "Type", "type"),
+    "source": ("source",),
+}
+
+
+def _parse_owned(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "y")
+    return bool(value)
+
+
+def normalize_filament_record(item: dict) -> dict:
+    """Map an imported record's keys onto ``Filament``'s field names.
+
+    ``Filament(**item)`` only knows snake_case/camelCase keys and silently
+    ignores anything else, so a HueForge ``personal_library.json`` entry
+    (``Brand``/``Name``/``Color``/``Transmissivity``) was imported as a blank
+    white filament with no name and TD 0 — while reporting success."""
+    out: dict[str, Any] = {}
+    for field, aliases in _FIELD_ALIASES.items():
+        for key in aliases:
+            value = item.get(key)
+            if value is None or (isinstance(value, str) and not value.strip() and field != "uuid"):
+                continue
+            out[field] = _parse_owned(value) if field == "owned" else value
+            break
+    return out
+
+
+def looks_like_filament(item: dict) -> bool:
+    """At least one of the fields that identify a filament is present."""
+    return any(k in item for f in ("brand", "name", "color", "td") for k in _FIELD_ALIASES[f])
 
 
 def _atomic_write_json(path: str, data):
@@ -48,26 +95,34 @@ class FilamentService:
     def _load_library(self):
         with self._lock:
             path = self._library_file()
-            if os.path.exists(path):
-                try:
-                    with open(path) as f:
-                        data = json.load(f)
-                    for item in data:
-                        f = Filament(**item)
-                        self._filaments[f.uuid] = f
-                except (json.JSONDecodeError, IOError):
-                    pass
+            self._filaments = self._read_entries(path)
+            self._active = self._read_entries(self._active_file())
 
-            active_path = self._active_file()
-            if os.path.exists(active_path):
-                try:
-                    with open(active_path) as f:
-                        data = json.load(f)
-                    for item in data:
-                        f = Filament(**item)
-                        self._active[f.uuid] = f
-                except (json.JSONDecodeError, IOError):
-                    pass
+    @staticmethod
+    def _read_entries(path: str) -> dict[str, Filament]:
+        """One invalid entry (a hand-edited file, an older version's field
+        types, a color the model now rejects) used to raise out of
+        ``FilamentService.__init__`` — and with it every filament route, the
+        server's startup library seeding, and so the whole app. It is
+        skipped instead, and the rest of the library still loads."""
+        entries: dict[str, Filament] = {}
+        if not os.path.exists(path):
+            return entries
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, IOError, UnicodeDecodeError):
+            return entries
+        if not isinstance(data, list):
+            return entries
+        for item in data:
+            try:
+                f = Filament(**item)
+            except (ValueError, TypeError) as e:
+                logger.warning("Skipping invalid filament entry in %s: %s", path, e)
+                continue
+            entries[f.uuid] = f
+        return entries
 
     def _save_library(self):
         os.makedirs(self._library_path, exist_ok=True)
@@ -147,25 +202,18 @@ class FilamentService:
         rows = self._normalize_csv_row(reader)
         parsed = []
         for row in rows:
-            td_str = row.get("TD") or row.get("td") or row.get("Transmissivity", "")
+            record = normalize_filament_record(row)
+            td_str = record.get("td", "")
             try:
-                td_val = float(td_str) if td_str else 0.0
+                record["td"] = float(td_str) if td_str not in ("", None) else 0.0
             except (ValueError, TypeError):
-                td_val = 0.0
-            parsed.append(
-                Filament(
-                    brand=row.get("Brand", row.get("brand", "")),
-                    name=row.get("Name", row.get("name", "")),
-                    color=row.get("Color", row.get("color", "#ffffff")),
-                    td=td_val,
-                    # Leave uuid blank when the source doesn't have one —
-                    # merge_import()/replace_library() are responsible for
-                    # assigning one, since merge_import needs to know
-                    # "no uuid was given" to try matching by name instead.
-                    uuid=row.get("UUID", row.get("uuid", "")) or "",
-                    filament_type=row.get("Type", row.get("filament_type", "")),
-                )
-            )
+                record["td"] = 0.0
+            # Leave uuid blank when the source doesn't have one —
+            # merge_import()/replace_library() are responsible for
+            # assigning one, since merge_import needs to know
+            # "no uuid was given" to try matching by name instead.
+            record["uuid"] = record.get("uuid") or ""
+            parsed.append(Filament(**record))
         return parsed
 
     def _match_key(self, f: Filament) -> tuple[str, str]:
@@ -189,8 +237,19 @@ class FilamentService:
                     f.uuid = str(uuid.uuid4())
                 self._filaments[f.uuid] = f
                 imported.append(f)
+            self._refresh_active_locked()
             self._save_library()
             return imported
+
+    def _refresh_active_locked(self) -> None:
+        """Active entries are copies; point every one whose uuid is (still)
+        in the library at the library's current version. update() did this
+        for a single edit, but re-importing a CSV with corrected TDs/colors
+        left the active copies — which is what runs and renders read — on
+        the old values until each filament was re-picked by hand."""
+        for u in list(self._active):
+            if u in self._filaments:
+                self._active[u] = self._filaments[u]
 
     def replace_library(self, filaments: list[Filament]) -> list[Filament]:
         """Replace the entire filament library with exactly these
@@ -210,6 +269,7 @@ class FilamentService:
             # otherwise orphaned every previously-active filament, and a run
             # right after would silently use their stale colors/TD.
             self._active = {u: f for u, f in self._active.items() if u in self._filaments}
+            self._refresh_active_locked()
             self._save_library()
             return imported
 
@@ -223,7 +283,7 @@ class FilamentService:
 
     def import_json(self, data: list[dict], mode: str = "merge") -> list[Filament]:
         with self._lock:
-            parsed = [Filament(**item) for item in data]
+            parsed = [Filament(**normalize_filament_record(item)) for item in data]
             imported = self.replace_library(parsed) if mode == "replace" else self.merge_import(parsed)
             self._mark_user_imported()
             return imported
@@ -233,6 +293,22 @@ class FilamentService:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             f.write("1")
+
+    def _hueforge_offered_marker_file(self) -> str:
+        return os.path.join(self._library_path, "hueforge_offered.marker")
+
+    def hueforge_offered(self) -> bool:
+        """Whether the startup offer to import HueForge's library was shown
+        already — it is made once per install, not on every page load."""
+        with self._lock:
+            return os.path.exists(self._hueforge_offered_marker_file())
+
+    def mark_hueforge_offered(self) -> None:
+        with self._lock:
+            path = self._hueforge_offered_marker_file()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("1")
 
     def has_custom_library(self) -> bool:
         with self._lock:

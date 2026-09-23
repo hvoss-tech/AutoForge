@@ -58,6 +58,35 @@ def friendly_error_message(exc: BaseException) -> str:
     return text
 
 
+def to_bgr_or_bgra_uint8(img: Optional[np.ndarray]) -> np.ndarray:
+    """Bring any image OpenCV decodes into the 8-bit BGR/BGRA layout the
+    pipeline is written for.
+
+    The upload endpoint accepts whatever ``cv2.imdecode`` can read, but the
+    pipeline indexed ``img.shape[2]`` and treated values as 0-255: a
+    grayscale PNG/JPEG (2-D array) failed with "tuple index out of range",
+    grayscale+alpha had two channels and failed in ``cvtColor``, and a
+    16-bit PNG ran on values up to 65535 — a nonsense target the optimizer
+    could never match."""
+    if img is None:
+        raise ValueError("The input image could not be read.")
+    if img.dtype == np.uint16:
+        img = (img.astype(np.float32) / 257.0).round().astype(np.uint8)
+    elif img.dtype in (np.float32, np.float64):
+        img = (np.clip(img, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    elif img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    channels = img.shape[2]
+    if channels == 1:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if channels == 2:
+        gray, alpha = img[:, :, 0], img[:, :, 1:2]
+        return np.concatenate([cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), alpha], axis=2)
+    return img
+
+
 # ---------------------------------------------------------------------------
 # Defaults mirroring configargparse in auto_forge.py
 # ---------------------------------------------------------------------------
@@ -106,6 +135,7 @@ _DEFAULTS = {
     "cap_layers": 0,
     "init_heightmap_method": "kmeans",
     "priority_mask": "",
+    "priority_mask_strength": 10.0,
 }
 
 
@@ -214,7 +244,7 @@ def build_pipeline_state(
     material_uuids = [str(f.get("uuid", "")) for f in active_filaments]
 
     # --- Read input image ---
-    img = imread(args.input_image, cv2.IMREAD_UNCHANGED)
+    img = to_bgr_or_bgra_uint8(imread(args.input_image, cv2.IMREAD_UNCHANGED))
     alpha = None
     if img.shape[2] == 4:
         alpha = img[:, :, 3]

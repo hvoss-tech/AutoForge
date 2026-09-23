@@ -4,6 +4,7 @@ import { useAppStore } from '../store/appStore'
 import type { Filament } from '../types'
 import { slidersNeedRender } from '../lib/sliderDiff'
 import { describeApiError } from '../lib/apiError'
+import { sliderRenderPaused } from '../lib/history'
 
 // Mirrors api/preview.py's INIT_JOB_SENTINEL — tells the backend "there's
 // no completed job yet, render against the post-upload auto-preview state
@@ -18,6 +19,7 @@ export function useSliderPreviewRender(): boolean {
   const currentJob = useAppStore((s) => s.currentJob)
   const initState = useAppStore((s) => s.initState)
   const activeFilaments = useAppStore((s) => s.activeFilaments)
+  const pruningJob = useAppStore((s) => s.pruningJob)
   const lastRenderedSlidersRef = useRef(JSON.stringify(colorSliders))
   const lastRenderedJobRef = useRef<string>(INIT_JOB_SENTINEL)
   const [isRendering, setIsRendering] = useState(false)
@@ -32,7 +34,10 @@ export function useSliderPreviewRender(): boolean {
   // Not while a job is running: its live broadcasts replace the stack every
   // few iterations, and each one used to trigger a pointless auto-preview
   // re-render competing with the optimizer for the GPU.
-  const jobActive = !!currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
+  // Pruning counts too: it mutates the result's optimizer in place and
+  // broadcasts each pass's stack, and every broadcast used to fire a render
+  // that read the optimizer (on the GPU) while pruning was rewriting it.
+  const jobActive = sliderRenderPaused(currentJob, pruningJob)
   const hasResult = !jobActive && (currentJob?.status === 'completed' || initState.status === 'ready')
   const jobId = currentJob?.status === 'completed' ? currentJob.job_id : INIT_JOB_SENTINEL
 
@@ -65,7 +70,7 @@ export function useSliderPreviewRender(): boolean {
     // so completion doesn't look like an edit and re-render the result.
     if (jobActive) {
       lastRenderedSlidersRef.current = JSON.stringify(colorSliders)
-      lastRenderedJobRef.current = currentJob.job_id
+      lastRenderedJobRef.current = currentJob?.job_id ?? jobId
       return
     }
     if (!hasResult) return

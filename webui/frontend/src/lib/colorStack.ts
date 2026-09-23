@@ -102,3 +102,23 @@ export function getStackSegments(handles: StackHandle[]): StackSegment[] {
 
   return result
 }
+
+/** Pixel height a full color-column handle (arrow plus layer number) needs
+ * to be drawn without overlapping the next one. */
+export const FULL_HANDLE_SPACING = 20
+
+/** For handles at these vertical positions (in order), the distance to the
+ * nearest neighbour above or below — Infinity for a lone handle. */
+export function nearestNeighborGaps(positions: number[]): number[] {
+  return positions.map((y, i) => {
+    const gaps = [positions[i - 1], positions[i + 1]].filter((n): n is number => n !== undefined).map((n) => Math.abs(n - y))
+    return gaps.length ? Math.min(...gaps) : Infinity
+  })
+}
+
+/** Height of the slim marker drawn instead of a full handle when the
+ * neighbours are closer than FULL_HANDLE_SPACING: as tall as the gap allows
+ * (leaving a pixel between markers), but never an invisible sliver. */
+export function compactHandleHeight(gap: number): number {
+  return Math.max(3, Math.min(12, Math.floor(gap) - 1))
+}

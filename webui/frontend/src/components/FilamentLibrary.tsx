@@ -253,7 +253,7 @@ export const FilamentLibrary: React.FC<{ onCollapse?: () => void }> = ({ onColla
 
         {/* On by default: the library is the list of filaments you own, not a
             document you compose, so an edit shouldn't need confirming. */}
-        <label className="flex items-center gap-1.5 text-xs text-gray-300 cursor-pointer" title="Write every filament edit to the library as you make it. With this off, changes are only kept when you press Save in the edit dialog.">
+        <label className="flex items-center gap-1.5 text-xs text-gray-300 cursor-pointer whitespace-nowrap min-w-0" title="Write every filament edit to the library as you make it. With this off, changes are only kept when you press Save in the edit dialog.">
           <input
             type="checkbox"
             checked={autoSaveLibrary}
@@ -261,7 +261,7 @@ export const FilamentLibrary: React.FC<{ onCollapse?: () => void }> = ({ onColla
             data-testid="library-auto-save-toggle"
           />
           Auto save
-          <span className="text-gray-500" data-testid="library-auto-save-state">{autoSaveLibrary ? '— changes are saved as you make them' : '— off'}</span>
+          <span className="text-gray-500 truncate" data-testid="library-auto-save-state">{autoSaveLibrary ? '— edits are saved right away' : '— off'}</span>
         </label>
       </div>
 
@@ -385,16 +385,19 @@ const FilamentItem: React.FC<{ filament: Filament; isActive: boolean }> = ({ fil
       draggable
       onDragStart={handleDragStart}
       onDoubleClick={openEditor}
-      className={`group flex items-center gap-1.5 px-2 py-1 text-xs cursor-grab active:cursor-grabbing ${isActive ? 'bg-emerald-500/10' : 'hover:bg-gray-800'}`}
+      className={`group relative flex items-center gap-2 pl-2 pr-2 py-1 text-xs cursor-grab active:cursor-grabbing hover:bg-gray-800`}
       data-testid={`filament-${filament.uuid}`}
       data-active={isActive}
       title="Double-click to edit · drag onto a color band"
     >
+      {/* A slim bar marks active rows. A tinted background on every active
+          row said nothing once most of the library was active. */}
+      {isActive && <span className="absolute left-0 top-1 bottom-1 w-0.5 rounded-full bg-emerald-500" aria-hidden />}
       {/* Was a "⌄" chevron for active filaments, which read as "expand". */}
       <button
         onClick={handleToggleActive}
-        className={`flex-shrink-0 w-5 h-5 flex items-center justify-center rounded ${
-          isActive ? 'bg-emerald-600 text-white hover:bg-red-600' : 'text-emerald-500 hover:bg-emerald-500/20 border border-gray-600'
+        className={`flex-shrink-0 w-4 h-4 flex items-center justify-center rounded ${
+          isActive ? 'bg-emerald-600 text-white hover:bg-red-600' : 'text-gray-400 hover:text-emerald-500 hover:border-emerald-500 border border-gray-600'
         }`}
         aria-label={isActive ? `Remove ${filament.name} from active filaments` : `Add ${filament.name} to active filaments`}
         title={isActive ? 'Active — click to remove' : 'Add to active filaments'}
@@ -403,8 +406,8 @@ const FilamentItem: React.FC<{ filament: Filament; isActive: boolean }> = ({ fil
         {isActive ? <Check className="w-3 h-3" /> : <Plus className="w-3 h-3" />}
       </button>
 
-      <FilamentSwatch filament={filament} size="sm" showLabel={false} />
-      <span className="text-gray-200 truncate flex-1">{filament.name}</span>
+      <FilamentSwatch filament={filament} size="sm" showLabel={false} showTd={false} />
+      <span className={`truncate flex-1 ${isActive ? 'text-gray-100' : 'text-gray-400'}`}>{filament.name}</span>
       {/* Editing and "owned" used to be reachable only by double-clicking. */}
       <button
         onClick={(e) => {
@@ -432,7 +435,7 @@ const FilamentItem: React.FC<{ filament: Filament; isActive: boolean }> = ({ fil
       >
         {filament.owned ? <span data-testid={`owned-badge-${filament.uuid}`}>owned</span> : <Tag className="w-3 h-3" />}
       </button>
-      <span className="text-[11px] text-gray-400 tabular-nums w-10 text-right" title="Transmission distance">TD {filament.td}</span>
+      <span className="text-[11px] text-gray-400 tabular-nums w-11 text-right whitespace-nowrap" title="Transmission distance: how see-through the filament is">TD {filament.td}</span>
     </div>
   )
 }

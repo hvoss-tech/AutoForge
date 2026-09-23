@@ -77,11 +77,15 @@ async def start_pruning(settings: PruningSettings):
         try:
             svc.update_status(prune_job_id, "running")
 
-            # Get the pipeline result for the optimization job
-            pipeline_result = svc.get_pipeline_result(job_id)
+            # Take over the optimization job's pipeline result: pruning
+            # mutates its optimizer in place, so from here on it no longer
+            # holds `job_id`'s solution (see get_pipeline_result).
+            pipeline_result = svc.claim_pipeline_result(prune_job_id, job_id)
             if not pipeline_result:
                 svc.update_status(prune_job_id, "failed",
-                                  error="No optimization pipeline result found. Please run optimization first.")
+                                  error="No optimization pipeline result found (this result was pruned "
+                                        "since, or the server was restarted). Go to the newest result, "
+                                        "or run optimization first.")
                 return
 
             from ..helpers.pipeline_runner import export_results
@@ -242,11 +246,10 @@ async def start_pruning(settings: PruningSettings):
 
             optimizer.preview_callback = _prune_progress
 
-            # Pruning regenerates this job's real outputs; an earlier slider
-            # edit rendered against the unpruned solution would otherwise
-            # keep hiding the pruned mesh in the 3D view.
-            from .outputs import discard_slider_edits
-            discard_slider_edits(job_id)
+            # No discard_slider_edits(job_id) here any more: pruning writes
+            # into its own directory, so `job_id`'s files — including the
+            # user's slider-edited mesh — are that result as it was, and are
+            # what an undo back to it has to show.
 
             def _broadcast_result() -> None:
                 """Push the pruned slider stack + image to the frontend, so

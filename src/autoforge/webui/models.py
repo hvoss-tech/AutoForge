@@ -1,6 +1,6 @@
 from __future__ import annotations
 import re
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Optional, Any, Literal
 from datetime import datetime
 
@@ -14,6 +14,27 @@ class CamelCaseModel(BaseModel):
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
 
+_HEX_COLOR = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+
+
+def normalize_hex_color(value: Any) -> str:
+    """``#RRGGBB`` for any hex spelling a library file may use (``RRGGBB``
+    without the hash, ``#RGB``, ``#RRGGBBAA``), or ``ValueError``.
+
+    The pipeline parses colors with ``hex_to_rgb``, which slices fixed
+    offsets: ``#fff`` or ``red`` got into the library unchecked and only
+    failed once a run started ("invalid literal for int() with base 16"),
+    and a color without ``#`` rendered as no color at all in the UI."""
+    text = str(value).strip()
+    match = _HEX_COLOR.match(text)
+    if not match:
+        raise ValueError(f"{text!r} is not a hex color like #RRGGBB")
+    digits = match.group(1)
+    if len(digits) == 3:
+        digits = "".join(c * 2 for c in digits)
+    return "#" + digits[:6]
+
+
 class Filament(CamelCaseModel):
     brand: str = ""
     name: str = ""
@@ -23,6 +44,11 @@ class Filament(CamelCaseModel):
     uuid: str = ""
     filament_type: str = ""
     source: str = "user"
+
+    @field_validator("color", mode="before")
+    @classmethod
+    def _normalize_color(cls, value: Any) -> str:
+        return normalize_hex_color(value)
 
 
 class ColorSliderConfig(CamelCaseModel):
@@ -85,7 +111,24 @@ class OptimizationSettings(CamelCaseModel):
     # Same choices as the CLI; anything else used to silently run as kmeans.
     init_heightmap_method: Literal["kmeans", "depth"] = "kmeans"
     priority_mask: str = ""
+    # How many times more a painted focus-area pixel counts (--priority_mask_strength).
+    priority_mask_strength: float = Field(10.0, ge=1.0, le=1000.0)
     visualize: bool = False
+
+    def base_height_error(self) -> Optional[str]:
+        """The CLI refuses a base that isn't a whole number of layers
+        (perform_basic_check); the webui ran it anyway, so every color layer
+        of the model sat off the printer's layer grid and the swap
+        instructions named heights the slicer never prints. Checked with a
+        tolerance: 0.28 / 0.04 is 7.000000000000001 in floating point."""
+        ratio = self.background_height / self.layer_height
+        if abs(ratio - round(ratio)) > 1e-6:
+            return (
+                f"Base height ({self.background_height:g} mm) must be a multiple of the "
+                f"layer height ({self.layer_height:g} mm), e.g. "
+                f"{max(1, round(ratio)) * self.layer_height:.2f} mm."
+            )
+        return None
 
 
 class JobStatus(CamelCaseModel):

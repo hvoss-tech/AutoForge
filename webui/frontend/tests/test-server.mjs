@@ -22,11 +22,16 @@ const python = process.env.AUTOFORGE_PYTHON || 'python'
 // after the run, rather than flooding the test output.
 const logPath = path.join(os.tmpdir(), 'autoforge-webui-e2e-server.log')
 const logFd = fs.openSync(logPath, 'w')
+// Never the developer's real HueForge library: its presence opens a
+// first-start import offer over the whole app. Specs that want one write a
+// file here (keep in sync with HUEFORGE_TEST_LIBRARY in tests/helpers.ts).
+const hueforgeLibrary = path.join(os.tmpdir(), 'autoforge-webui-e2e-hueforge', 'personal_library.json')
+fs.rmSync(path.dirname(hueforgeLibrary), { recursive: true, force: true })
 
 const server = spawn(
   python,
   ['-m', 'uvicorn', 'autoforge.webui.server:app', '--host', '127.0.0.1', '--port', port, '--log-level', 'warning'],
-  { cwd: dataDir, stdio: ['ignore', logFd, logFd], env: { ...process.env, PYTHONUNBUFFERED: '1' } },
+  { cwd: dataDir, stdio: ['ignore', logFd, logFd], env: { ...process.env, PYTHONUNBUFFERED: '1', AUTOFORGE_WEBUI_HUEFORGE_LIBRARY: hueforgeLibrary } },
 )
 console.log(`AutoForge test server log: ${logPath}`)
 

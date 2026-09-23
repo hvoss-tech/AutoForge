@@ -12,7 +12,7 @@ import {
 } from '../lib/history'
 import { describeApiError } from '../lib/apiError'
 import * as bandOps from '../lib/bandOps'
-import { readStoredRunInputs, storeRunInputs, type RunInputs } from '../lib/staleResult'
+import { inheritRunInputs, readStoredRunInputs, storeRunInputs, type RunInputs } from '../lib/staleResult'
 import { appendLossPoint, type LossPoint } from '../lib/lossHistory'
 import type { PruningCounts } from '../lib/pruning'
 import { projectFileName, projectFingerprint, projectNameFromFile } from '../lib/project'
@@ -39,6 +39,16 @@ function snapshotToHistoryEntry(s: Snapshot): HistoryEntry {
 }
 
 let pruningPollTimer: ReturnType<typeof setTimeout> | null = null
+// Bumped by stopPruningPoll(). clearTimeout alone can't stop a poll whose
+// status fetch is already in flight: it re-armed itself afterwards and, once
+// the prune finished, made that result the current job — under a new image
+// or a new project the user had switched to in the meantime.
+let pruningPollGeneration = 0
+function stopPruningPoll() {
+  pruningPollGeneration += 1
+  if (pruningPollTimer) clearTimeout(pruningPollTimer)
+  pruningPollTimer = null
+}
 const MAX_TOASTS = 5
 
 // POST /api/init/run requests from this page still waiting for an answer.
@@ -50,6 +60,10 @@ export function isInitRequestInFlight(): boolean {
 }
 
 export type ToastLevel = 'error' | 'warning' | 'info'
+
+export type ImageView = 'original' | 'result' | 'split' | 'compare' | 'difference'
+
+export type ServerConnection = 'ok' | 'reconnecting' | 'lost'
 
 export type InitOutcome = 'ready' | 'busy' | 'error'
 
@@ -271,6 +285,7 @@ export const defaultSettings: OptimizationSettings = {
   cap_layers: 0,
   init_heightmap_method: 'kmeans',
   priority_mask: '',
+  priority_mask_strength: 10,
   visualize: true,
 }
 
@@ -311,6 +326,9 @@ interface AppState {
   hasRenderedInitPreview: boolean
   newFilamentModalOpen: boolean
   importModalOpen: boolean
+  /** The import dialog was opened by the one-time first-start offer to
+   * import HueForge's personal library, not by the Import button. */
+  importModalHueforgeOffer: boolean
   customLibraryLoaded: boolean
   editFilamentModalOpen: boolean
   editingFilament: Filament | null
@@ -322,7 +340,7 @@ interface AppState {
   confirmRequest: ConfirmRequest | null
   historyOpen: boolean
   bottomTab: 'layers' | 'plan'
-  imageView: 'original' | 'result' | 'split' | 'compare'
+  imageView: ImageView
   /** The band selected in the layer list / color core (a colorSliders index). */
   selectedBand: number | null
   /** The band under the pointer in either of them. */
@@ -348,6 +366,13 @@ interface AppState {
   tutorialOpen: boolean
   /** Write filament edits to the library as they're made. */
   autoSaveLibrary: boolean
+  /** Whether the running job's server can be reached: 'reconnecting' while
+   * the progress socket is being re-established, 'lost' once that gave up
+   * and status polls fail too (the server stopped or crashed). */
+  serverConnection: ServerConnection
+  /** Bumped by retryServerConnection(); the job socket reconnects from
+   * scratch whenever it changes. */
+  connectionRetryNonce: number
 
   setFilaments: (filaments: Filament[]) => void
   setFilamentTypes: (types: string[]) => void
@@ -362,7 +387,7 @@ interface AppState {
   resolveConfirm: (ok: boolean) => void
   setHistoryOpen: (open: boolean) => void
   setBottomTab: (tab: 'layers' | 'plan') => void
-  setImageView: (view: 'original' | 'result' | 'split' | 'compare') => void
+  setImageView: (view: ImageView) => void
   setSelectedBand: (index: number | null) => void
   setHoveredBand: (index: number | null) => void
   moveBand: (from: number, to: number) => void
@@ -394,6 +419,7 @@ interface AppState {
   setHasRenderedInitPreview: (val: boolean) => void
   setNewFilamentModalOpen: (open: boolean) => void
   setImportModalOpen: (open: boolean) => void
+  openHueforgeImportOffer: () => void
   setCustomLibraryLoaded: (loaded: boolean) => void
   setEditFilamentModalOpen: (open: boolean) => void
   setEditingFilament: (filament: Filament | null) => void
@@ -420,6 +446,10 @@ interface AppState {
   setBaseFilament: (filament: Filament) => void
   setTutorialOpen: (open: boolean) => void
   setAutoSaveLibrary: (on: boolean) => void
+  setServerConnection: (state: ServerConnection) => void
+  retryServerConnection: () => void
+  /** The uploaded focus-area mask (a file in uploads/), or '' for none. */
+  setPriorityMask: (filename: string) => void
   applyUploadedImage: (filename: string, displayUrl: string) => Promise<void>
 
   // Undo/redo
@@ -458,6 +488,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   hasRenderedInitPreview: false,
   newFilamentModalOpen: false,
   importModalOpen: false,
+  importModalHueforgeOffer: false,
   customLibraryLoaded: false,
   editFilamentModalOpen: false,
   editingFilament: null,
@@ -485,6 +516,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   // First visit opens it by itself; after that it's the ? button's job.
   tutorialOpen: !hasSeenTutorial(),
   autoSaveLibrary: readAutoSaveLibrary(),
+  serverConnection: 'ok',
+  connectionRetryNonce: 0,
 
   requestConfirm: (request) => {
     // Only one at a time: a newer request cancels an unanswered older one.
@@ -562,10 +595,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   dismissSessionRestored: () => set({ sessionRestored: false }),
   startNewProject: () => {
-    if (pruningPollTimer) clearTimeout(pruningPollTimer)
+    stopPruningPoll()
     set((state) => ({
       inputImage: null,
-      settings: { ...state.settings, input_image: '' },
+      settings: { ...state.settings, input_image: '', priority_mask: '' },
       colorSliders: [],
       sliderLayerRange: { min: 0, max: state.settings.max_layers || 75 },
       currentJob: null,
@@ -792,7 +825,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   setInitState: (state) => set((prev) => ({ initState: { ...prev.initState, ...state } })),
   setHasRenderedInitPreview: (val) => set({ hasRenderedInitPreview: val }),
   setNewFilamentModalOpen: (open) => set({ newFilamentModalOpen: open }),
-  setImportModalOpen: (open) => set({ importModalOpen: open }),
+  setImportModalOpen: (open) => set({ importModalOpen: open, importModalHueforgeOffer: false }),
+  openHueforgeImportOffer: () => set({ importModalOpen: true, importModalHueforgeOffer: true }),
   setCustomLibraryLoaded: (loaded) => set({ customLibraryLoaded: loaded }),
   setEditFilamentModalOpen: (open) => set({ editFilamentModalOpen: open }),
   setEditingFilament: (filament) => set({ editingFilament: filament }),
@@ -853,7 +887,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // applyUploadedImage() clears it for a fresh upload. Leaving any of it
     // in place is what showed the previous project's PLY under the loaded
     // one, and re-rendered the new project's colors onto the old heightmap.
-    if (pruningPollTimer) clearTimeout(pruningPollTimer)
+    stopPruningPoll()
     await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
     set({
       currentJob: null,
@@ -961,18 +995,31 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ autoSaveLibrary: on })
   },
 
+  setServerConnection: (state) => {
+    if (get().serverConnection !== state) set({ serverConnection: state })
+  },
+  retryServerConnection: () => set((s) => ({ serverConnection: 'reconnecting', connectionRetryNonce: s.connectionRetryNonce + 1 })),
+
+  setPriorityMask: (filename) => {
+    const before = get().settings
+    if (before.priority_mask === filename) return
+    set({ settings: { ...before, priority_mask: filename } })
+    queueCaptureSnapshot(filename ? 'Painted focus areas' : 'Cleared focus areas')
+  },
+
   applyUploadedImage: async (filename, displayUrl) => {
     // A new photo invalidates everything derived from the old one. Leaving
     // any of it in place is what made the 3D panel show the previous image:
     // `stlFile`/`currentJob` kept the old result's mesh on screen, and the
     // backend kept serving the old auto-preview mesh (its state was still
     // "ready") until the new heightmap init finished.
-    if (pruningPollTimer) clearTimeout(pruningPollTimer)
+    stopPruningPoll()
     // Before the store changes, not after: setting `inputImage` is what makes
     // useAutoPreviewInit start the new heightmap init, and a reset landing
     // after that had started would wipe the init it had just kicked off.
     await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
-    const settings = { ...get().settings, input_image: filename }
+    // The focus-area mask was painted over the old picture's shapes.
+    const settings = { ...get().settings, input_image: filename, priority_mask: '' }
     set({
       settings,
       inputImage: displayUrl,
@@ -1078,7 +1125,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     const data = await response.json()
     markJobTracked()
-    if (pruningPollTimer) clearTimeout(pruningPollTimer)
+    stopPruningPoll()
     const runInputsByJob = storeRunInputs(get().runInputsByJob, data.job_id, {
       settings: { ...state.settings },
       filamentUuids: state.activeFilaments.map((f) => f.uuid),
@@ -1159,15 +1206,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     // files stop changing once this prune begins, so anything still
     // pointing at it would keep showing the *pre-this-prune* result.
     const jobId = data.job_id
-    if (pruningPollTimer) clearTimeout(pruningPollTimer)
+    const sourceJobId = state.currentJob.job_id
+    stopPruningPoll()
+    const generation = pruningPollGeneration
     const poll = async () => {
       try {
         const res = await fetch(`/api/optimize/status/${jobId}`)
+        if (generation !== pruningPollGeneration) return
         if (res.ok) {
           const job = await res.json()
           set({ pruningJob: job })
           if (job.status === 'completed') {
-            set({ currentJob: job, stlFile: job.job_id })
+            // The pruned result is built from the same run's settings and
+            // filaments. Without its own entry here it had none, so the
+            // "Out of date" badge could never show for a pruned result.
+            const runInputsByJob = inheritRunInputs(get().runInputsByJob, sourceJobId, job.job_id)
+            set({ currentJob: job, stlFile: job.job_id, runInputsByJob })
             get().loadBaseColor(job.job_id)
             queueCaptureSnapshot('Pruning completed')
           }
@@ -1176,6 +1230,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       } catch {
         // Keep polling; backend may briefly be unavailable between prune stages
       }
+      if (generation !== pruningPollGeneration) return
       pruningPollTimer = setTimeout(poll, 1000)
     }
     poll()
