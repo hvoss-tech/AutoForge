@@ -4,6 +4,7 @@ AutoForge is a Python tool for generating 3D printed layered models from an inpu
 
 **TLDR:** It uses a picture to generate a 3D layer image that you can print with a 3d printer. Similar to [Hueforge](https://shop.thehueforge.com/), but without the manual work.
 
+![2.0_webui.png](images/webui/2.0_webui.png)
 
 
 
@@ -41,7 +42,6 @@ The pruning is set to a maximum of 8 color and 20 swaps, so each image uses at m
 
 ## Web UI: One-Click Install & Run
 
-![2.0_webui.png](images/webui/2.0_webui.png)
 
 The easiest way to use AutoForge is the web UI, a local app with drag-and-drop image upload, a filament library, live sliders for adjusting colors after optimization, and pruning. No command-line arguments needed.
 
