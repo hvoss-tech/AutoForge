@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "test": "npm run build && playwright test",
     "test:e2e": "playwright test",
-    "test:unit": "node --test tests/*.test.mjs"
+    "test:unit": "node --import tsx/esm --test tests/*.test.mjs"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.2",
@@ -43,6 +43,7 @@
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.16",
+    "tsx": "^4.23.15",
     "typescript": "~5.6.2",
     "vite": "^6.0.3"
   }
