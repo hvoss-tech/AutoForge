@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import threading
 from collections import defaultdict
@@ -8,7 +9,14 @@ from fastapi import APIRouter, HTTPException
 from ..config import config
 from ..services.optimization_service import get_optimization_service
 from ..services.filament_service import get_filament_service
-from ..helpers.slider_render import render_with_sliders
+from ..helpers.mesh_persist import schedule_persist
+from ..helpers.slider_render import (
+    compute_slider_render,
+    render_with_sliders,
+    top_vertex_colors,
+    write_slider_ply,
+    write_slider_png,
+)
 from .ws import broadcast_preview
 from .init import get_init_pipeline_result, _init_dir
 from .outputs import EDITED_PLY, EDITED_PNG
@@ -24,7 +32,6 @@ INIT_JOB_SENTINEL = "__init__"
 _seq_lock = threading.Lock()
 _latest_seq: dict[str, int] = {}
 _render_locks: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
-
 
 @router.post("/render-with-sliders")
 async def render_preview(data: dict):
@@ -91,6 +98,8 @@ async def render_preview(data: dict):
         _latest_seq[effective_job_id] = seq = _latest_seq.get(effective_job_id, 0) + 1
         render_lock = _render_locks[effective_job_id]
 
+    want_vertex_colors = bool(data.get("vertex_colors"))
+
     def _render():
         # One render per target at a time (they write the same files), and a
         # request that was overtaken by a newer edit while it waited is
@@ -99,7 +108,20 @@ async def render_preview(data: dict):
         with render_lock:
             if _latest_seq.get(effective_job_id) != seq:
                 return "superseded"
-            return render_with_sliders(pipeline_result, sliders, filament_lookup, output_dir, **file_names)
+            if not want_vertex_colors:
+                return render_with_sliders(pipeline_result, sliders, filament_lookup, output_dir, **file_names)
+            render = compute_slider_render(pipeline_result, sliders, filament_lookup)
+            if render is None:
+                return None
+            png_name = file_names.get("png_name", "final_model.png")
+            ply_name = file_names.get("ply_name", "final_model_colored.ply")
+            write_slider_png(render, output_dir, png_name)
+            schedule_persist(effective_job_id, lambda: write_slider_ply(render, output_dir, ply_name))
+            return {
+                "image_b64": render["image_b64"],
+                "vertex_colors": base64.b64encode(top_vertex_colors(render)).decode("ascii"),
+                "top_vertex_count": int(len(render["top_vertex_pixels"])),
+            }
 
     # Off the event loop: this is real GPU/CPU work, and running it inline
     # stalled every other request and websocket while a slider was dragged.
@@ -120,6 +142,16 @@ async def render_preview(data: dict):
         # stick). Optimization/pruning broadcasts still send `sliders`
         # because those genuinely carry new information the frontend
         # doesn't have (the server-derived stack from a fresh solution).
-        broadcast_preview(result["image_b64"], job_id=effective_job_id)
+        #
+        # `render_id` lets the tab that asked for this edit recognize it:
+        # that tab already recolored its mesh from the response, so it must
+        # not refetch the whole PLY because of this broadcast.
+        broadcast_preview(result["image_b64"], job_id=effective_job_id, render_id=data.get("render_id"))
 
-    return {"status": "ok", "job_id": effective_job_id, "slider_count": len(sliders)}
+    response = {"status": "ok", "job_id": effective_job_id, "slider_count": len(sliders)}
+    if "vertex_colors" in result:
+        # RGB bytes (base64) for the mesh's top vertices, in vertex order —
+        # the client writes them straight into the mesh it already shows.
+        response["vertex_colors"] = result["vertex_colors"]
+        response["top_vertex_count"] = result["top_vertex_count"]
+    return response

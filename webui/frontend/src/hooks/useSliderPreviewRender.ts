@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useDebouncedCallback } from './useDebouncedCallback'
 import { useAppStore } from '../store/appStore'
-import type { Filament } from '../types'
+import type { ColorSliderConfig, Filament } from '../types'
 import { slidersNeedRender } from '../lib/sliderDiff'
 import { describeApiError } from '../lib/apiError'
 import { sliderRenderPaused } from '../lib/history'
+import { decodeBase64, meshKeyForJob, newRenderId, publishVertexColors } from '../lib/meshColors'
 
 // Mirrors api/preview.py's INIT_JOB_SENTINEL — tells the backend "there's
 // no completed job yet, render against the post-upload auto-preview state
@@ -14,6 +15,40 @@ export const INIT_JOB_SENTINEL = '__init__'
 /** Re-renders the preview mesh/image whenever the color layers change.
  * Mounted once (in the bottom panel), independent of which tab is shown.
  * Returns whether a render is in flight. */
+interface RenderArgs {
+  sliders: ColorSliderConfig[]
+  filaments: Filament[]
+  jobId: string
+}
+
+async function renderOnce({ sliders, filaments, jobId }: RenderArgs, lastErrorRef: { current: string | null }): Promise<void> {
+  try {
+    const response = await fetch('/api/preview/render-with-sliders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sliders, active_filaments: filaments, job_id: jobId, vertex_colors: true, render_id: newRenderId() }),
+    })
+    if (!response.ok) {
+      // e.g. the result was computed before a server restart and can't be
+      // re-colored — previously the edit just silently did nothing.
+      const message = `Preview not updated: ${describeApiError(await response.json().catch(() => null), response.status)}`
+      if (message !== lastErrorRef.current) useAppStore.getState().pushToast(message, 'warning')
+      lastErrorRef.current = message
+      return
+    }
+    lastErrorRef.current = null
+    const data = await response.json().catch(() => null)
+    if (data?.status !== 'ok') return
+    const applied = typeof data.vertex_colors === 'string'
+      && publishVertexColors(meshKeyForJob(jobId), decodeBase64(data.vertex_colors))
+    // No mesh on screen to recolor (still loading, or a different one):
+    // fetch the file instead, which waits for the edit to be written.
+    if (!applied) useAppStore.getState().bumpPreviewVersion()
+  } catch {
+    // Ignore — the WS-driven preview simply won't update this round.
+  }
+}
+
 export function useSliderPreviewRender(): boolean {
   const colorSliders = useAppStore((s) => s.colorSliders)
   const currentJob = useAppStore((s) => s.currentJob)
@@ -41,29 +76,38 @@ export function useSliderPreviewRender(): boolean {
   const hasResult = !jobActive && (currentJob?.status === 'completed' || initState.status === 'ready')
   const jobId = currentJob?.status === 'completed' ? currentJob.job_id : INIT_JOB_SENTINEL
 
-  const triggerPreviewRender = useDebouncedCallback(async (sliders: typeof colorSliders, filaments: Filament[], jobId: string | undefined) => {
+  // One request in flight at a time, always for the newest stack: while a
+  // slider is dragged, edits that arrive during a render collapse into one
+  // follow-up request instead of queueing (or being dropped until the drag
+  // pauses, as a long debounce did). With the mesh recolored in place from
+  // the response, each round trip is a few tens of milliseconds.
+  const inFlightRef = useRef(false)
+  const queuedRef = useRef<RenderArgs | null>(null)
+
+  const sendRender = useCallback(async (args: RenderArgs) => {
+    if (inFlightRef.current) {
+      queuedRef.current = args
+      return
+    }
+    inFlightRef.current = true
     setIsRendering(true)
     try {
-      const response = await fetch('/api/preview/render-with-sliders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sliders, active_filaments: filaments, job_id: jobId }),
-      })
-      if (!response.ok) {
-        // e.g. the result was computed before a server restart and can't be
-        // re-colored — previously the edit just silently did nothing.
-        const message = `Preview not updated: ${describeApiError(await response.json().catch(() => null), response.status)}`
-        if (message !== lastRenderErrorRef.current) useAppStore.getState().pushToast(message, 'warning')
-        lastRenderErrorRef.current = message
-      } else {
-        lastRenderErrorRef.current = null
-      }
-    } catch {
-      // Ignore — the WS-driven preview simply won't update this round.
+      await renderOnce(args, lastRenderErrorRef)
     } finally {
-      setIsRendering(false)
+      inFlightRef.current = false
+      const next = queuedRef.current
+      queuedRef.current = null
+      if (next) void sendRender(next)
+      else setIsRendering(false)
     }
-  }, [], 150)
+  }, [])
+
+  // Just enough to coalesce the handful of store updates one edit makes.
+  const triggerPreviewRender = useDebouncedCallback(
+    (sliders: typeof colorSliders, filaments: Filament[], jobId: string) => sendRender({ sliders, filaments, jobId }),
+    [],
+    16,
+  )
 
   useEffect(() => {
     // While a job runs, its broadcasts *are* the rendered state — track them

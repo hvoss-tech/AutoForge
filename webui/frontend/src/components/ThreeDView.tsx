@@ -5,6 +5,7 @@ import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 import * as THREE from 'three'
 import { cn } from '../lib/utils'
 import { parseColoredMeshAsync } from '../lib/plyWorkerClient'
+import { colorsNewerThan, currentColorSeq, subscribeVertexColors, writeTopVertexColors } from '../lib/meshColors'
 import type { StackSegment } from '../lib/colorStack'
 
 interface ThreeDViewProps {
@@ -102,6 +103,28 @@ const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
   // until something else forced a rebuild.
   const currentRef = useRef<{ geom: THREE.BufferGeometry; jobKey: string; positionsHash: number } | null>(null)
 
+  // Live slider edits: recolor the geometry on screen in place (see
+  // lib/meshColors) instead of waiting for a whole new PLY.
+  const applyColors = (geom: THREE.BufferGeometry, rgb: Uint8Array): boolean => {
+    const colorAttr = geom.getAttribute('color') as THREE.BufferAttribute | undefined
+    if (!colorAttr || !writeTopVertexColors(colorAttr.array as Float32Array, rgb)) return false
+    colorAttr.needsUpdate = true
+    invalidate()
+    // For timing live edits (tests/jobs/live-recolor.spec.ts, devtools).
+    performance.mark('autoforge:mesh-recolored')
+    return true
+  }
+  useEffect(
+    () =>
+      subscribeVertexColors((update) => {
+        const current = currentRef.current
+        if (!current || current.jobKey !== update.meshKey) return false
+        return applyColors(current.geom, update.rgb)
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [invalidate],
+  )
+
   useEffect(() => {
     let cancelled = false
     setLoading(true)
@@ -114,6 +137,8 @@ const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
     setError(null)
 
     const jobKey = plyUrl.split('?')[0]
+    // Colors published while this file downloads are newer than the file.
+    const loadStartSeq = currentColorSeq()
 
     fetch(plyUrl)
       .then(r => {
@@ -145,6 +170,8 @@ const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
           } else {
             current.geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3))
           }
+          const newer = colorsNewerThan(jobKey, loadStartSeq)
+          if (newer) applyColors(current.geom, newer.rgb)
           setMesh({ geom: current.geom, colors: true })
           setLoading(false)
           invalidate()
@@ -171,6 +198,9 @@ const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
         }
 
         currentRef.current = { geom: centered, jobKey, positionsHash }
+        performance.mark('autoforge:mesh-loaded')
+        const newer = colors ? colorsNewerThan(jobKey, loadStartSeq) : null
+        if (newer) applyColors(centered, newer.rgb)
         setMesh({ geom: centered, colors: !!colors })
         setLoading(false)
         invalidate()

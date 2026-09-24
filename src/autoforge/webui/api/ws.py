@@ -50,6 +50,7 @@ def broadcast_preview(
     loss: float | None = None,
     min_layer: int | None = None,
     max_layer: int | None = None,
+    render_id: str | None = None,
 ):
     """Send a preview update to all connected preview clients (thread-safe).
 
@@ -70,6 +71,8 @@ def broadcast_preview(
         payload["min_layer"] = min_layer
     if max_layer is not None:
         payload["max_layer"] = max_layer
+    if render_id:
+        payload["render_id"] = str(render_id)
     _send_to_all(json.dumps(payload))
 
 

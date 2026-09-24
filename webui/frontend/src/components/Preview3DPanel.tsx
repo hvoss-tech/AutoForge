@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useRef } from 'react'
 import { acceptsPreviewFor, isInitRequestInFlight, useAppStore } from '../store/appStore'
 import { Box, Loader2, AlertTriangle } from 'lucide-react'
 import { ThreeDView } from './ThreeDView'
+import { isOwnRender, meshKeyForJob } from '../lib/meshColors'
+import { INIT_JOB_SENTINEL } from '../hooks/useSliderPreviewRender'
 import { getStackHandles, getStackSegments, filterActiveHandles } from '../lib/colorStack'
 
 export const Preview3DPanel: React.FC = () => {
@@ -14,7 +16,7 @@ export const Preview3DPanel: React.FC = () => {
   const setInitState = useAppStore((s) => s.setInitState)
   const setSliderLayerRange = useAppStore((s) => s.setSliderLayerRange)
   const currentJob = useAppStore((s) => s.currentJob)
-  const previewVersion = useAppStore((s) => s.previewVersion)
+  const meshVersion = useAppStore((s) => s.meshVersion)
   const bumpPreviewVersion = useAppStore((s) => s.bumpPreviewVersion)
   const wsRef = useRef<WebSocket | null>(null)
 
@@ -83,7 +85,11 @@ export const Preview3DPanel: React.FC = () => {
             // A completed job's colored PLY may have been regenerated
             // in-place (e.g. from a slider edit) — the URL is otherwise
             // unchanged, so ThreeDView would never refetch it without this.
-            bumpPreviewVersion()
+            // Except for this tab's own slider edit: its mesh was already
+            // recolored from the render response, and refetching the whole
+            // PLY for it is exactly the slow path that replaced.
+            if (isOwnRender(data.render_id)) useAppStore.getState().bumpImageVersion()
+            else bumpPreviewVersion()
 
             // Only apply slider updates when the backend actually sends a
             // non-empty stack.  Empty payloads must NOT clear the current
@@ -204,17 +210,17 @@ export const Preview3DPanel: React.FC = () => {
   }, [inputImage, setPreviewImage, setInitState, setSliderLayerRange, optimizationStarted, jobFailed, jobHasResult])
 
   const coloredPlyUrl = stlFile && currentJob?.job_id
-    ? `/api/outputs/colored-ply/${currentJob.job_id}?v=${previewVersion}`
+    ? `${meshKeyForJob(currentJob.job_id)}?v=${meshVersion}`
     : null
   // The auto-preview mesh (api/init.py) — the real heightmap-init result,
   // draped with the original photo, so the 3D view shows actual geometry
   // (not a flat 2D image or the fake uniform-block stackSegments preview)
   // the moment an image + filament are present, before the user has ever
-  // clicked Run. `previewVersion` also bumps on every slider-triggered
-  // re-render (ColorSliders posts job_id: "__init__" during this phase),
-  // so manually assigning colors updates this mesh live.
+  // clicked Run. Slider edits in this phase (job_id "__init__") recolor
+  // this mesh in place (lib/meshColors); `meshVersion` only bumps when the
+  // file itself has to be fetched again.
   const initMeshUrl = !stlFile && initState.status === 'ready'
-    ? `/api/init/mesh?v=${previewVersion}`
+    ? `${meshKeyForJob(INIT_JOB_SENTINEL)}?v=${meshVersion}`
     : null
 
   const showNoFilamentsWarning = inputImage && activeFilaments.length === 0 && initState.status !== 'initializing' && !previewImage

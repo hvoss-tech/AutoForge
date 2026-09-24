@@ -10,6 +10,7 @@ const IGNORED = new Set([
   'pruning_max_colors',
   'pruning_max_swaps',
   'pruning_max_layer',
+  'auto_initial_prune',
   'visualize',
   'disable_visualization_for_gradio',
   'tensorboard',

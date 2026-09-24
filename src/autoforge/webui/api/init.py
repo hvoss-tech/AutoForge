@@ -26,6 +26,7 @@ from ..services.image_service import get_image_service
 from ..helpers.pipeline_runner import build_init_preview, friendly_error_message
 from ..helpers.colored_mesh import generate_colored_preview_mesh
 from ..helpers.gpu_memory import release_pipeline_result
+from ..helpers.mesh_persist import cancel_pending_mesh, wait_for_pending_mesh
 from ..helpers.sliders import derive_base_from_result, derive_layer_range_from_result
 
 logger = logging.getLogger(__name__)
@@ -290,6 +291,8 @@ async def init_preview():
 
 @router.get("/mesh")
 async def init_mesh():
+    # A live slider edit of the preview writes this file in the background.
+    await asyncio.to_thread(wait_for_pending_mesh, "__init__")
     with _lock:
         ready = _state["status"] == "ready" and _pipeline_result is not None
     path = _mesh_path()
@@ -316,6 +319,9 @@ async def reset_init():
     """
     global _state
     in_flight_event = reset_init_state()
+    # A slider-edit mesh of the replaced image still being written must land
+    # before the new image's preview is built, never after it.
+    await asyncio.to_thread(wait_for_pending_mesh, "__init__")
     if in_flight_event is not None:
         await asyncio.to_thread(in_flight_event.wait)
         # The replaced build's completion handler deliberately leaves the
@@ -344,6 +350,7 @@ def reset_init_state():
         # finishes — that is what makes /api/init/run refuse to start a
         # second, concurrent build.
     release_pipeline_result(superseded)
+    cancel_pending_mesh("__init__")
     try:
         os.remove(_mesh_path())
     except OSError:

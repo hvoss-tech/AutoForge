@@ -31,6 +31,7 @@ const BASIC_FIELDS: Field[] = [
   { key: 'background_height', label: 'Base height', unit: 'mm', help: 'Solid base printed in the background color before any color layer.', type: 'number', step: 0.01, min: 0 },
   { key: 'stl_output_size', label: 'Size', unit: 'mm', help: 'Length of the longest side of the print.', type: 'number', step: 1, min: 10, integer: true },
   { key: 'auto_background_color', label: 'Pick base color automatically', help: 'Let the optimizer choose the base color from your filaments. Turn off to set it yourself.', type: 'boolean' },
+  { key: 'auto_initial_prune', label: 'Clean up automatically after running', help: "Runs one pruning pass right after optimization finishes, at the result's own color/swap/layer counts (nothing is forced out) — it only merges what doesn't cost accuracy, so the result is print-ready without opening the Pruning dialog by hand.", type: 'boolean' },
   { key: 'background_color', label: 'Base color', help: 'The filament the solid base is printed in.', type: 'color' },
   {
     key: 'init_heightmap_method',

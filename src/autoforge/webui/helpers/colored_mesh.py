@@ -52,6 +52,77 @@ def downsample_grid_step(height: int, width: int, max_dim: int) -> int:
     return max(1, -(-max(height, width) // max_dim))
 
 
+def _sample_grid(full_H: int, full_W: int, max_grid_dim: Optional[int]) -> tuple[np.ndarray, np.ndarray]:
+    """The original row/column indices the preview grid samples."""
+    step = downsample_grid_step(
+        full_H,
+        full_W,
+        preview_mesh_max_dim() if max_grid_dim is None else max_grid_dim,
+    )
+    rows = np.arange(full_H)
+    cols = np.arange(full_W)
+    if step > 1:
+        # The last row/column is kept as well as the strided ones, so the mesh
+        # still spans the full footprint instead of stopping short of the edge.
+        rows = np.unique(np.append(np.arange(0, full_H, step), full_H - 1))
+        cols = np.unique(np.append(np.arange(0, full_W, step), full_W - 1))
+    return rows, cols
+
+
+def _valid_mask(alpha_mask: Optional[np.ndarray], H: int, W: int) -> np.ndarray:
+    valid_mask: np.ndarray = (
+        np.ones((H, W), dtype=bool)
+        if alpha_mask is None
+        else (alpha_mask >= 128).squeeze()
+    )
+    if valid_mask.ndim == 3 and valid_mask.shape[-1] >= 1:
+        valid_mask = valid_mask[:, :, 0]
+    return valid_mask.astype(bool)
+
+
+def _quad_valid(valid_mask: np.ndarray) -> np.ndarray:
+    return (
+        valid_mask[:-1, :-1]
+        & valid_mask[:-1, 1:]
+        & valid_mask[1:, 1:]
+        & valid_mask[1:, :-1]
+    )
+
+
+def top_vertex_pixel_indices(
+    full_H: int,
+    full_W: int,
+    alpha_mask: Optional[np.ndarray] = None,
+    max_grid_dim: Optional[int] = None,
+) -> np.ndarray:
+    """Flat (row-major) pixel index of every *top* vertex of the mesh that
+    ``generate_colored_preview_mesh`` builds for this grid, in the mesh's
+    own vertex order.
+
+    The mesh keeps the top and bottom vertex of every corner of a valid quad
+    (top ones first, row-major), so its first ``len(result)`` vertices are
+    exactly these pixels and the rest are their bottom twins. That is what
+    lets a slider edit — which changes colors, never heights — recolor the
+    mesh the client already has by sending ``colors[result]`` instead of
+    rebuilding, exporting and re-downloading the whole PLY.
+    """
+    rows, cols = _sample_grid(full_H, full_W, max_grid_dim)
+    H, W = len(rows), len(cols)
+    if alpha_mask is not None:
+        alpha = np.asarray(alpha_mask)
+        if alpha.ndim >= 2 and (len(rows) != full_H or len(cols) != full_W):
+            alpha = alpha[np.ix_(rows, cols)]
+        alpha_mask = alpha
+    quad_valid = _quad_valid(_valid_mask(alpha_mask, H, W))
+    corners = np.zeros((H, W), dtype=bool)
+    corners[:-1, :-1] |= quad_valid
+    corners[:-1, 1:] |= quad_valid
+    corners[1:, 1:] |= quad_valid
+    corners[1:, :-1] |= quad_valid
+    ii, jj = np.nonzero(corners)  # row-major, like the mesh's vertex order
+    return (rows[ii] * full_W + cols[jj]).astype(np.int64)
+
+
 def generate_colored_preview_mesh(
     height_map: np.ndarray,
     color_image: np.ndarray,
@@ -85,18 +156,8 @@ def generate_colored_preview_mesh(
         Trimesh with vertex_colors set.
     """
     full_H, full_W = height_map.shape
-    step = downsample_grid_step(
-        full_H,
-        full_W,
-        preview_mesh_max_dim() if max_grid_dim is None else max_grid_dim,
-    )
-    rows = np.arange(full_H)
-    cols = np.arange(full_W)
-    if step > 1:
-        # The last row/column is kept as well as the strided ones, so the mesh
-        # still spans the full footprint instead of stopping short of the edge.
-        rows = np.unique(np.append(np.arange(0, full_H, step), full_H - 1))
-        cols = np.unique(np.append(np.arange(0, full_W, step), full_W - 1))
+    rows, cols = _sample_grid(full_H, full_W, max_grid_dim)
+    if len(rows) != full_H or len(cols) != full_W:
         height_map = height_map[np.ix_(rows, cols)]
         color_image = color_image[np.ix_(rows, cols)]
         if alpha_mask is not None:
@@ -105,21 +166,8 @@ def generate_colored_preview_mesh(
 
     H, W = height_map.shape
 
-    valid_mask: np.ndarray = (
-        np.ones((H, W), dtype=bool)
-        if alpha_mask is None
-        else (alpha_mask >= 128).squeeze()
-    )
-    if valid_mask.ndim == 3 and valid_mask.shape[-1] >= 1:
-        valid_mask = valid_mask[:, :, 0]
-    valid_mask = valid_mask.astype(bool)
-
-    quad_valid = (
-        valid_mask[:-1, :-1]
-        & valid_mask[:-1, 1:]
-        & valid_mask[1:, 1:]
-        & valid_mask[1:, :-1]
-    )
+    valid_mask = _valid_mask(alpha_mask, H, W)
+    quad_valid = _quad_valid(valid_mask)
     vi, vj = np.nonzero(quad_valid)
     if len(vi) == 0:
         return trimesh.Trimesh()

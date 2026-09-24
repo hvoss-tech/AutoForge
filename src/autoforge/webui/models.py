@@ -93,6 +93,12 @@ class OptimizationSettings(CamelCaseModel):
     pruning_max_colors: int = Field(100, ge=1)
     pruning_max_swaps: int = Field(100, ge=0)
     pruning_max_layer: int = Field(75, ge=1)
+    # WebUI-only orchestration flag (the CLI/pipeline never reads it): once
+    # an optimization job completes, the frontend automatically starts one
+    # pruning pass at the result's own current counts (no forced reduction)
+    # so it's print-ready without the user opening the Pruning dialog by
+    # hand. See appStore.setCurrentJob.
+    auto_initial_prune: bool = True
     random_seed: int = 0
     # Empty/None means auto-detect (CUDA/ROCm, then Apple Metal, then CPU).
     device: Optional[str] = None
@@ -183,10 +189,11 @@ class PruningSettings(CamelCaseModel):
     # Every pruning phase is a greedy search scored against the current
     # solution, so a better starting point improves everything after it.
     # Both are strictly non-worsening (see FilamentOptimizer.rng_seed_search
-    # and .polish_height_offsets) and both were previously hardcoded on.
+    # and .polish_height_offsets); seed search is cheap enough to default on,
+    # height fine-tuning is the slower of the two so it defaults off.
     seed_search: bool = True
     seed_search_count: int = Field(200, ge=1, le=20000)
-    fine_tune_height: bool = True
+    fine_tune_height: bool = False
     fine_tune_steps: int = Field(50, ge=1, le=2000)
 
 

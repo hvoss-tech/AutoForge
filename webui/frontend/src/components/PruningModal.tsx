@@ -92,13 +92,13 @@ export const PruningModal: React.FC = () => {
   // repeating it keeps gaining until it doesn't. Off by default: each pass is
   // real GPU time, and the user should choose to spend it.
   const [autoRepeat, setAutoRepeat] = useState(false)
-  // The two polish passes that run before the reduction phases. Both were
-  // hardcoded on (200 seeds / 50 steps) before they became switchable, so on
-  // is the behaviour-preserving default.
+  // The two polish passes that run before the reduction phases. Both are
+  // non-worsening, but height fine-tuning is the slower of the two, so only
+  // color-seed search defaults on.
   const [polish, setPolish] = useState({
     seedSearch: true,
     seedSearchCount: 200,
-    fineTuneHeight: true,
+    fineTuneHeight: false,
     fineTuneSteps: 50,
   })
 

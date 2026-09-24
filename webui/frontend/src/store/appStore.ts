@@ -14,7 +14,8 @@ import { describeApiError } from '../lib/apiError'
 import * as bandOps from '../lib/bandOps'
 import { inheritRunInputs, readStoredRunInputs, storeRunInputs, type RunInputs } from '../lib/staleResult'
 import { appendLossPoint, type LossPoint } from '../lib/lossHistory'
-import type { PruningCounts } from '../lib/pruning'
+import { suggestPruningLimits, resultCounts, type PruningCounts } from '../lib/pruning'
+import { buildPrintPlan } from '../lib/printPlan'
 import { projectFileName, projectFingerprint, projectNameFromFile } from '../lib/project'
 
 // Module-level undo stack — NOT in Zustand store to avoid infinite loops via subscribe
@@ -271,6 +272,7 @@ export const defaultSettings: OptimizationSettings = {
   pruning_max_colors: 100,
   pruning_max_swaps: 100,
   pruning_max_layer: 75,
+  auto_initial_prune: true,
   random_seed: 0,
   device: null,
   mps: false,
@@ -297,7 +299,7 @@ const defaultPruningSettings: PruningSettings = {
   max_passes: 25,
   seed_search: true,
   seed_search_count: 200,
-  fine_tune_height: true,
+  fine_tune_height: false,
   fine_tune_steps: 50,
 }
 
@@ -313,6 +315,10 @@ interface AppState {
   inputImage: string | null
   previewImage: string | null
   previewVersion: number
+  /** Bumped when the 3D mesh file must be fetched again. previewVersion
+   * (the result image) moves with it, except for this tab's own slider
+   * edits: those recolor the mesh in place (lib/meshColors). */
+  meshVersion: number
   stlFile: string | null
   settingsModalOpen: boolean
   activeTab: string
@@ -406,6 +412,7 @@ interface AppState {
   setInputImage: (image: string | null) => void
   setPreviewImage: (image: string | null) => void
   bumpPreviewVersion: () => void
+  bumpImageVersion: () => void
   setStlFile: (file: string | null) => void
   setSettingsModalOpen: (open: boolean) => void
   setActiveTab: (tab: string) => void
@@ -430,7 +437,7 @@ interface AppState {
   pauseOptimization: (jobId: string) => Promise<void>
   resumeOptimization: (jobId: string) => Promise<void>
   cancelOptimization: (jobId: string) => Promise<void>
-  startPruning: () => Promise<string>
+  startPruning: (overrides?: Partial<PruningSettings>) => Promise<string>
   pausePruning: (jobId: string) => Promise<void>
   resumePruning: (jobId: string) => Promise<void>
   cancelPruning: (jobId: string) => Promise<void>
@@ -475,6 +482,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   inputImage: null,
   previewImage: null,
   previewVersion: 0,
+  meshVersion: 0,
   stlFile: null,
   settingsModalOpen: false,
   activeTab: 'PLA',
@@ -807,12 +815,36 @@ export const useAppStore = create<AppState>((set, get) => ({
       // inside the pipeline), so pick it up now that there's a result.
       get().loadBaseColor(job.job_id)
       queueCaptureSnapshot('Optimization completed')
+      // Auto-clean the fresh result once, so it's print-ready without the
+      // user opening the Pruning dialog by hand: the limits are set to the
+      // result's own current counts, so nothing is forced out, but the
+      // color-seed search and swap-position pass still merge/move anything
+      // that doesn't cost accuracy. Never re-fires for a pruning job's own
+      // completion — that path sets currentJob directly (see startPruning's
+      // poll loop) rather than through this action; the job_id check is
+      // cheap extra insurance against that assumption changing later.
+      if (get().settings.auto_initial_prune && !job.job_id.startsWith('prune-')) {
+        const current = resultCounts(buildPrintPlan(get().colorSliders, [], get().settings))
+        const limits = suggestPruningLimits(current)
+        set({ pruningBaseline: current })
+        get().startPruning({
+          pruning_max_colors: limits.colors,
+          pruning_max_swaps: limits.swaps,
+          pruning_max_layer: limits.layers,
+          auto_repeat: false,
+          seed_search: true,
+          fine_tune_height: false,
+        }).catch((e) => {
+          console.error('Automatic initial pruning failed:', e)
+        })
+      }
     }
   },
   setSliderLayerRange: (range) => set({ sliderLayerRange: range }),
   setInputImage: (image) => { set({ inputImage: image }); queueCaptureSnapshot('Input image changed') },
   setPreviewImage: (image) => set({ previewImage: image }),
-  bumpPreviewVersion: () => set((state) => ({ previewVersion: state.previewVersion + 1 })),
+  bumpPreviewVersion: () => set((state) => ({ previewVersion: state.previewVersion + 1, meshVersion: state.meshVersion + 1 })),
+  bumpImageVersion: () => set((state) => ({ previewVersion: state.previewVersion + 1 })),
   setStlFile: (file) => set({ stlFile: file }),
   setSettingsModalOpen: (open) => set({ settingsModalOpen: open }),
   setActiveTab: (tab) => set({ activeTab: tab }),
@@ -1180,15 +1212,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     }))
   },
 
-  startPruning: async () => {
+  startPruning: async (overrides) => {
     const state = get()
     if (state.currentJob?.status !== 'completed') {
       throw new Error("Run an optimization first — there's no result to prune yet.")
     }
+    const pruningSettings = { ...state.pruningSettings, ...overrides }
     const response = await fetch('/api/pruning/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...state.pruningSettings, job_id: state.currentJob.job_id }),
+      body: JSON.stringify({ ...pruningSettings, job_id: state.currentJob.job_id }),
     })
     if (!response.ok) {
       throw new Error(describeApiError(await response.json().catch(() => null), response.status))

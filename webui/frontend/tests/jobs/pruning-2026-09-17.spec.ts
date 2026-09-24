@@ -112,15 +112,19 @@ test('the polish passes run before pruning, are switchable, and only ever help',
   await byTestId(page, 'top-pruning-btn').click()
   await expect(byTestId(page, 'pruning-modal')).toBeVisible()
 
-  // Both on by default — they were hardcoded on before they became options.
+  // Color-seed search is on by default (cheap); height fine-tuning is off
+  // (slower) — both are switchable.
   await expect(byTestId(page, 'pruning-seed-search')).toBeChecked()
-  await expect(byTestId(page, 'pruning-fine-tune-height')).toBeChecked()
-  // Their limits are editable, and only shown while the pass is enabled.
+  await expect(byTestId(page, 'pruning-fine-tune-height')).not.toBeChecked()
+  // Its limit is editable, and only shown while the pass is enabled.
   await expect(byTestId(page, 'pruning-seed-search-count')).toHaveValue('200')
-  await expect(byTestId(page, 'pruning-fine-tune-steps')).toHaveValue('50')
   await byTestId(page, 'pruning-seed-search').uncheck()
   await expect(byTestId(page, 'pruning-seed-search-count')).toHaveCount(0)
   await byTestId(page, 'pruning-seed-search').check()
+
+  // Turn height fine-tuning on too, so this test still exercises both passes.
+  await byTestId(page, 'pruning-fine-tune-height').check()
+  await expect(byTestId(page, 'pruning-fine-tune-steps')).toHaveValue('50')
 
   // Keep them small so the test stays quick, but real.
   await byTestId(page, 'pruning-seed-search-count').fill('40')

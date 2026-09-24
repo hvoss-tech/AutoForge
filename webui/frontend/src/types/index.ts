@@ -46,6 +46,9 @@ export interface OptimizationSettings {
   pruning_max_colors: number
   pruning_max_swaps: number
   pruning_max_layer: number
+  /** Run one unlimited pruning pass automatically once an optimization
+   * completes (see appStore.setCurrentJob). */
+  auto_initial_prune: boolean
   random_seed: number
   /** Torch device override ('cuda', 'cuda:1', 'mps', 'cpu'); null = auto-detect. */
   device: string | null

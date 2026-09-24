@@ -15,6 +15,7 @@ mapping implied by the slider stack instead of the optimizer's learned
 
 from __future__ import annotations
 
+import base64
 import os
 import threading
 from typing import Any, Optional
@@ -25,7 +26,11 @@ import torch
 
 from autoforge.Helper.FilamentHelper import hex_to_rgb
 from autoforge.Helper.OptimizerHelper import bleed_layer_effect
-from autoforge.webui.helpers.colored_mesh import generate_colored_preview_mesh
+from autoforge.webui.helpers.colored_mesh import (
+    generate_colored_preview_mesh,
+    preview_mesh_max_dim,
+    top_vertex_pixel_indices,
+)
 
 # Same empirical opacity-vs-thickness curve used by composite_image_disc /
 # composite_image_cont — keep in sync with OptimizerHelper.py.
@@ -197,19 +202,17 @@ def _alpha_matching_shape(pipeline_result: dict[str, Any], target_hw: tuple[int,
     return resized
 
 
-def render_with_sliders(
+def compute_slider_render(
     pipeline_result: dict[str, Any],
     sliders: list[dict],
     filament_lookup: dict[str, dict],
-    output_dir: str,
-    png_name: str = "final_model.png",
-    ply_name: str = "final_model_colored.ply",
 ) -> Optional[dict[str, Any]]:
-    """Recompute the composite preview + colored PLY from an edited slider
-    stack, writing ``png_name`` / ``ply_name`` into ``output_dir``.
+    """The fast part of a slider edit: composite the edited stack and encode
+    the preview PNG — no files written, no mesh built.
 
-    Returns ``{"image_b64": str, "preview_png": path, "colored_ply": path}``
-    or ``None`` if there is no discretized solution to render yet.
+    Returns None when there is no discretized solution (or nothing enabled).
+    Everything in the result is plain numpy/bytes, so it can outlive the
+    pipeline result (a background PLY write keeps no GPU memory alive).
     """
     optimizer = pipeline_result["optimizer"]
     args = pipeline_result["args"]
@@ -244,39 +247,95 @@ def render_with_sliders(
             max_layers,
         )
 
-    comp_np = comp.detach().cpu().numpy().astype(np.uint8)
+    comp_np = np.ascontiguousarray(comp.detach().cpu().numpy().astype(np.uint8))
     comp_bgr = cv2.cvtColor(comp_np, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".png", comp_bgr)
+    png_bytes = buf.tobytes() if ok else None
 
-    _ok, buf = cv2.imencode(".png", comp_bgr)
-    image_b64 = None
-    if _ok:
-        import base64
+    height_map_mm = disc_height_image.detach().cpu().numpy().astype(np.float32) * h
+    alpha_for_mesh = _alpha_matching_shape(pipeline_result, height_map_mm.shape[:2])
+    return {
+        "comp_np": comp_np,
+        "png_bytes": png_bytes,
+        "image_b64": base64.b64encode(png_bytes).decode("utf-8") if png_bytes else None,
+        "height_map_mm": height_map_mm,
+        "alpha": alpha_for_mesh,
+        "background_height": float(args.background_height),
+        "stl_output_size": float(args.stl_output_size),
+        "top_vertex_pixels": _cached_top_vertex_pixels(pipeline_result, height_map_mm.shape[:2], alpha_for_mesh),
+    }
 
-        image_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
 
+def _cached_top_vertex_pixels(pipeline_result: dict[str, Any], hw: tuple[int, int], alpha) -> np.ndarray:
+    """Which pixel each top mesh vertex shows. It depends only on the grid
+    size and the alpha mask — never on heights or colors — so it is computed
+    once per result instead of on every edit."""
+    key = (int(hw[0]), int(hw[1]), preview_mesh_max_dim(),
+           id(pipeline_result.get("alpha")), id(pipeline_result.get("alpha_proc")))
+    cached = pipeline_result.get("_top_vertex_pixels")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    idx = top_vertex_pixel_indices(int(hw[0]), int(hw[1]), alpha)
+    pipeline_result["_top_vertex_pixels"] = (key, idx)
+    return idx
+
+
+def top_vertex_colors(render: dict[str, Any]) -> bytes:
+    """RGB bytes for the mesh's top vertices, in vertex order (see
+    ``top_vertex_pixel_indices``) — all a client needs to recolor the mesh
+    it already shows. The bottom vertices never change color."""
+    return render["comp_np"].reshape(-1, 3)[render["top_vertex_pixels"]].tobytes()
+
+
+def write_slider_png(render: dict[str, Any], output_dir: str, png_name: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     preview_path = os.path.join(output_dir, png_name)
     # Written to a temp file and renamed into place: the 3D view / image panel
     # fetch these files right after every edit, and reading one while it was
     # being rewritten in place gave truncated or aborted responses.
-    if _ok:
-        _atomic_write_bytes(preview_path, buf.tobytes())
+    if render["png_bytes"] is not None:
+        _atomic_write_bytes(preview_path, render["png_bytes"])
     else:
-        cv2.imwrite(preview_path, comp_bgr)
+        cv2.imwrite(preview_path, cv2.cvtColor(render["comp_np"], cv2.COLOR_RGB2BGR))
+    return preview_path
 
-    height_map_mm = disc_height_image.detach().cpu().numpy().astype(np.float32) * h
-    color_image_np = np.ascontiguousarray(comp_np)
-    alpha_for_mesh = _alpha_matching_shape(pipeline_result, height_map_mm.shape[:2])
+
+def write_slider_ply(render: dict[str, Any], output_dir: str, ply_name: str) -> str:
+    """The slow part: build and export the colored mesh (~150ms and ~25MB at
+    default settings). Only needed so the edit survives a reload/undo — a
+    live edit reaches the 3D view as vertex colors instead."""
     colored_mesh = generate_colored_preview_mesh(
-        height_map=height_map_mm,
-        color_image=color_image_np,
-        background_height=float(args.background_height),
-        maximum_x_y_size=float(args.stl_output_size),
-        alpha_mask=alpha_for_mesh,
+        height_map=render["height_map_mm"],
+        color_image=render["comp_np"],
+        background_height=render["background_height"],
+        maximum_x_y_size=render["stl_output_size"],
+        alpha_mask=render["alpha"],
     )
+    os.makedirs(output_dir, exist_ok=True)
     ply_path = os.path.join(output_dir, ply_name)
     tmp_ply = f"{ply_path}.{os.getpid()}.{threading.get_ident()}.tmp.ply"
     colored_mesh.export(tmp_ply, encoding="binary")
     os.replace(tmp_ply, ply_path)
+    return ply_path
 
-    return {"image_b64": image_b64, "preview_png": preview_path, "colored_ply": ply_path}
+
+def render_with_sliders(
+    pipeline_result: dict[str, Any],
+    sliders: list[dict],
+    filament_lookup: dict[str, dict],
+    output_dir: str,
+    png_name: str = "final_model.png",
+    ply_name: str = "final_model_colored.ply",
+) -> Optional[dict[str, Any]]:
+    """Recompute the composite preview + colored PLY from an edited slider
+    stack, writing ``png_name`` / ``ply_name`` into ``output_dir``.
+
+    Returns ``{"image_b64": str, "preview_png": path, "colored_ply": path}``
+    or ``None`` if there is no discretized solution to render yet.
+    """
+    render = compute_slider_render(pipeline_result, sliders, filament_lookup)
+    if render is None:
+        return None
+    preview_path = write_slider_png(render, output_dir, png_name)
+    ply_path = write_slider_ply(render, output_dir, ply_name)
+    return {"image_b64": render["image_b64"], "preview_png": preview_path, "colored_ply": ply_path}

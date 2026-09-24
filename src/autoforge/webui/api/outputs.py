@@ -1,9 +1,11 @@
+import asyncio
 import io
 import os
 import zipfile
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from ..config import config
+from ..helpers.mesh_persist import wait_for_pending_mesh
 from ..services.optimization_service import get_optimization_service
 
 router = APIRouter()
@@ -87,6 +89,9 @@ async def current_preview(job_id: str):
 async def download_colored_ply(job_id: str):
     """The mesh the 3D view shows: the user's slider-edited version when one
     exists, otherwise the optimizer's own."""
+    # A live edit writes its mesh in the background; don't serve the one
+    # from before it.
+    await asyncio.to_thread(wait_for_pending_mesh, job_id)
     edited = _job_path(job_id, EDITED_PLY)
     if edited and os.path.exists(edited):
         return FileResponse(edited, filename=f"{job_id}_colored.ply")

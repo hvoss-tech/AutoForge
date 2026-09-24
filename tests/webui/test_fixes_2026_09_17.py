@@ -396,14 +396,15 @@ def test_the_full_resolution_height_restore_happens_only_once():
 
 
 def test_pruning_settings_expose_the_polish_passes(client):
-    """Both used to be hardcoded — 200 seeds inside prune(), 50 fine-tune
-    steps in export_results — so on is the behaviour-preserving default."""
+    """Both are non-worsening polish passes that run before the reduction
+    phases. Seed search is cheap and defaults on; height fine-tuning is the
+    slower of the two and defaults off."""
     from autoforge.webui.models import PruningSettings
 
     defaults = PruningSettings()
     assert defaults.seed_search is True
     assert defaults.seed_search_count == 200
-    assert defaults.fine_tune_height is True
+    assert defaults.fine_tune_height is False
     assert defaults.fine_tune_steps == 50
 
     custom = PruningSettings(seed_search=False, seed_search_count=5000, fine_tune_steps=200)
