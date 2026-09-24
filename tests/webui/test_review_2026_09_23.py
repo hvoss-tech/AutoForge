@@ -838,11 +838,14 @@ def test_successful_prune_clones_into_its_own_job_and_directory(client, monkeypa
     assert prune_job.input_image == "history-clone.png"
     assert svc.get_latest_job().job_id == prune_job_id
 
-    # Its pipeline result is aliased, not moved: both ids resolve to a
-    # result, and the original job's is untouched (a follow-up prune off
-    # the *original* job, or an already-open tab still pointed at it,
-    # must not find it silently emptied).
+    # The new job resolves to the (still-mutating) optimizer, via the same
+    # underlying dict claim_pipeline_result() already retargeted at the
+    # start of this prune.
     assert svc.get_pipeline_result(prune_job_id) is not None
     assert svc.get_pipeline_result(prune_job_id)["optimizer"] is original_result["optimizer"]
-    assert svc.get_pipeline_result(done.job_id) is original_result
-    assert svc.get_pipeline_result(done.job_id)["optimizer"] is original_result["optimizer"]
+    # The *original* job id gets nothing any more (see get_pipeline_result's
+    # own docstring): pruning mutated that optimizer in place, so the
+    # original id resolving to it would hand out a pruned solution under an
+    # unpruned job's id — exactly the "undo back to the unpruned result
+    # shows pruned heights" bug this ownership check exists to prevent.
+    assert svc.get_pipeline_result(done.job_id) is None
