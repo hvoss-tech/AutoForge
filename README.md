@@ -2,12 +2,10 @@
 
 AutoForge is a Python tool for generating 3D printed layered models from an input image. Using a learned optimization strategy with a Gumbel softmax formulation, AutoForge assigns materials per layer and produces both a discretized composite image and a 3D-printable STL file. It also generates swap instructions to guide the printer through material changes during a multi-material print. 
 
-**TLDR:** It uses a picture to generate a 3D layer image that you can print with a 3d printer. Similar to [Hueforge](https://shop.thehueforge.com/), but without the manual work (and without the artistic control).
+**TLDR:** It uses a picture to generate a 3D layer image that you can print with a 3d printer. Similar to [Hueforge](https://shop.thehueforge.com/), but without the manual work.
 
 
-## You can now run Autoforge for free in your browser thanks to [Huggingface space support](https://huggingface.co/spaces/hvoss-techfak/Autoforge).
-This includes the option to run it locally if you have a powerful pc and don't want to limit yourself to the Huggingface computing limits. \
-For this simply go to the [Huggingface](https://huggingface.co/spaces/hvoss-techfak/Autoforge) space and pull the docker container for this project (upper right corner -> three dots -> "run locally")
+
 
 ## Example
 All examples use only the 27 BambuLab Basic PLA filaments, currently available in Hueforge 0.9.0, the background color is set to black.
@@ -43,14 +41,14 @@ The pruning is set to a maximum of 8 color and 20 swaps, so each image uses at m
 
 ## Web UI: One-Click Install & Run
 
-The easiest way to use AutoForge is the web UI — a local app (like ComfyUI) with drag-and-drop image upload, a filament library, live sliders for adjusting colors after optimization, and pruning. No command-line arguments needed.
+The easiest way to use AutoForge is the web UI, a local app with drag-and-drop image upload, a filament library, live sliders for adjusting colors after optimization, and pruning. No command-line arguments needed.
 
 1. **Clone this repository** (or download and extract the ZIP from the green "Code" button on GitHub).
 2. **Install**, from the project folder:
    - Linux/macOS: `./install.sh`
    - Windows: double-click `install.bat` (or run it from a terminal)
 
-   This installs [`uv`](https://docs.astral.sh/uv/) (a fast Python package manager) if you don't already have it, installs all Python dependencies, and builds the web UI. You'll need [Node.js](https://nodejs.org/) installed for that last step — the installer will tell you if it's missing.
+   This installs [`uv`](https://docs.astral.sh/uv/) (a fast Python package manager) if you don't already have it, installs all Python dependencies, and builds the web UI. You'll need [Node.js](https://nodejs.org/) installed for that last step, the installer will tell you if it's missing.
 3. **Run**:
    - Linux/macOS: `./run_webui.sh`
    - Windows: double-click `run_webui.bat`
@@ -59,9 +57,10 @@ The easiest way to use AutoForge is the web UI — a local app (like ComfyUI) wi
 
    To make some parts of the picture come out closer than the rest (a face, the eyes, lettering), click **Focus** in the image panel and paint over them; a slider sets how much more they count (2× to 100×, default 10×). After a run, the **Differences** view shows where the print strays furthest from the picture.
 
-   If HueForge is installed on the same computer, the web UI finds your HueForge personal filament library and offers to import it once, on its first start. It is always available afterwards as the highlighted option under **Import** in the filament library. It looks in `%APPDATA%\HueForge\Filaments\personal_library.json` on Windows, `~/Library/Application Support/HueForge/Filaments/` on macOS and `~/.local/share/HueForge/Filaments/` on Linux; set `AUTOFORGE_WEBUI_HUEFORGE_LIBRARY` to use a different file.
+   If HueForge is installed on the same computer, the web UI finds your HueForge personal filament library and offers to import it once, on its first start.
 
-   The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports — unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace — so bugs can get fixed faster. No image data, filament data, or personal information is sent. To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
+   The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports (unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace) so bugs can get fixed faster. No image data, filament data, or personal information is sent. To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
+
 4. **Update to the latest release** whenever you want, from the project folder:
    - Linux/macOS: `./update.sh`
    - Windows: double-click `update.bat`
@@ -80,27 +79,6 @@ If you just want the command-line tool (no web UI), install the current version 
 
 If you have problems running the code on your gpu, please refer to the [Pytorch Homepage](https://pytorch.org/) for help. \
 CUDA, ROCm, and MPS (Apple Metal) are supported, but you need to install the correct version of pytorch for your system.
-
-## Older NVIDIA GPUs (GTX 900/10-series, Titan V)
-
-The default CUDA build of PyTorch only ships kernels for compute capability 7.5 (Turing) and newer. On GTX 900-series (Maxwell), GTX 10-series (Pascal) and Titan V (Volta) cards, `torch.cuda.is_available()` still returns `True`, but the first kernel launch fails with `CUDA error: no kernel image is available for execution on the device`.
-
-`install.sh` (Linux/macOS) detects these GPUs and reinstalls PyTorch from the CUDA 12.6 index, the last build line that includes their kernels (see [pytorch/pytorch#190385](https://github.com/pytorch/pytorch/issues/190385)). `run_webui.sh` then skips `uv`'s automatic sync so the launch doesn't swap the default build back in. To do it by hand, run this in the project folder:
-
-```bash
-uv pip install --reinstall-package torch --reinstall-package torchvision torch torchvision \
-    --index-url https://download.pytorch.org/whl/cu126
-```
-
-and set `UV_NO_SYNC=1` when using `uv run` so it isn't reverted. With plain `pip`, use `pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126` instead.
-
-To verify, check that the architecture list printed by the following contains an entry your GPU can run (`sm_61` is covered by `sm_60`):
-
-```bash
-uv run --no-sync python -c "import torch; print(torch.__version__, torch.cuda.get_arch_list())"
-```
-
-A working CUDA 12.6 build lists `sm_50`, `sm_60` and `sm_70` in addition to the newer architectures.
 
 ## Usage
 
@@ -214,6 +192,10 @@ After running, the following files will be created in your specified output fold
 - **Optional Cap Layer STL**: `Cap_MaterialName_HEXCODE.stl` (if `--cap_layers > 0`)
   
   *Note:* FlatForge generates multiple STL files that align perfectly when loaded together in your slicer, creating a solid rectangular print with each color as a separate object.
+
+## You can now run Autoforge for free in your browser thanks to [Huggingface space support](https://huggingface.co/spaces/hvoss-techfak/Autoforge).
+This includes the option to run it locally if you have a powerful pc and don't want to limit yourself to the Huggingface computing limits. \
+For this simply go to the [Huggingface](https://huggingface.co/spaces/hvoss-techfak/Autoforge) space and pull the docker container for this project (upper right corner -> three dots -> "run locally")
 
 ## Development
 
