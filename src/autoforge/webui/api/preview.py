@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 from ..config import config
 from ..services.optimization_service import get_optimization_service
 from ..services.filament_service import get_filament_service
+from autoforge.Helper.FilamentHelper import hex_to_rgb
 from ..helpers.mesh_persist import schedule_persist
 from ..helpers.slider_render import (
     compute_slider_render,
@@ -99,6 +100,8 @@ async def render_preview(data: dict):
         render_lock = _render_locks[effective_job_id]
 
     want_vertex_colors = bool(data.get("vertex_colors"))
+    background_color = data.get("background_color")
+    background_rgb = tuple(hex_to_rgb(background_color)) if background_color else None
 
     def _render():
         # One render per target at a time (they write the same files), and a
@@ -109,8 +112,11 @@ async def render_preview(data: dict):
             if _latest_seq.get(effective_job_id) != seq:
                 return "superseded"
             if not want_vertex_colors:
-                return render_with_sliders(pipeline_result, sliders, filament_lookup, output_dir, **file_names)
-            render = compute_slider_render(pipeline_result, sliders, filament_lookup)
+                return render_with_sliders(
+                    pipeline_result, sliders, filament_lookup, output_dir,
+                    background_rgb=background_rgb, **file_names,
+                )
+            render = compute_slider_render(pipeline_result, sliders, filament_lookup, background_rgb=background_rgb)
             if render is None:
                 return None
             png_name = file_names.get("png_name", "final_model.png")

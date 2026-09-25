@@ -6,6 +6,7 @@ import { slidersNeedRender } from '../lib/sliderDiff'
 import { describeApiError } from '../lib/apiError'
 import { sliderRenderPaused } from '../lib/history'
 import { decodeBase64, meshKeyForJob, newRenderId, publishVertexColors } from '../lib/meshColors'
+import { effectiveBaseColor } from '../lib/baseColor'
 
 // Mirrors api/preview.py's INIT_JOB_SENTINEL — tells the backend "there's
 // no completed job yet, render against the post-upload auto-preview state
@@ -19,14 +20,18 @@ interface RenderArgs {
   sliders: ColorSliderConfig[]
   filaments: Filament[]
   jobId: string
+  backgroundColor: string
 }
 
-async function renderOnce({ sliders, filaments, jobId }: RenderArgs, lastErrorRef: { current: string | null }): Promise<void> {
+async function renderOnce({ sliders, filaments, jobId, backgroundColor }: RenderArgs, lastErrorRef: { current: string | null }): Promise<void> {
   try {
     const response = await fetch('/api/preview/render-with-sliders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sliders, active_filaments: filaments, job_id: jobId, vertex_colors: true, render_id: newRenderId() }),
+      body: JSON.stringify({
+        sliders, active_filaments: filaments, job_id: jobId, vertex_colors: true,
+        render_id: newRenderId(), background_color: backgroundColor,
+      }),
     })
     if (!response.ok) {
       // e.g. the result was computed before a server restart and can't be
@@ -55,7 +60,11 @@ export function useSliderPreviewRender(): boolean {
   const initState = useAppStore((s) => s.initState)
   const activeFilaments = useAppStore((s) => s.activeFilaments)
   const pruningJob = useAppStore((s) => s.pruningJob)
+  const settings = useAppStore((s) => s.settings)
+  const resolvedBase = useAppStore((s) => s.resolvedBase)
+  const backgroundColor = effectiveBaseColor(settings, resolvedBase)
   const lastRenderedSlidersRef = useRef(JSON.stringify(colorSliders))
+  const lastRenderedBackgroundRef = useRef(backgroundColor)
   const lastRenderedJobRef = useRef<string>(INIT_JOB_SENTINEL)
   const [isRendering, setIsRendering] = useState(false)
   const lastRenderErrorRef = useRef<string | null>(null)
@@ -104,7 +113,8 @@ export function useSliderPreviewRender(): boolean {
 
   // Just enough to coalesce the handful of store updates one edit makes.
   const triggerPreviewRender = useDebouncedCallback(
-    (sliders: typeof colorSliders, filaments: Filament[], jobId: string) => sendRender({ sliders, filaments, jobId }),
+    (sliders: typeof colorSliders, filaments: Filament[], jobId: string, backgroundColor: string) =>
+      sendRender({ sliders, filaments, jobId, backgroundColor }),
     [],
     16,
   )
@@ -114,6 +124,7 @@ export function useSliderPreviewRender(): boolean {
     // so completion doesn't look like an edit and re-render the result.
     if (jobActive) {
       lastRenderedSlidersRef.current = JSON.stringify(colorSliders)
+      lastRenderedBackgroundRef.current = backgroundColor
       lastRenderedJobRef.current = currentJob?.job_id ?? jobId
       return
     }
@@ -124,21 +135,23 @@ export function useSliderPreviewRender(): boolean {
     // pre-run preview) has its own previously-rendered colors on disk, so
     // it needs a render even when the slider stacks happen to match.
     const targetChanged = jobId !== lastRenderedJobRef.current
-    if (!targetChanged && currentKey === lastRenderedSlidersRef.current) return
+    const backgroundChanged = backgroundColor !== lastRenderedBackgroundRef.current
+    if (!targetChanged && !backgroundChanged && currentKey === lastRenderedSlidersRef.current) return
 
     // ...except the pre-run preview with nothing assigned yet: rendering that
     // would replace the photo-draped mesh with an all-gray one.
     const nothingAssigned = jobId === INIT_JOB_SENTINEL && !colorSliders.some((s) => s.enabled && s.filament_uuid)
     const needsRender = targetChanged
       ? !nothingAssigned
-      : slidersNeedRender(JSON.parse(lastRenderedSlidersRef.current), colorSliders)
+      : backgroundChanged || slidersNeedRender(JSON.parse(lastRenderedSlidersRef.current), colorSliders)
     if (needsRender) {
-      triggerPreviewRender(colorSliders, activeFilaments, jobId)
+      triggerPreviewRender(colorSliders, activeFilaments, jobId, backgroundColor)
     }
 
     lastRenderedSlidersRef.current = currentKey
+    lastRenderedBackgroundRef.current = backgroundColor
     lastRenderedJobRef.current = jobId
-  }, [colorSliders, hasResult, jobActive, activeFilaments, jobId, triggerPreviewRender])
+  }, [colorSliders, hasResult, jobActive, activeFilaments, jobId, backgroundColor, triggerPreviewRender])
 
 
   return isRendering

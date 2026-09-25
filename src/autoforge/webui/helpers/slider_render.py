@@ -206,9 +206,15 @@ def compute_slider_render(
     pipeline_result: dict[str, Any],
     sliders: list[dict],
     filament_lookup: dict[str, dict],
+    background_rgb: Optional[tuple[float, float, float]] = None,
 ) -> Optional[dict[str, Any]]:
     """The fast part of a slider edit: composite the edited stack and encode
     the preview PNG — no files written, no mesh built.
+
+    ``background_rgb`` (0-1 floats) overrides the pipeline's own resolved
+    background color — without it, editing the base color in the UI had no
+    effect on the composite, since the render always fell back to whatever
+    color the optimization run happened to settle on.
 
     Returns None when there is no discretized solution (or nothing enabled).
     Everything in the result is plain numpy/bytes, so it can outlive the
@@ -217,6 +223,8 @@ def compute_slider_render(
     optimizer = pipeline_result["optimizer"]
     args = pipeline_result["args"]
     background: torch.Tensor = pipeline_result["background"]
+    if background_rgb is not None:
+        background = torch.tensor(background_rgb, dtype=background.dtype, device=background.device)
 
     disc_global, disc_height_image = optimizer.get_discretized_solution(best=True)
     if disc_global is None or disc_height_image is None:
@@ -326,6 +334,7 @@ def render_with_sliders(
     output_dir: str,
     png_name: str = "final_model.png",
     ply_name: str = "final_model_colored.ply",
+    background_rgb: Optional[tuple[float, float, float]] = None,
 ) -> Optional[dict[str, Any]]:
     """Recompute the composite preview + colored PLY from an edited slider
     stack, writing ``png_name`` / ``ply_name`` into ``output_dir``.
@@ -333,7 +342,7 @@ def render_with_sliders(
     Returns ``{"image_b64": str, "preview_png": path, "colored_ply": path}``
     or ``None`` if there is no discretized solution to render yet.
     """
-    render = compute_slider_render(pipeline_result, sliders, filament_lookup)
+    render = compute_slider_render(pipeline_result, sliders, filament_lookup, background_rgb=background_rgb)
     if render is None:
         return None
     preview_path = write_slider_png(render, output_dir, png_name)
