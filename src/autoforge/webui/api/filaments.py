@@ -2,8 +2,10 @@ import json
 import os
 from typing import Optional
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from ..config import config
 from ..models import Filament
+from ..services.catalog_service import get_catalog_service
 from ..services.filament_service import (
     get_filament_service,
     looks_like_filament,
@@ -202,6 +204,53 @@ def import_hueforge(mode: str = "merge"):
     result = _import_filament_records(records, mode)
     get_filament_service().mark_hueforge_offered()
     return result
+
+
+class CatalogAddRequest(BaseModel):
+    ids: list[int]
+    owned: bool = True
+    activate: bool = False
+
+
+@router.get("/catalog")
+def filament_catalog():
+    """Every filamentcolors.xyz filament with a measured TD (the bundled
+    snapshot plus anything the background update found since). The whole
+    list is small enough to send at once and search in the browser.
+    ``library_uuids`` maps swatch id -> library uuid for the ones already in
+    the user's library."""
+    catalog_svc = get_catalog_service()
+    catalog = catalog_svc.catalog()
+    matches = get_filament_service().catalog_matches(catalog["filaments"])
+    library_uuids = {str(i): f.uuid for i, f in matches.items()}
+    return {
+        **{k: v for k, v in catalog.items() if k != "filaments"},
+        **catalog_svc.status(),
+        "filaments": catalog["filaments"],
+        "library_uuids": library_uuids,
+    }
+
+
+@router.post("/catalog/add")
+def add_from_catalog(body: CatalogAddRequest):
+    """Add catalog filaments to the library (and optionally make them
+    active). Filaments already in the library are reported, not duplicated."""
+    if not body.ids:
+        raise HTTPException(400, "No filaments selected.")
+    by_id = get_catalog_service().entries_by_id()
+    missing = [i for i in body.ids if i not in by_id]
+    if missing:
+        raise HTTPException(404, f"Not in the catalog: {', '.join(map(str, missing))}")
+    svc = get_filament_service()
+    added, existing = svc.add_catalog_entries([by_id[i] for i in dict.fromkeys(body.ids)], owned=body.owned)
+    if body.activate:
+        for f in added + existing:
+            svc.set_active(f)
+    return {
+        "added": [f.model_dump() for f in added],
+        "existing": [f.model_dump() for f in existing],
+        "active": [f.model_dump() for f in svc.get_active()],
+    }
 
 
 @router.get("/has-custom-library")

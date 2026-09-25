@@ -57,6 +57,15 @@ def looks_like_filament(item: dict) -> bool:
     return any(k in item for f in ("brand", "name", "color", "td") for k in _FIELD_ALIASES[f])
 
 
+CATALOG_SOURCE = "filamentcolors"
+
+
+def catalog_uuid(swatch_id: int) -> str:
+    """Stable uuid for a filament added from the filamentcolors.xyz catalog,
+    so adding the same swatch twice finds the first copy."""
+    return f"filamentcolors-{int(swatch_id)}"
+
+
 def _atomic_write_json(path: str, data):
     parent = os.path.dirname(path)
     if parent:
@@ -287,6 +296,57 @@ class FilamentService:
             imported = self.replace_library(parsed) if mode == "replace" else self.merge_import(parsed)
             self._mark_user_imported()
             return imported
+
+    @staticmethod
+    def _catalog_key(brand: str, name: str, filament_type: str) -> tuple[str, str, str]:
+        return (brand.strip().lower(), name.strip().lower(), filament_type.strip().lower())
+
+    def catalog_matches(self, entries: list[dict]) -> dict[int, Filament]:
+        """Swatch id -> the library filament that already is that catalog
+        entry: the one added from it before (its uuid), or one of the user's
+        own with the same brand, name and type (e.g. imported from HueForge)."""
+        with self._lock:
+            by_key = {self._catalog_key(f.brand, f.name, f.filament_type): f for f in self._filaments.values()}
+            matches: dict[int, Filament] = {}
+            for entry in entries:
+                match = self._filaments.get(catalog_uuid(entry["id"])) or by_key.get(
+                    self._catalog_key(entry["brand"], entry["name"], entry["filament_type"])
+                )
+                if match:
+                    matches[entry["id"]] = match
+            return matches
+
+    def add_catalog_entries(self, entries: list[dict], owned: bool = True) -> tuple[list[Filament], list[Filament]]:
+        """Add filamentcolors.xyz catalog entries to the library.
+        Returns ``(added, already_in_library)``; entries already there are
+        left untouched, so the user's own edits (a re-measured TD) survive."""
+        with self._lock:
+            added: list[Filament] = []
+            existing: list[Filament] = []
+            matches = self.catalog_matches(entries)
+            for entry in entries:
+                match = matches.get(entry["id"])
+                if match:
+                    existing.append(match)
+                    continue
+                f = Filament(
+                    brand=entry["brand"],
+                    name=entry["name"],
+                    color=entry["color"],
+                    td=entry["td"],
+                    owned=owned,
+                    uuid=catalog_uuid(entry["id"]),
+                    filament_type=entry["filament_type"],
+                    source=CATALOG_SOURCE,
+                )
+                self._filaments[f.uuid] = f
+                added.append(f)
+            if added:
+                self._save_library()
+                # The library panel hides non-"user" filaments until a
+                # library of the user's own was loaded.
+                self._mark_user_imported()
+            return added, existing
 
     def _mark_user_imported(self):
         path = self._imported_marker_file()

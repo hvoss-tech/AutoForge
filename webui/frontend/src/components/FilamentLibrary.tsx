@@ -1,7 +1,7 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
 import { useFilamentLoader } from '../services/filamentService'
-import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronsLeft, Hand, Pencil, Plus, Save, Search, Tag, Upload, X } from 'lucide-react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronsLeft, Globe, Hand, Pencil, Plus, Save, Search, Tag, Upload, X } from 'lucide-react'
 import type { Filament } from '../types'
 import { FilamentSwatch } from './FilamentSwatch'
 import { EditFilamentModal } from './EditFilamentModal'
@@ -41,6 +41,7 @@ export const FilamentLibrary: React.FC<{ onCollapse?: () => void }> = ({ onColla
   const setFilterQuery = useAppStore((s) => s.setFilterQuery)
   const setNewFilamentModalOpen = useAppStore((s) => s.setNewFilamentModalOpen)
   const setImportModalOpen = useAppStore((s) => s.setImportModalOpen)
+  const setCatalogModalOpen = useAppStore((s) => s.setCatalogModalOpen)
   const customLibraryLoaded = useAppStore((s) => s.customLibraryLoaded)
   const setCustomLibraryLoaded = useAppStore((s) => s.setCustomLibraryLoaded)
   const pushToast = useAppStore((s) => s.pushToast)
@@ -243,6 +244,14 @@ export const FilamentLibrary: React.FC<{ onCollapse?: () => void }> = ({ onColla
           <button onClick={() => setNewFilamentModalOpen(true)} className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium bg-cyan-600 hover:bg-cyan-500 text-white" data-testid="new-filament-btn">
             <Plus className="w-3.5 h-3.5" /> New
           </button>
+          <button
+            onClick={() => setCatalogModalOpen(true)}
+            className={secondaryButton}
+            title="Find your filament among hundreds with a measured TD (from filamentcolors.xyz) and add it"
+            data-testid="catalog-btn"
+          >
+            <Globe className="w-3.5 h-3.5" /> Catalog
+          </button>
           <button onClick={() => setImportModalOpen(true)} className={secondaryButton} data-testid="import-btn">
             <Upload className="w-3.5 h-3.5" /> Import
           </button>
@@ -298,6 +307,11 @@ export const FilamentLibrary: React.FC<{ onCollapse?: () => void }> = ({ onColla
                 : ownedOnly
                   ? 'No owned filaments here. Hover a filament and click the tag to mark it as owned.'
                   : 'No filaments found'}
+            {!activeOnly && (
+              <button onClick={() => setCatalogModalOpen(true)} className="block mx-auto mt-2 text-cyan-500 hover:underline" data-testid="empty-catalog-link">
+                Search the filament catalog
+              </button>
+            )}
           </div>
         )}
       </div>

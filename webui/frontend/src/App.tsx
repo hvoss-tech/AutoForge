@@ -12,6 +12,7 @@ import { StatusBar } from './components/StatusBar'
 import { SettingsModal } from './components/SettingsModal'
 import { NewFilamentModal } from './components/NewFilamentModal'
 import { ImportModal } from './components/ImportModal'
+import { CatalogModal } from './components/CatalogModal'
 import { TutorialModal } from './components/TutorialModal'
 import { ToastContainer } from './components/ToastContainer'
 import { ResizeHandle } from './components/ui/resize-handle'
@@ -300,6 +301,7 @@ const App: React.FC = () => {
       <SettingsModal />
       <NewFilamentModal />
       <ImportModal />
+      <CatalogModal />
       <HistoryDrawer />
       <ConfirmDialog />
       <TutorialModal />

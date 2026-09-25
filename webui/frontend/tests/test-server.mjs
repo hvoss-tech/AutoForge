@@ -31,7 +31,13 @@ fs.rmSync(path.dirname(hueforgeLibrary), { recursive: true, force: true })
 const server = spawn(
   python,
   ['-m', 'uvicorn', 'autoforge.webui.server:app', '--host', '127.0.0.1', '--port', port, '--log-level', 'warning'],
-  { cwd: dataDir, stdio: ['ignore', logFd, logFd], env: { ...process.env, PYTHONUNBUFFERED: '1', AUTOFORGE_WEBUI_HUEFORGE_LIBRARY: hueforgeLibrary } },
+  { cwd: dataDir, stdio: ['ignore', logFd, logFd], env: {
+      ...process.env,
+      PYTHONUNBUFFERED: '1',
+      AUTOFORGE_WEBUI_HUEFORGE_LIBRARY: hueforgeLibrary,
+      // The catalog specs use the bundled snapshot; never call filamentcolors.xyz from tests.
+      AUTOFORGE_WEBUI_FILAMENTCOLORS_AUTO_UPDATE: 'false',
+    } },
 )
 console.log(`AutoForge test server log: ${logPath}`)
 

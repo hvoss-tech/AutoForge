@@ -50,6 +50,9 @@ test = [
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.package-data]
+autoforge = ["data/*.json"]
+
 [project.scripts]
 autoforge = "autoforge.auto_forge:main"
 

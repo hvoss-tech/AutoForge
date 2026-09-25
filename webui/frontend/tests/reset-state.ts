@@ -66,7 +66,9 @@ export async function cleanupTestFilaments(baseURL: string): Promise<void> {
     if (res.ok) {
       const all = await res.json()
       for (const f of all) {
-        if (isTestBrand(f.brand)) {
+        // Filaments added from the filamentcolors.xyz catalog carry real
+        // brand names, so they're recognised by their uuid instead.
+        if (isTestBrand(f.brand) || String(f.uuid).startsWith('filamentcolors-')) {
           await fetch(`${baseURL}/api/filaments/${f.uuid}`, { method: 'DELETE' }).catch(() => {})
           await fetch(`${baseURL}/api/filaments/active/${f.uuid}`, { method: 'DELETE' }).catch(() => {})
         }

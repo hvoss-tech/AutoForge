@@ -12,6 +12,12 @@ class WebUIConfig(BaseSettings):
     # Where HueForge keeps the user's personal filament library. Empty means
     # "look in HueForge's per-user data folder" (see hueforge_library_candidates).
     hueforge_library: str = ""
+    # Look for filaments published on filamentcolors.xyz since the bundled
+    # catalog snapshot, in the background on startup. Checks are skipped when
+    # the last one was less than this many hours ago (restart loops, dev
+    # reloads). AUTOFORGE_WEBUI_FILAMENTCOLORS_AUTO_UPDATE=false disables it.
+    filamentcolors_auto_update: bool = True
+    filamentcolors_check_interval_hours: float = 1.0
 
     # PostHog telemetry — anonymous usage analytics, on by default for every
     # install so the project has aggregate usage data. This is the project's

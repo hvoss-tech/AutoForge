@@ -61,6 +61,8 @@ The easiest way to use AutoForge is the web UI, a local app with drag-and-drop i
 
    If HueForge is installed on the same computer, the web UI finds your HueForge personal filament library and offers to import it once, on its first start.
 
+   To find a filament you own without measuring it yourself, click **Catalog** in the filament library. It searches every filament on [filamentcolors.xyz](https://filamentcolors.xyz) that has a measured TD (search by brand, color name, type or hex code; filter by type, brand or color family; or pick a color to see the closest matches first), and **Add** puts it straight into your library.
+
    The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports (unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace) so bugs can get fixed faster. No image data, filament data, or personal information is sent. To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
 
 4. **Update to the latest release** whenever you want, from the project folder:
@@ -211,6 +213,8 @@ conda activate forge
 pip install -e .
 ```
 
+To refresh the bundled filamentcolors.xyz catalog (`src/autoforge/data/filamentcolors_catalog.json`) before a release, run `./generate_filamentcolors_library.sh`. It downloads the whole catalog once, pausing 2 seconds between pages (`--delay` sets the pause; requests are never less than 1 second apart), and keeps only the filaments that have a TD.
+
 If the installed pytorch version has no cuda support execute the following:
 
 ```bash
@@ -239,6 +243,7 @@ I would love to see what you have done with the software, so it would be great i
 First and foremost:
 - [Hueforge](https://shop.thehueforge.com/) for providing the inspiration for this project.
 Without it, this project would not have been possible.
+- [filamentcolors.xyz](https://filamentcolors.xyz) and its community for the measured filament swatches and TD values in the web UI's filament catalog.
 
 AutoForge makes use of several open source libraries:
 

@@ -332,6 +332,7 @@ interface AppState {
   hasRenderedInitPreview: boolean
   newFilamentModalOpen: boolean
   importModalOpen: boolean
+  catalogModalOpen: boolean
   /** The import dialog was opened by the one-time first-start offer to
    * import HueForge's personal library, not by the Import button. */
   importModalHueforgeOffer: boolean
@@ -426,6 +427,7 @@ interface AppState {
   setHasRenderedInitPreview: (val: boolean) => void
   setNewFilamentModalOpen: (open: boolean) => void
   setImportModalOpen: (open: boolean) => void
+  setCatalogModalOpen: (open: boolean) => void
   openHueforgeImportOffer: () => void
   setCustomLibraryLoaded: (loaded: boolean) => void
   setEditFilamentModalOpen: (open: boolean) => void
@@ -496,6 +498,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   hasRenderedInitPreview: false,
   newFilamentModalOpen: false,
   importModalOpen: false,
+  catalogModalOpen: false,
   importModalHueforgeOffer: false,
   customLibraryLoaded: false,
   editFilamentModalOpen: false,
@@ -858,6 +861,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setHasRenderedInitPreview: (val) => set({ hasRenderedInitPreview: val }),
   setNewFilamentModalOpen: (open) => set({ newFilamentModalOpen: open }),
   setImportModalOpen: (open) => set({ importModalOpen: open, importModalHueforgeOffer: false }),
+  setCatalogModalOpen: (open) => set({ catalogModalOpen: open }),
   openHueforgeImportOffer: () => set({ importModalOpen: true, importModalHueforgeOffer: true }),
   setCustomLibraryLoaded: (loaded) => set({ customLibraryLoaded: loaded }),
   setEditFilamentModalOpen: (open) => set({ editFilamentModalOpen: open }),

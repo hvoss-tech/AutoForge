@@ -6,7 +6,7 @@ export interface Filament {
   owned: boolean
   uuid: string
   filament_type: string
-  source?: 'user' | 'swatch'
+  source?: 'user' | 'swatch' | 'filamentcolors'
 }
 
 export interface ColorSliderConfig {

@@ -47,6 +47,19 @@ def _patch_httpx_app_kwarg() -> None:
 _patch_httpx_app_kwarg()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_filamentcolors_network():
+    """Every ``TestClient(app)`` runs the webui lifespan, which would start
+    a background check against filamentcolors.xyz. Tests use the bundled
+    catalog and fake fetchers instead — never the real site."""
+    from autoforge.webui.config import config
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(config, "filamentcolors_auto_update", False)
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def _deterministic_rng():
     """Give every test the same starting RNG state.

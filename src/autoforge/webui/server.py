@@ -60,6 +60,13 @@ async def lifespan(app: FastAPI):
                     "Seeded %d filaments from %s", len(imported), default_csv
                 )
 
+    # Pick up filaments published on filamentcolors.xyz since the bundled
+    # catalog snapshot. Runs on a daemon thread: startup never waits on the
+    # network, and an offline machine just keeps the bundled catalog.
+    if config.filamentcolors_auto_update:
+        from .services.catalog_service import get_catalog_service
+        get_catalog_service().start_background_update()
+
     yield
     flush_telemetry()
 
