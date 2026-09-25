@@ -1,5 +1,5 @@
 import React from 'react'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './ui/tooltip'
+import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
 import { contrastTextColor, normalizeHex } from '../lib/color'
 import type { Filament } from '../types'
 
@@ -67,17 +67,21 @@ export const FilamentSwatch: React.FC<FilamentSwatchProps> = ({
   )
 
   if (!showLabel) {
+    // Relies on the single TooltipProvider mounted once at the app root
+    // (App.tsx): a provider per swatch here tore its portal down
+    // independently from React's own unmount of the row whenever the
+    // filament list re-rendered (search/sort/brand collapse), racing
+    // Radix's Presence cleanup against React's commit and throwing
+    // "insertBefore"/"removeChild" NotFoundErrors.
     return (
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>{swatch}</TooltipTrigger>
-          <TooltipContent side="top" className="text-xs">
-            <div>{label}</div>
-            <div>TD: {filament.td?.toFixed(1)}</div>
-            <div>{normalizeHex(filament.color)}</div>
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>{swatch}</TooltipTrigger>
+        <TooltipContent side="top" className="text-xs">
+          <div>{label}</div>
+          <div>TD: {filament.td?.toFixed(1)}</div>
+          <div>{normalizeHex(filament.color)}</div>
+        </TooltipContent>
+      </Tooltip>
     )
   }
 

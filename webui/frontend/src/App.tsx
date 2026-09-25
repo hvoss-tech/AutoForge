@@ -15,6 +15,7 @@ import { ImportModal } from './components/ImportModal'
 import { TutorialModal } from './components/TutorialModal'
 import { ToastContainer } from './components/ToastContainer'
 import { ResizeHandle } from './components/ui/resize-handle'
+import { TooltipProvider } from './components/ui/tooltip'
 import { useAppStore } from './store/appStore'
 import { useJobWebSocket } from './hooks/useJobWebSocket'
 import { useAutoPreviewInit } from './hooks/useAutoPreviewInit'
@@ -220,6 +221,7 @@ const App: React.FC = () => {
   }, [])
 
   return (
+    <TooltipProvider>
     <div data-testid="app" style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', backgroundColor: 'var(--bg-main)', color: 'var(--text-primary)' }}>
       <TopBar />
 
@@ -303,6 +305,7 @@ const App: React.FC = () => {
       <TutorialModal />
       <ToastContainer />
     </div>
+    </TooltipProvider>
   )
 }
 
