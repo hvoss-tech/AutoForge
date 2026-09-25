@@ -67,12 +67,15 @@ jobs:
       - name: Run frontend unit tests
         working-directory: webui/frontend
         run: npm run test:unit
-      - name: Run Playwright E2E tests
+      - name: Run Playwright E2E tests (fast subset)
         working-directory: webui/frontend
-        # Builds the frontend, then runs the full suite (including the
-        # `jobs` project, which drives real — small, CPU-fast — optimization
-        # runs) against a throwaway backend started by tests/test-server.mjs.
-        run: npm test
+        # Builds the frontend, then runs the `chromium` project only,
+        # against a throwaway backend started by tests/test-server.mjs. The
+        # `jobs` project (which drives many real, sequential optimization
+        # runs against a single-worker backend) is too slow for every push/PR
+        # and runs separately via the manually-triggered
+        # `playwright-full.yml` workflow instead.
+        run: npm run build && npm run test:e2e:fast
         env:
           AUTOFORGE_PYTHON: python
       - name: Upload Playwright report

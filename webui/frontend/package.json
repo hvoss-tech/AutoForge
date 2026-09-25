@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "npm run build && playwright test",
     "test:e2e": "playwright test",
+    "test:e2e:fast": "playwright test --project=chromium",
     "test:unit": "node --import tsx/esm --test tests/*.test.mjs"
   },
   "dependencies": {
