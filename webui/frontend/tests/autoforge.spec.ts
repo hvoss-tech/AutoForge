@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test'
 import zlib from 'zlib'
 import { resetProjectState } from './reset-state'
+import { presetSettings } from './helpers'
 import { makeSolidPng } from './png-helper'
 
 // Project state (color sliders, global params) is now genuinely persisted
@@ -1373,6 +1374,9 @@ test.describe('Pruning Flow', () => {
     })
     expect(upload.ok()).toBeTruthy()
     const filename = (await upload.json()).filename
+    // The page only restores a finished job under the image it was run on
+    // (jobBelongsToImage), so the project has to have that image open.
+    await presetSettings(request, { input_image: filename })
 
     for (const [name, color, td] of [
       ['Red', '#FF0000', 1.0],
@@ -1530,6 +1534,9 @@ test.describe('Pruning Flow', () => {
     })
     expect(upload.ok()).toBeTruthy()
     const filename = (await upload.json()).filename
+    // The page only restores a finished job under the image it was run on
+    // (jobBelongsToImage), so the project has to have that image open.
+    await presetSettings(request, { input_image: filename })
 
     for (const [name, color, td] of [
       ['Red', '#FF0000', 1.0], ['Green', '#00FF00', 2.0], ['Blue', '#0000FF', 3.0],

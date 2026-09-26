@@ -65,6 +65,16 @@ def get_init_pipeline_result() -> Optional[dict[str, Any]]:
         return _pipeline_result
 
 
+def is_init_building() -> bool:
+    """Whether an auto-preview build is running (or a reset is still waiting
+    for one to finish). It is a GPU job like optimization and pruning, so
+    those refuse to start meanwhile — the Run button waiting for it was the
+    only thing that stopped a second tab or a direct API call from putting
+    both on the GPU at once."""
+    with _lock:
+        return _state["status"] == "initializing"
+
+
 def release_init_result() -> None:
     """Release the auto-preview's retained optimizer (its GPU memory)
     without disturbing anything else about its displayed state.
@@ -77,9 +87,9 @@ def release_init_result() -> None:
     with _lock:
         if _state["status"] == "initializing":
             # A build is in flight; it isn't safe to rip its result out from
-            # under it here, and run_init's own GPU-mutex check (above)
-            # already stops a new optimization/pruning job from starting
-            # while a build is running.
+            # under it here. Optimization and pruning refuse to start while
+            # one runs (is_init_building), so this is only reached in that
+            # narrow window.
             return
         result, _pipeline_result = _pipeline_result, None
     release_pipeline_result(result)

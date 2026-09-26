@@ -241,6 +241,7 @@ def _eval_candidates_batch(
     optimizer: FilamentOptimizer,
     dg_candidates: list[torch.Tensor],
     eff_thick: torch.Tensor | None = None,
+    batch_size: int = 0,
 ) -> tuple[float, torch.Tensor]:
     """
     Evaluate a batch of discrete-assignment candidates and return the single
@@ -262,36 +263,45 @@ def _eval_candidates_batch(
         eff_thick = _make_shared_eff_thick(optimizer)
 
     num_materials = optimizer.material_colors.shape[0]
-
-    # Build batched global_logits [B, L, M] with one scatter_ instead of a
-    # Python loop building B separate [L, M] tensors.
     L = dg_candidates[0].shape[0]
-    dg_batch = torch.stack(dg_candidates, dim=0)  # [B, L]
-    gl_batch = dg_batch.new_full(
-        (n_cands, L, num_materials), fill_value=-1e5, dtype=torch.float32
-    )
-    gl_batch.scatter_(
-        dim=2, index=dg_batch.contiguous().to(torch.long).unsqueeze(-1), value=1e5
-    )
+    # --pruning_batch_size: how many candidates share one material-selection
+    # pass ([B, L, M] logits). It used to be read only as an on/off switch,
+    # every candidate of a chunk went into one batch whatever the value.
+    # Selection is independent per candidate, so the result does not depend
+    # on it.
+    step = batch_size if batch_size > 0 else n_cands
 
-    # Material selection — batched (shared prefix)
-    cols, tds = _material_select_batched(
-        gl_batch, optimizer.material_colors, optimizer.material_TDs,
-        rng_seed=optimizer.best_seed, tau=optimizer.vis_tau,
-    )
-
-    # Composite + loss per candidate — iterative, no [B, L, H, W]
     losses = []
-    for b in range(n_cands):
-        with _gpu_lock, torch.no_grad():
-            comp = _compose_candidate(
-                eff_thick, cols[b], tds[b], optimizer.background,
-            )
-            loss = compute_loss(
-                comp=comp, target=optimizer.target, focus_map=optimizer.focus_map,
-                alpha=optimizer.alpha,
-            )
-        losses.append(loss)
+    for lo in range(0, n_cands, step):
+        chunk = dg_candidates[lo:lo + step]
+        # Build batched global_logits [B, L, M] with one scatter_ instead of
+        # a Python loop building B separate [L, M] tensors.
+        dg_batch = torch.stack(chunk, dim=0)  # [B, L]
+        gl_batch = dg_batch.new_full(
+            (len(chunk), L, num_materials), fill_value=-1e5, dtype=torch.float32
+        )
+        gl_batch.scatter_(
+            dim=2, index=dg_batch.contiguous().to(torch.long).unsqueeze(-1), value=1e5
+        )
+
+        # Material selection — batched (shared prefix)
+        cols, tds = _material_select_batched(
+            gl_batch, optimizer.material_colors, optimizer.material_TDs,
+            rng_seed=optimizer.best_seed, tau=optimizer.vis_tau,
+        )
+        del gl_batch
+
+        # Composite + loss per candidate — iterative, no [B, L, H, W]
+        for b in range(len(chunk)):
+            with _gpu_lock, torch.no_grad():
+                comp = _compose_candidate(
+                    eff_thick, cols[b], tds[b], optimizer.background,
+                )
+                loss = compute_loss(
+                    comp=comp, target=optimizer.target, focus_map=optimizer.focus_map,
+                    alpha=optimizer.alpha,
+                )
+            losses.append(loss)
 
     best_loss_t, best_idx_t = torch.min(torch.stack(losses), dim=0)
     best_idx = int(best_idx_t.item())
@@ -443,6 +453,7 @@ def prune_num_colors(
                     dg_list = [merge_color(best_dg, *pair) for pair in chunk]
                     merge_loss, merge_dg = _eval_candidates_batch(
                         optimizer, dg_list, eff_thick=shared_eff,
+                        batch_size=pruning_batch_size,
                     )
                 else:
                     cand_results = Parallel(
@@ -475,6 +486,7 @@ def prune_num_colors(
                 dg_list = [merge_color(best_dg, *pair) for pair in merge_pairs]
                 merge_loss, merge_dg = _eval_candidates_batch(
                     optimizer, dg_list, eff_thick=shared_eff,
+                    batch_size=pruning_batch_size,
                 )
             else:
                 cand_results = Parallel(
@@ -616,6 +628,7 @@ def prune_num_swaps(
                     dg_list = [merge_bands(best_dg, *spec) for spec in chunk]
                     merge_loss, merge_dg = _eval_candidates_batch(
                         optimizer, dg_list, eff_thick=shared_eff,
+                        batch_size=pruning_batch_size,
                     )
                 else:
                     cand_results = Parallel(
@@ -654,6 +667,7 @@ def prune_num_swaps(
                 dg_list = [merge_bands(best_dg, *spec) for spec in merge_specs]
                 merge_loss, merge_dg = _eval_candidates_batch(
                     optimizer, dg_list, eff_thick=shared_eff,
+                    batch_size=pruning_batch_size,
                 )
             else:
                 cand_results = Parallel(
@@ -796,7 +810,10 @@ def remove_layer_from_solution(
     new_max_layers = new_global_logits.shape[0]
 
     new_height = current_height.clone()
-    mask = disc_height >= layer_to_remove
+    # A pixel of height z prints layers 0..z-1, so only pixels *above*
+    # layer_to_remove contain it. `>=` also lowered pixels whose top was
+    # layer_to_remove - 1, stripping a layer that is not being removed.
+    mask = disc_height > layer_to_remove
     new_height[mask] = new_height[mask] - h
 
     # Invert the sigmoid mapping:

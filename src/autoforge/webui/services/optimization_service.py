@@ -144,6 +144,21 @@ class OptimizationService:
                 result[OWNER_KEY] = new_owner_job_id
             return result
 
+    def return_pipeline_result(self, job_id: str, from_owner_job_id: str) -> bool:
+        """Undo claim_pipeline_result: give ``job_id``'s result back to it.
+
+        For a prune that was cancelled or failed after restoring the solution
+        it started from — the frontend stays on ``job_id`` in that case, and
+        without handing ownership back that job answered "pruned since" to
+        every recolor/prune while nothing else could reach the result either.
+        Only succeeds while ``from_owner_job_id`` still holds it."""
+        with self._lock:
+            result = self._pipeline_results.get(job_id)
+            if not result or result.get(OWNER_KEY) != from_owner_job_id:
+                return False
+            result[OWNER_KEY] = job_id
+            return True
+
     def alias_pipeline_result(self, new_job_id: str, existing_job_id: str) -> None:
         """Make ``new_job_id`` resolve to the same live pipeline result as
         ``existing_job_id``, without touching anything else.

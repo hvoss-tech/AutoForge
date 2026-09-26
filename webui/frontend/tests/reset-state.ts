@@ -41,7 +41,11 @@ export async function resetProjectState(baseURL: string): Promise<void> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       color_sliders: DEFAULT_SLIDERS,
-      settings: {},
+      // Off for tests: when on (the app default), finishing a run makes the
+      // page start a pruning pass by itself, so a spec that then prunes got
+      // "Pruning is already running" (409), and every result it checked had
+      // been changed underneath it. Specs about that feature opt back in.
+      settings: { auto_initial_prune: false },
       active_filaments: [],
     }),
   }).catch(() => {})

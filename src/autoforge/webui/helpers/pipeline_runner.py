@@ -19,7 +19,7 @@ import torch
 
 from autoforge.Helper.AmpUtils import safe_autocast
 from autoforge.Helper.FilamentHelper import hex_to_rgb
-from autoforge.Helper.ImageHelper import imread, resize_image
+from autoforge.Helper.ImageHelper import imread, resize_image, to_bgr_or_bgra_uint8
 from autoforge.Helper.OtherHelper import get_device, set_seed
 from autoforge.Helper.OutputHelper import generate_stl
 from autoforge.Modules.Optimizer import FilamentOptimizer
@@ -56,35 +56,6 @@ def friendly_error_message(exc: BaseException) -> str:
             "image size, then run again.\n\n" + text
         )
     return text
-
-
-def to_bgr_or_bgra_uint8(img: Optional[np.ndarray]) -> np.ndarray:
-    """Bring any image OpenCV decodes into the 8-bit BGR/BGRA layout the
-    pipeline is written for.
-
-    The upload endpoint accepts whatever ``cv2.imdecode`` can read, but the
-    pipeline indexed ``img.shape[2]`` and treated values as 0-255: a
-    grayscale PNG/JPEG (2-D array) failed with "tuple index out of range",
-    grayscale+alpha had two channels and failed in ``cvtColor``, and a
-    16-bit PNG ran on values up to 65535 — a nonsense target the optimizer
-    could never match."""
-    if img is None:
-        raise ValueError("The input image could not be read.")
-    if img.dtype == np.uint16:
-        img = (img.astype(np.float32) / 257.0).round().astype(np.uint8)
-    elif img.dtype in (np.float32, np.float64):
-        img = (np.clip(img, 0.0, 1.0) * 255.0).round().astype(np.uint8)
-    elif img.dtype != np.uint8:
-        img = np.clip(img, 0, 255).astype(np.uint8)
-    if img.ndim == 2:
-        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    channels = img.shape[2]
-    if channels == 1:
-        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    if channels == 2:
-        gray, alpha = img[:, :, 0], img[:, :, 1:2]
-        return np.concatenate([cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), alpha], axis=2)
-    return img
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +699,7 @@ def export_results(
             if not args.flatforge:
                 from autoforge.Helper.OutputHelper import generate_swap_instructions
 
-                background_layers = int(args.background_height // args.layer_height)
+                background_layers = int(round(args.background_height / args.layer_height))
                 swap_instructions = generate_swap_instructions(
                     disc_global.cpu().numpy(),
                     disc_height_image.cpu().numpy(),
@@ -758,7 +729,7 @@ def export_results(
             # project file can be generated the same way the CLI does.
             project_path = None
             if not args.flatforge:
-                from autoforge.Helper.OutputHelper import generate_project_file
+                from autoforge.Helper.OutputHelper import generate_project_file, model_size_mm
 
                 active_filaments = result.get("active_filaments") or []
                 materials_csv_path = os.path.join(args.output_folder, "materials.csv")
@@ -785,8 +756,11 @@ def export_results(
                     args,
                     disc_global.cpu().numpy(),
                     disc_height_image.cpu().numpy(),
-                    output_target.shape[1],
-                    output_target.shape[0],
+                    *model_size_mm(
+                        output_target.shape[1],
+                        output_target.shape[0],
+                        args.stl_output_size,
+                    ),
                     stl_path,
                     args.csv_file,
                 )

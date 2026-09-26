@@ -23,8 +23,10 @@ def set_seed(args) -> Any:
 
 
 def perform_basic_check(args):
-    # Basic checks
-    if not (args.background_height / args.layer_height).is_integer():
+    # Basic checks. With a tolerance: in floating point 0.28 / 0.04 is
+    # 7.000000000000001, so an exact is_integer() rejected valid settings.
+    ratio = args.background_height / args.layer_height
+    if abs(ratio - round(ratio)) > 1e-6:
         print(
             "Error: Background height must be a multiple of layer height.",
             file=sys.stderr,

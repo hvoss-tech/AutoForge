@@ -95,6 +95,14 @@ async def start_optimization(settings: OptimizationSettings):
             f"An optimization is already {busy.status}. Resume or cancel it before starting a new one.",
         )
 
+    from .init import is_init_building
+
+    if is_init_building():
+        raise HTTPException(
+            409,
+            "The preview of the image is still being prepared. Wait for it to finish, then try again.",
+        )
+
     job = svc.create_job(settings_dict)
 
     def _run():

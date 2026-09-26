@@ -17,6 +17,7 @@ behavior should have changed relative to the previous monolithic version.
 """
 
 import argparse
+import copy
 import sys
 import os
 import traceback
@@ -49,13 +50,14 @@ from autoforge.Helper.Heightmaps.FastTSPHeightMap import (
     run_init_threads,
 )
 
-from autoforge.Helper.ImageHelper import resize_image, imread
+from autoforge.Helper.ImageHelper import resize_image, imread, to_bgr_or_bgra_uint8
 from autoforge.Helper.OtherHelper import set_seed, perform_basic_check, get_device
 from autoforge.Helper.OutputHelper import (
     generate_stl,
     generate_swap_instructions,
     generate_project_file,
     generate_flatforge_stls,
+    model_size_mm,
 )
 from autoforge.Modules.Optimizer import FilamentOptimizer
 
@@ -608,11 +610,10 @@ def _load_priority_mask(
     """
     focus_map_full = None
     if args.priority_mask != "":
-        pm = imread(args.priority_mask, cv2.IMREAD_UNCHANGED)
-        if pm.ndim == 3:
-            if pm.shape[2] == 4:
-                pm = pm[:, :, :3]
-            pm = cv2.cvtColor(pm, cv2.COLOR_BGR2GRAY)
+        # 8-bit first: a 16-bit mask divided by 255 below gave weights up
+        # to 257 instead of 0..1.
+        pm = to_bgr_or_bgra_uint8(imread(args.priority_mask, cv2.IMREAD_UNCHANGED))
+        pm = cv2.cvtColor(pm[:, :, :3], cv2.COLOR_BGR2GRAY)
         tgt_h, tgt_w = output_img_np.shape[:2]
         pm_resized = cv2.resize(pm, (tgt_w, tgt_h), interpolation=cv2.INTER_LINEAR)
         pm_float = pm_resized.astype(np.float32) / 255.0
@@ -925,9 +926,13 @@ def _post_optimize_and_export(
                 # though it's independent of pruning and equally applicable
                 # here. Run it unconditionally so the non-pruning path gets
                 # the same free quality improvement.
-                optimizer.rng_seed_search(
-                    optimizer.best_discrete_loss, 50, autoset_seed=True
-                )
+                # Baseline measured now, at the full output resolution the
+                # search scores at - best_discrete_loss comes from training
+                # at the processing resolution, so "beat the start" compared
+                # numbers from two different image sizes (see prune()).
+                start_loss = optimizer.solution_loss()
+                if start_loss is not None:
+                    optimizer.rng_seed_search(start_loss, 50, autoset_seed=True)
                 from autoforge.Helper.PruningHelper import optimise_swap_positions
 
                 optimise_swap_positions(optimizer, max_passes=3)
@@ -992,7 +997,7 @@ def _post_optimize_and_export(
                 )
 
             if not args.flatforge:
-                background_layers = int(args.background_height // args.layer_height)
+                background_layers = int(round(args.background_height / args.layer_height))
                 swap_instructions = generate_swap_instructions(
                     disc_global.cpu().numpy(),
                     disc_height_image.cpu().numpy(),
@@ -1014,8 +1019,11 @@ def _post_optimize_and_export(
                     args,
                     disc_global.cpu().numpy(),
                     disc_height_image.cpu().numpy(),
-                    output_target.shape[1],
-                    output_target.shape[0],
+                    *model_size_mm(
+                        output_target.shape[1],
+                        output_target.shape[0],
+                        args.stl_output_size,
+                    ),
                     os.path.join(args.output_folder, "final_model.stl"),
                     args.csv_file,
                 )
@@ -1064,7 +1072,9 @@ def start(args) -> float:
     )
 
     # Read input image early (needed for auto background color)
-    img = imread(args.input_image, cv2.IMREAD_UNCHANGED)
+    # Grayscale, grayscale+alpha and 16-bit images are brought to 8-bit
+    # BGR(A) first - the code below indexes img.shape[2] and assumes 0-255.
+    img = to_bgr_or_bgra_uint8(imread(args.input_image, cv2.IMREAD_UNCHANGED))
     alpha = None
     if img.shape[2] == 4:
         alpha = img[:, :, 3]
@@ -1222,9 +1232,15 @@ def main() -> None:
             try:
                 print(f"Run {i + 1}/{args.best_of}")
                 run_folder = os.path.join(temp_output_folder, f"run_{i + 1}")
-                args.output_folder = run_folder
-                os.makedirs(args.output_folder, exist_ok=True)
-                run_loss = start(args)
+                # Each run gets its own copy: start() writes results back into
+                # its args (the pruned max_layers, the auto-picked background
+                # color, ...), and a shared namespace handed them to every
+                # later run - run 2 onwards started with run 1's pruned layer
+                # count instead of the requested --max_layers.
+                run_args = copy.copy(args)
+                run_args.output_folder = run_folder
+                os.makedirs(run_args.output_folder, exist_ok=True)
+                run_loss = start(run_args)
                 print(f"Run {i + 1} finished with loss: {run_loss}")
                 if run_loss < run_best_loss:
                     run_best_loss = run_loss
@@ -1240,6 +1256,12 @@ def main() -> None:
                 plt.close("all")
             except Exception:
                 traceback.print_exc()
+        if not ret:
+            print(
+                f"Error: all {args.best_of} runs failed; see the errors above.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         best_run = min(ret, key=lambda x: x[1])
         best_run_folder = best_run[0]
         best_loss = best_run[1]

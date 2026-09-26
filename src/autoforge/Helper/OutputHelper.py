@@ -48,6 +48,56 @@ def extract_filament_swaps(disc_global, disc_height_image, background_layers):
     return filament_indices, slider_values
 
 
+def _is_blank(value) -> bool:
+    """Missing, None, or the NaN pandas reads an empty CSV cell as."""
+    if value is None:
+        return True
+    if isinstance(value, float) and np.isnan(value):
+        return True
+    return isinstance(value, str) and value.strip() == ""
+
+
+def _hfp_filament(mat, brand="", color="#000000", name=""):
+    """One ``filament_set`` entry of a .hfp file from a material record.
+
+    The records come from pandas, which reads an empty CSV cell as NaN -
+    and ``json.dump`` writes that as a bare ``NaN``, which is not JSON, so
+    HueForge (or any strict parser) could not open the project. The webui
+    hits this for every filament without a brand. Blank fields get the
+    given defaults (a fresh uuid for ``uuid``) instead."""
+
+    def text(key, default):
+        value = mat.get(key)
+        return default if _is_blank(value) else str(value)
+
+    td_raw = mat.get("Transmissivity")
+    try:
+        td = float(td_raw)
+    except (TypeError, ValueError):
+        td = float("nan")
+    if not np.isfinite(td):
+        td = 0.1
+    return {
+        "Brand": text("Brand", brand),
+        "Color": text("Color", color),
+        "Name": text("Name", name),
+        "Owned": str(mat.get("Owned", False)).strip().lower() == "true",
+        "Transmissivity": int(td) if td.is_integer() else td,
+        "Type": text("Type", "PLA"),
+        "uuid": text("Uuid", str(uuid.uuid4())),
+    }
+
+
+def model_size_mm(width_px, height_px, maximum_x_y_size):
+    """Physical (width, height) in mm of a model built by ``generate_stl``
+    from a ``width_px`` x ``height_px`` height map: its longer side spans
+    ``maximum_x_y_size`` mm across the pixel centres (``max(W, H) - 1``
+    steps)."""
+    steps = max(int(width_px) - 1, int(height_px) - 1, 1)
+    scale = float(maximum_x_y_size) / steps
+    return (max(int(width_px) - 1, 0) * scale, max(int(height_px) - 1, 0) * scale)
+
+
 def generate_project_file(
     project_filename,
     args,
@@ -78,7 +128,7 @@ def generate_project_file(
         csv_filename (str): Path to the CSV file containing material data.
     """
     # Compute the number of background layers (as in your main())
-    background_layers = int(args.background_height / args.layer_height)
+    background_layers = int(round(args.background_height / args.layer_height))
 
     # Load full material data from CSV
     material_data = load_materials_data(args)
@@ -95,21 +145,13 @@ def generate_project_file(
     # Use actual background filament data if auto selected and index stored
     bg_idx = getattr(args, "background_material_index", None)
     if bg_idx is not None and 0 <= bg_idx < len(material_data):
-        bg_mat = material_data[bg_idx]
         filament_set.append(
-            {
-                "Brand": bg_mat.get("Brand", "Autoforge"),
-                "Color": bg_mat.get("Color", args.background_color),
-                "Name": bg_mat.get("Name", "Background"),
-                "Owned": str(bg_mat.get("Owned", False)).strip().lower() == "true",
-                "Transmissivity": (
-                    int(bg_mat["Transmissivity"])
-                    if float(bg_mat["Transmissivity"]).is_integer()
-                    else float(bg_mat["Transmissivity"])
-                ),
-                "Type": bg_mat.get("Type", "PLA"),
-                "uuid": bg_mat.get("Uuid", str(uuid.uuid4())),
-            }
+            _hfp_filament(
+                material_data[bg_idx],
+                brand="Autoforge",
+                color=args.background_color,
+                name="Background",
+            )
         )
     else:
         filament_set.append(
@@ -125,22 +167,7 @@ def generate_project_file(
         )
 
     for idx in filament_indices:
-        mat = material_data[idx]
-        filament_set.append(
-            {
-                "Brand": mat["Brand"],
-                "Color": mat["Color"],
-                "Name": mat["Name"],
-                "Owned": str(mat.get("Owned", False)).strip().lower() == "true",
-                "Transmissivity": (
-                    int(mat["Transmissivity"])
-                    if float(mat["Transmissivity"]).is_integer()
-                    else float(mat["Transmissivity"])
-                ),
-                "Type": mat.get("Type", "PLA"),
-                "uuid": mat.get("Uuid", str(uuid.uuid4())),
-            }
-        )
+        filament_set.append(_hfp_filament(material_data[idx]))
 
     filament_set = filament_set[::-1]
 
@@ -204,7 +231,9 @@ def generate_project_file(
 
     # Write out the project file as JSON
     with open(project_filename, "w") as f:
-        json.dump(project_data, f, indent=4)
+        # allow_nan=False: a NaN that slipped through must fail here, loudly,
+        # rather than produce a file HueForge cannot parse.
+        json.dump(project_data, f, indent=4, allow_nan=False)
 
 
 def generate_stl(
@@ -526,93 +555,69 @@ def generate_flatforge_stls(
     )
     print(f"Selected clear material: {material_names[most_transparent_idx]} (TD: {material_TDs_np[most_transparent_idx]:.2f})")
     
-    # Create a 3D array: [layer, height, width] where each entry indicates which material is at that position
-    # Initialize with -1 (no material)
-    layer_materials = np.full((max_layer, H, W), -1, dtype=int)
-    
-    # For each pixel, assign materials to layers based on disc_height_image and disc_global
-    for i in range(H):
-        for j in range(W):
-            if not valid_mask[i, j]:
-                continue
-            
-            pixel_height = int(disc_height_image[i, j])
-            
-            # Assign materials from layer 0 to min(pixel_height, max_layer)-1
-            # Fill any gaps in disc_global by extending the last color from below
-            # This ensures there's no clear between two colored layers
-            last_color = -1
-            for layer in range(min(pixel_height, max_layer)):
-                material = int(disc_global[layer])
-                if material >= 0:
-                    # This layer has a color assigned
-                    last_color = material
-                    layer_materials[layer, i, j] = material
-                elif last_color >= 0:
-                    # This layer is a gap in disc_global, extend the color from below
-                    # This prevents clear from being placed between two colored layers
-                    layer_materials[layer, i, j] = last_color
-                # else: both material and last_color are -1, leave as -1
-    
+    heights = np.asarray(disc_height_image).astype(np.int64)
+
+    # The material printed at each layer. A gap in disc_global (-1) takes the
+    # color from below, so there is never clear between two colored layers.
+    layer_color = np.full(max_layer, -1, dtype=np.int64)
+    last_color = -1
+    for layer in range(max_layer):
+        material = int(disc_global[layer])
+        if material >= 0:
+            last_color = material
+        layer_color[layer] = last_color
+
+    # Contiguous runs of one material: (material, first_layer, end_layer).
+    bands = []
+    for layer in range(max_layer):
+        material = int(layer_color[layer])
+        if material < 0:
+            continue
+        if bands and bands[-1][0] == material and bands[-1][2] == layer:
+            bands[-1] = (material, bands[-1][1], layer + 1)
+        else:
+            bands.append((material, layer, layer + 1))
+
     # Get unique materials used (excluding background)
-    unique_materials = np.unique(disc_global[:max_layer])
-    unique_materials = [int(m) for m in unique_materials if m >= 0]
-    
+    unique_materials = sorted({material for material, _, _ in bands})
+
     # Calculate the total height of the print (including cap layers)
     total_height = background_height + (max_layer + cap_layers) * layer_height
-    
+
     stl_files = []
-    
-    # Helper function to create a flat box STL for a given material at specific layers
+
     def create_color_stl(material_idx, material_name, color_hex):
-        """Create an STL for a specific material/color."""
-        # Find which layers and pixels use this material
-        material_mask_3d = (layer_materials == material_idx)
-        
-        # Create a height map for this material
-        # For each pixel, find the maximum layer that uses this material
-        height_map = np.zeros((H, W), dtype=float)
-        min_height_map = np.full((H, W), max_layer + cap_layers, dtype=float)
-        
-        has_material = False
-        for layer in range(max_layer):
-            for i in range(H):
-                for j in range(W):
-                    if material_mask_3d[layer, i, j]:
-                        has_material = True
-                        # Track the highest layer this material appears at this pixel
-                        if layer + 1 > height_map[i, j]:
-                            height_map[i, j] = layer + 1
-                        # Track the lowest layer this material appears at this pixel
-                        if layer < min_height_map[i, j]:
-                            min_height_map[i, j] = layer
-        
-        if not has_material:
+        """Create the STL for one material: one solid per band it prints in.
+
+        A material can recur in several separate bands (e.g. white low down
+        and again as a highlight). A single solid spanning the lowest to the
+        highest of its layers used to swallow every other material printed in
+        between, so the per-color STLs overlapped. At a pixel of height z, the
+        band [a, b) is filled from layer a up to min(b, z)."""
+        pieces = []
+        for material, first, end in bands:
+            if material != material_idx:
+                continue
+            band_mask = heights > first
+            if not np.any(band_mask & valid_mask):
+                continue
+            top_mm = np.minimum(heights, end).astype(float) * layer_height
+            bottom_mm = np.full((H, W), first * layer_height, dtype=float)
+            mesh_data = _create_flatforge_box_mesh(
+                top_mm, bottom_mm, background_height,
+                maximum_x_y_size, valid_mask, band_mask
+            )
+            if mesh_data is not None:
+                pieces.append(mesh_data)
+
+        if not pieces:
             return None
-        
-        # Convert to mm (layers to mm)
-        height_map_mm = height_map * layer_height
-        min_height_map_mm = min_height_map * layer_height
-        
-        # Create a 2D mask indicating which pixels have this material (at any layer)
-        material_mask_2d = np.any(material_mask_3d, axis=0)
-        
-        # Create vertices for the box
-        # We need to create a rectangular box where z goes from min to max for each pixel
+
         filename = os.path.join(output_folder, f"{material_name}_{color_hex.lstrip('#')}.stl")
-        
-        # Build mesh with per-pixel min and max heights
-        mesh_data = _create_flatforge_box_mesh(
-            height_map_mm, min_height_map_mm, background_height, 
-            maximum_x_y_size, valid_mask, material_mask_2d
-        )
-        
-        if mesh_data is not None:
-            _save_stl_with_manifold_fix(mesh_data, filename)
-            stl_files.append(filename)
-            return filename
-        return None
-    
+        _save_stl_with_manifold_fix(np.concatenate(pieces, axis=0), filename)
+        stl_files.append(filename)
+        return filename
+
     # Generate STL for each unique material
     for mat_idx in unique_materials:
         material_name = material_names[mat_idx].replace(" ", "_").replace("/", "-")
@@ -621,42 +626,20 @@ def generate_flatforge_stls(
         color_hex = "#{:02x}{:02x}{:02x}".format(
             int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
         )
-        
+
         print(f"Generating FlatForge STL for {material_name}...")
         create_color_stl(mat_idx, material_name, color_hex)
-    
+
     # Generate STL for clear/transparent areas
-    # Clear should ONLY be placed above the topmost colored material, never between colors
-    # Since gaps between colors are filled by extending the color from below during material assignment,
-    # we only need to check if the pixel height is less than max_layer (unfilled top layers)
+    # Clear is only placed above the topmost colored layer of a pixel, never
+    # between colors (gaps take the color from below, see layer_color).
     print("Generating FlatForge STL for clear areas...")
-    
-    # Find positions where clear is needed (above all colored materials)
-    clear_height_map = np.zeros((H, W), dtype=float)
-    clear_min_height_map = np.full((H, W), max_layer, dtype=float)
-    
-    has_clear = False
-    for i in range(H):
-        for j in range(W):
-            if not valid_mask[i, j]:
-                continue
-            
-            pixel_height = int(disc_height_image[i, j])
-            
-            # If pixel height is less than max_layer, fill the top with clear
-            if pixel_height < max_layer:
-                has_clear = True
-                clear_min_height_map[i, j] = pixel_height
-                clear_height_map[i, j] = max_layer
-            # Note: We don't check layer_materials because gaps are already filled with colors
-    
-    if has_clear:
-        clear_height_map_mm = clear_height_map * layer_height
-        clear_min_height_map_mm = clear_min_height_map * layer_height
-        
-        # Create mask for clear areas
-        clear_mask = (clear_height_map > 0) & valid_mask
-        
+
+    clear_mask = valid_mask & (heights < max_layer)
+    if np.any(clear_mask):
+        clear_height_map_mm = np.full((H, W), max_layer * layer_height, dtype=float)
+        clear_min_height_map_mm = heights.astype(float) * layer_height
+
         filename = os.path.join(output_folder, f"Clear_{clear_material_name}_{clear_color_hex}.stl")
         mesh_data = _create_flatforge_box_mesh(
             clear_height_map_mm, clear_min_height_map_mm, background_height,
@@ -667,7 +650,7 @@ def generate_flatforge_stls(
             stl_files.append(filename)
     else:
         print("No clear areas needed - all layers filled with colored materials.")
-    
+
     # Generate cap layer if requested
     if cap_layers > 0:
         print(f"Generating FlatForge STL for cap layer ({cap_layers} layers)...")

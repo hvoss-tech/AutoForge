@@ -31,12 +31,25 @@ async function runOptimization(request: APIRequestContext, baseURL: string) {
   })
   expect(upload.ok()).toBeTruthy()
   const filename = (await upload.json()).filename
+  // The page only restores a finished job under the image it was run on
+  // (jobBelongsToImage), so the project has to have that image open.
+  await presetSettings(request, { input_image: filename })
 
   const start = await request.post('/api/optimize/start', { data: { ...FAST_SETTINGS, input_image: filename } })
   expect(start.ok(), await start.text()).toBeTruthy()
   const jobId = (await start.json()).job_id
   const done = await waitForJob(request, jobId)
   expect(done.status, done.error ?? '').toBe('completed')
+  // A run started from the page leaves the result's color layers in the
+  // project; one started through the API doesn't, and the pruning dialog
+  // reads its current counts (and so its default limits) from those layers.
+  // With the reset defaults there, it asked to prune a 4-color result down
+  // to one color.
+  const derived = await (await request.get(`/api/sliders/from-optimizer?job_id=${jobId}`)).json()
+  expect(derived.sliders.length).toBeGreaterThan(0)
+  const state = await (await request.get('/api/project/state')).json()
+  const saved = await request.post('/api/project/state', { data: { ...state, color_sliders: derived.sliders } })
+  expect(saved.ok()).toBeTruthy()
   return jobId
 }
 
@@ -273,15 +286,20 @@ test('repeat pruning never ends up worse than the pass before it', async ({ requ
   const jobId = await runOptimization(request, baseURL!)
 
   const losses: number[] = []
+  // Each pass prunes the previous pass's result, as the page does: a
+  // completed prune takes the result over under its own job id, and the id
+  // it started from no longer resolves to it.
+  let target = jobId
   for (let pass = 0; pass < 3; pass++) {
     const start = await request.post('/api/pruning/start', {
-      data: { pruning_max_colors: 4, pruning_max_swaps: 6, pruning_max_layer: 18, job_id: jobId },
+      data: { pruning_max_colors: 4, pruning_max_swaps: 6, pruning_max_layer: 18, job_id: target },
     })
     expect(start.ok(), await start.text()).toBeTruthy()
     const done = await waitForJob(request, (await start.json()).job_id)
     expect(done.status, done.error ?? '').toBe('completed')
     expect(typeof done.loss, `pass ${pass + 1} reported no loss`).toBe('number')
     losses.push(done.loss as number)
+    target = done.job_id
   }
 
   // Pass 2 onwards may improve or hold, never regress. (Pass 1 is exempt: it

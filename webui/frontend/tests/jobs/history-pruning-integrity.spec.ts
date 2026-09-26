@@ -66,13 +66,24 @@ async function captureState(page: Page): Promise<CapturedState> {
   const columns = page.locator('[data-testid^="slider-column-"]')
   const n = await columns.count()
   const bands: BandState[] = []
-  for (let i = 0; i < n; i++) {
-    const layer = await byTestId(page, `layer-input-${i}`).inputValue()
-    const td = await byTestId(page, `td-input-${i}`).inputValue()
-    const filamentUuid = await byTestId(page, `filament-select-${i}`).getAttribute('data-value')
-    const enabled = (await byTestId(page, `toggle-${i}`).getAttribute('data-enabled')) === 'true'
-    bands.push({ layer, td, filamentUuid, enabled })
+  // Short per-read timeouts: this is polled while a history jump re-renders
+  // the band list. With no actionTimeout configured, reading a column that
+  // disappeared between count() and the read waited forever, so a single
+  // poll attempt hung past the poll's own 900s limit even though the page
+  // had long since settled on the right state.
+  const read = { timeout: 2_000 }
+  try {
+    for (let i = 0; i < n; i++) {
+      const layer = await byTestId(page, `layer-input-${i}`).inputValue(read)
+      const td = await byTestId(page, `td-input-${i}`).inputValue(read)
+      const filamentUuid = await byTestId(page, `filament-select-${i}`).getAttribute('data-value', read)
+      const enabled = (await byTestId(page, `toggle-${i}`).getAttribute('data-enabled', read)) === 'true'
+      bands.push({ layer, td, filamentUuid, enabled })
+    }
+  } catch {
+    return { image: `${image} (band list still changing)`, bands: [] }
   }
+  if ((await columns.count()) !== n) return { image: `${image} (band list still changing)`, bands: [] }
   return { image, bands }
 }
 

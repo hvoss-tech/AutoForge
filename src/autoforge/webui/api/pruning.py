@@ -3,6 +3,8 @@ import copy
 import threading
 import time
 import uuid
+
+import torch
 from fastapi import APIRouter, HTTPException
 from ..models import PruningSettings
 from ..services.optimization_service import get_optimization_service
@@ -34,6 +36,14 @@ async def start_pruning(settings: PruningSettings):
         raise HTTPException(
             409,
             f"An optimization is {busy.status}. Let it finish or cancel it before pruning.",
+        )
+
+    from .init import is_init_building
+
+    if is_init_building():
+        raise HTTPException(
+            409,
+            "The preview of the image is still being prepared. Wait for it to finish, then try again.",
         )
 
     # Pruning must operate on the specific result the frontend is looking
@@ -73,6 +83,33 @@ async def start_pruning(settings: PruningSettings):
     cancel_event = svc.cancel_event(prune_job_id)
     pause_event = svc.pause_event(prune_job_id)
 
+    # What a cancelled or failed prune needs to put back (see _roll_back).
+    rollback: dict = {}
+
+    def _roll_back() -> None:
+        """Return the result to exactly what `job_id` held before this prune.
+
+        Only a *completed* prune becomes the frontend's current job; after a
+        cancel or a failure it stays on `job_id`. The optimizer had already
+        been claimed and (partly) pruned, so that job then answered "pruned
+        since" to every recolor and prune, and nothing could reach the result
+        at all until the next run. Restore the solution, hand ownership back,
+        and re-send the stack — the per-pass broadcasts had already replaced
+        the frontend's sliders with pruned ones."""
+        optimizer = rollback.get("optimizer")
+        if optimizer is None:
+            return
+        try:
+            if rollback["snapshot"] is not None:
+                optimizer.restore_solution_snapshot(rollback["snapshot"])
+            optimizer._prune_runs = rollback["prune_runs"]
+            optimizer.preview_callback = rollback["preview_callback"]
+        finally:
+            svc.return_pipeline_result(job_id, prune_job_id)
+        broadcast = rollback.get("broadcast")
+        if broadcast is not None:
+            broadcast()
+
     def _run():
         try:
             svc.update_status(prune_job_id, "running")
@@ -87,6 +124,19 @@ async def start_pruning(settings: PruningSettings):
                                         "since, or the server was restarted). Go to the newest result, "
                                         "or run optimization first.")
                 return
+            claimed_optimizer = pipeline_result["optimizer"]
+            snapshot = None
+            if hasattr(claimed_optimizer, "solution_snapshot"):
+                snapshot = claimed_optimizer.solution_snapshot()
+                logits = snapshot.get("pixel_height_logits")
+                if isinstance(logits, torch.Tensor):
+                    snapshot["pixel_height_logits"] = logits.detach().clone()
+            rollback.update(
+                optimizer=claimed_optimizer,
+                snapshot=snapshot,
+                prune_runs=getattr(claimed_optimizer, "_prune_runs", 0),
+                preview_callback=getattr(claimed_optimizer, "preview_callback", None),
+            )
 
             from ..helpers.pipeline_runner import export_results
 
@@ -290,6 +340,8 @@ async def start_pruning(settings: PruningSettings):
                     import traceback
                     traceback.print_exc()
 
+            rollback["broadcast"] = _broadcast_result
+
             def _discrete_loss() -> float | None:
                 """The loss of the solution as it now stands — the measure
                 auto-repeat decides on. Deliberately the same
@@ -348,10 +400,9 @@ async def start_pruning(settings: PruningSettings):
                     pause_event=pause_event,
                     apply_spike_removal=apply_spikes,
                 )
-                # Cancelled between phases — the solution as of the last
-                # completed phase was still exported, so the partial result
-                # is real and usable, just not fully pruned. The user asked
-                # to stop, so their sliders aren't force-overwritten either.
+                # Cancelled between phases. The frontend stays on the result
+                # pruning started from, so the solution is rolled back to it
+                # below (_roll_back) rather than left half-pruned.
                 if not outputs.get("pruning_completed", True):
                     cancelled_midway = True
                     break
@@ -388,6 +439,7 @@ async def start_pruning(settings: PruningSettings):
 
             _counts_state["value"] = None  # force a fresh read of the final solution
             if cancelled_midway:
+                _roll_back()
                 svc.update_status(
                     prune_job_id, "cancelled", phase=None, **_live_counts(), **_pass_fields(),
                 )
@@ -408,6 +460,10 @@ async def start_pruning(settings: PruningSettings):
             import traceback
             traceback.print_exc()
             capture_exception(e, {"phase": "pruning", "job_id": prune_job_id})
+            try:
+                _roll_back()
+            except Exception:
+                traceback.print_exc()
             svc.update_status(prune_job_id, "failed", error=friendly_error_message(e))
 
     thread = threading.Thread(target=_run, daemon=True)

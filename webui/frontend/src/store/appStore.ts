@@ -751,11 +751,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       return { activeFilaments: [...state.activeFilaments, filament] }
     })
     try {
-      await fetch('/api/filaments/active', {
+      const response = await fetch('/api/filaments/active', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(filament),
       })
+      // fetch() only throws on a network failure. A rejected request (e.g.
+      // a 422 for a filament the server can't accept) left the filament
+      // shown as active while /api/optimize/start — which reads the
+      // server's list — ran without it.
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
     } catch (e) {
       console.error('Failed to add active filament:', e)
       get().pushToast(`Failed to add "${filament.name}" to active filaments — it may not be saved on the server.`)
@@ -768,7 +773,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeFilaments: state.activeFilaments.filter((f) => f.uuid !== uuid),
     }))
     try {
-      await fetch(`/api/filaments/active/${uuid}`, { method: 'DELETE' })
+      const response = await fetch(`/api/filaments/active/${uuid}`, { method: 'DELETE' })
+      if (!response.ok && response.status !== 404) throw new Error(`HTTP ${response.status}`)
     } catch (e) {
       console.error('Failed to remove active filament:', e)
       get().pushToast('Failed to remove active filament on the server — it may reappear after a reload.')
