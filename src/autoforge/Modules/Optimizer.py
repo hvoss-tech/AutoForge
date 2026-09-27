@@ -238,6 +238,8 @@ class FilamentOptimizer:
             "height_offsets": self.height_offsets,
         }
 
+        self._setup_constraints(args)
+
         # Tau schedule
         self.num_steps_done = 0
         self.warmup_steps = min(
@@ -354,6 +356,224 @@ class FilamentOptimizer:
                 )
             self.initial_height_map = initial_height.cpu().detach().numpy()
 
+    def _setup_constraints(self, args) -> None:
+        """--constrained_opt: the colour/swap limits the optimizer has to
+        hold (None = no limit), in the same terms pruning uses them."""
+        n_mat = self.material_colors.shape[0]
+        self.limit_colors = None
+        self.limit_swaps = None
+        if getattr(args, "constrained_opt", False):
+            colors = max(1, args.pruning_max_colors - (2 if args.flatforge else 1))
+            if colors < n_mat:
+                self.limit_colors = colors
+            if args.pruning_max_swaps < self.max_layers - 1:
+                self.limit_swaps = args.pruning_max_swaps
+        self.constrained = self.limit_colors is not None or self.limit_swaps is not None
+        if self.constrained:
+            # Static buffers, updated in place, so the captured training graph
+            # sees the current values.
+            self._proj_target = torch.zeros(
+                self.max_layers, n_mat, dtype=torch.float32, device=self.device
+            )
+            self._proj_rho = torch.zeros((), dtype=torch.float32, device=self.device)
+            # Lagrangian on the expected (colours, swaps) of a stack sampled
+            # from softmax(global_logits): multipliers, limits, the latest
+            # violation and an on/off gate, all updated in place.
+            inf = float("inf")
+            self._lam = torch.zeros(2, dtype=torch.float32, device=self.device)
+            self._lim = torch.tensor(
+                [
+                    float(self.limit_colors) if self.limit_colors is not None else inf,
+                    float(self.limit_swaps) * getattr(args, "constraint_swap_margin", 1.0)
+                    if self.limit_swaps is not None
+                    else inf,
+                ],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._viol = torch.zeros(2, dtype=torch.float32, device=self.device)
+            self._lagr_gate = torch.zeros((), dtype=torch.float32, device=self.device)
+
+    def _expected_counts(self, global_logits: torch.Tensor) -> torch.Tensor:
+        """[E colours, E swaps] of a stack drawn layer by layer from
+        softmax(global_logits) - the distribution the discrete snapshots
+        sample from. Differentiable."""
+        p = torch.softmax(global_logits.float(), dim=1)
+        e_swaps = (1.0 - (p[1:] * p[:-1]).sum(dim=1)).sum()
+        log_absent = torch.log1p(-p.clamp(max=1.0 - 1e-6)).sum(dim=0)  # [M]
+        e_colors = (1.0 - torch.exp(log_absent)).sum()
+        return torch.stack([e_colors, e_swaps])
+
+    def project_feasible(self, score: torch.Tensor) -> torch.Tensor:
+        from autoforge.Helper.ConstraintHelper import project_assignment
+
+        return project_assignment(score, self.limit_colors, self.limit_swaps)
+
+    def _dual_step(self) -> None:
+        """Dual ascent on the multipliers: grow them while the expected
+        counts exceed the limits (no host sync)."""
+        self._lam.add_(self._viol * (self._lagr_gate * self.args.constraint_dual_lr))
+
+    def _update_constraint_pull(self) -> None:
+        """Ramp the pull toward the nearest feasible stack and refresh that
+        stack (the projection of the current logits)."""
+        i = self.num_steps_done
+        T = self.args.iterations
+        t0 = self.args.constraint_start * T
+        t1 = self.args.constraint_full * T
+        frac = min(1.0, max(0.0, (i - t0) / max(t1 - t0, 1.0)))
+        rho = self.args.constraint_rho * frac
+        self._lagr_gate.fill_(1.0 if i >= t0 else 0.0)
+        if rho > 0 and not getattr(self, "_proj_from_search", False) and (
+            i % 50 == 0 or not getattr(self, "_proj_ready", False)
+        ):
+            with torch.no_grad():
+                logp = torch.log_softmax(self.params["global_logits"].detach().float(), dim=1)
+                dg = self.project_feasible(logp)
+                self._proj_target.zero_()
+                self._proj_target.scatter_(1, dg.view(-1, 1), 1.0)
+            self._proj_ready = True
+        self._proj_rho.fill_(rho)
+
+    def _linearized_candidates(self, dg: torch.Tensor, eff: Optional[torch.Tensor] = None) -> list:
+        """Non-local feasible moves: linearize the discrete loss in each
+        layer's material distribution at the stack ``dg`` and solve the
+        constrained projection on those costs (a Frank-Wolfe step over the
+        feasible stacks), charging each layer the predicted damage of a
+        change and only a fraction of its predicted gain."""
+        n_mat = self.material_colors.shape[0]
+        eps = 1e-3
+        if eff is None:
+            eff = self._apply_height_offset(
+                self.best_params["pixel_height_logits"], self.best_params["height_offsets"]
+            )
+        eff = eff.detach()
+        with torch.enable_grad():
+            onehot = F.one_hot(dg.long(), n_mat).float()
+            p = onehot * (1 - eps) + eps / n_mat
+            logit = torch.log(p).requires_grad_(True)
+            comp = composite_image_cont(
+                eff, logit, self.vis_tau, 1.0, self.h, self.max_layers,
+                self.material_colors, self.material_TDs, self.background,
+                None, torch.ones_like(logit),
+            )
+            loss = compute_loss(comp=comp, target=self.target, focus_map=self.focus_map, alpha=self.alpha)
+            (grad,) = torch.autograd.grad(loss, logit)
+        d = (grad / p).detach()
+        delta = d - d.gather(1, dg.long().view(-1, 1))  # linear loss change of l -> m
+        if not torch.isfinite(delta).all():
+            return []
+        # Minimal damage: a layer only pays for leaving its current material
+        # when that is predicted to hurt; predicted gains are trusted only in
+        # part (c), since they do not add up once several layers change.
+        out = []
+        for c in (0.0, 0.1, 0.3, 1.0):
+            cost = torch.clamp(delta, min=0) + c * torch.clamp(delta, max=0)
+            out.append(self.project_feasible(-cost).to(dg.dtype))
+        return out
+
+    @torch.no_grad()
+    def _pin_to_best(self) -> None:
+        """Final phase: continue training from the best feasible solution
+        with its layer stack pinned (logits one-hot enough that the soft
+        composite is that stack), so the heights adapt to the stack that
+        will actually be printed; the search moves the stack in between."""
+        from autoforge.Helper.PruningHelper import disc_to_logits
+
+        if self.best_params is None:
+            return
+        dg, _ = self.get_discretized_solution(best=True)
+        self.params["global_logits"].copy_(
+            disc_to_logits(dg, self.material_colors.shape[0], big_pos=20.0)
+        )
+        self.height_offsets.copy_(self.best_params["height_offsets"])
+
+    def _compound_move(self, dg, cur_loss, cands, shared, rng, n_free: int = 3):
+        """Two-step move out of a local optimum at the limit: one of the
+        cheapest moves that frees a swap or a colour, then the best feasible
+        single move from there. Returns (loss, stack) if the pair improves."""
+        from autoforge.Helper.ConstraintHelper import count_colors_swaps, neighbour_stacks
+        from autoforge.Helper.PruningHelper import _eval_candidates_batch
+
+        c0, s0 = count_colors_swaps(dg)
+        freeing = []
+        for cand in cands:
+            c, s_ = count_colors_swaps(cand)
+            if c < c0 or s_ < s0:
+                freeing.append(cand)
+        if not freeing:
+            return None
+        scored = [(_eval_candidates_batch(self, [f], eff_thick=shared)[0], i) for i, f in enumerate(freeing)]
+        scored.sort()
+        n_mat = self.material_colors.shape[0]
+        for _, i in scored[:n_free]:
+            second = neighbour_stacks(freeing[i], n_mat, self.limit_colors, self.limit_swaps)
+            order = rng.permutation(len(second))
+            for lo in range(0, len(second), 256):
+                chunk = [second[j] for j in order[lo:lo + 256]]
+                loss, best = _eval_candidates_batch(self, chunk, eff_thick=shared, batch_size=64)
+                if loss < cur_loss - 1e-6:
+                    return loss, best
+        return None
+
+    @composite_graph_scope()
+    @torch.no_grad()
+    def constrained_local_search(
+        self, max_rounds: int = 1000, compound: bool = False, should_stop=None
+    ) -> bool:
+        """Best-improvement descent over feasible single-move neighbours of
+        the best stack, scored by the real discrete loss with the best
+        heights. Never leaves the feasible set. Returns True if improved."""
+        from autoforge.Helper.ConstraintHelper import neighbour_stacks
+        from autoforge.Helper.PruningHelper import (
+            _eval_candidates_batch,
+            _make_shared_eff_thick,
+            disc_to_logits,
+        )
+
+        if self.best_params is None:
+            return False
+        n_mat = self.material_colors.shape[0]
+        dg, _ = self.get_discretized_solution(best=True)
+        shared = _make_shared_eff_thick(self)
+        cur_loss, _ = _eval_candidates_batch(self, [dg], eff_thick=shared)
+        improved = False
+        rng = np.random.default_rng(self.num_steps_done)
+        for _ in range(max_rounds):
+            if should_stop is not None and should_stop():
+                break
+            cands = neighbour_stacks(dg, n_mat, self.limit_colors, self.limit_swaps)
+            if self.constrained and getattr(self.args, "constraint_linear_moves", False):
+                cands += self._linearized_candidates(dg)
+            if not cands:
+                break
+            # First improvement over shuffled chunks: most rounds stop after
+            # the first chunk instead of scoring the whole neighbourhood.
+            order = rng.permutation(len(cands))
+            step_ok = False
+            for lo in range(0, len(cands), 256):
+                chunk = [cands[i] for i in order[lo:lo + 256]]
+                loss, best = _eval_candidates_batch(self, chunk, eff_thick=shared, batch_size=64)
+                if loss < cur_loss - 1e-6:
+                    cur_loss, dg = loss, best
+                    improved = step_ok = True
+                    break
+            if not step_ok and compound and self.constrained:
+                step = self._compound_move(dg, cur_loss, cands, shared, rng)
+                if step is not None:
+                    cur_loss, dg = step
+                    improved = step_ok = True
+            if not step_ok:
+                break
+        if improved:
+            self.best_params["global_logits"] = disc_to_logits(dg, n_mat, big_pos=1e5)
+            self.best_discrete_loss = min(self.best_discrete_loss, cur_loss)
+            if self.constrained:
+                self._proj_target.zero_()
+                self._proj_target.scatter_(1, dg.view(-1, 1), 1.0)
+                self._proj_from_search = True
+        return improved
+
     def _apply_height_offset(
         self,
         pixel_logits: Optional[torch.Tensor] = None,
@@ -460,6 +680,15 @@ class FilamentOptimizer:
             compute_dtype=self.composite_compute_dtype,
             gumbel_exp=self._gumbel_exp,
         )
+        if self.constrained:
+            logp = torch.log_softmax(self.params["global_logits"].float(), dim=1)
+            loss = loss - self._proj_rho * (logp * self._proj_target).sum(1).mean()
+            excess = torch.clamp(
+                self._expected_counts(self.params["global_logits"]) - self._lim, min=0.0
+            )
+            excess = torch.nan_to_num(excess, posinf=0.0)
+            self._viol.copy_(excess.detach())
+            loss = loss + self._lagr_gate * (self._lam * excess).sum()
 
         if self.precision.scaler is not None:
             self.precision.scaler.scale(loss).backward()
@@ -665,6 +894,8 @@ class FilamentOptimizer:
             g["lr"] = self.current_learning_rate
 
         tau_height, tau_global = self._get_tau()
+        if self.constrained:
+            self._update_constraint_pull()
 
         # Draw this step's Gumbel noise here, outside any captured region, so
         # the eager and graph-replay paths consume the identical random stream.
@@ -674,9 +905,13 @@ class FilamentOptimizer:
             self._graph.replay()
             loss = self._graph_loss
             self._optimizer_step()
+            if self.constrained:
+                self._dual_step()
         else:
             loss = self._forward_backward(tau_height, tau_global)
             self._optimizer_step()
+            if self.constrained:
+                self._dual_step()
             # Drop the reference to this step's autograd graph *before*
             # attempting capture. A live graph keeps its AccumulateGrad nodes
             # alive, and those are cached per-parameter and reused - so the
@@ -702,6 +937,15 @@ class FilamentOptimizer:
 
         if record_best:
             self._maybe_update_best_discrete()
+            if (
+                getattr(self.args, "constrained_opt", False)
+                and self.num_steps_done >= self.args.constraint_full * self.args.iterations
+            ):
+                self.constrained_local_search(
+                    max_rounds=int(getattr(self.args, "constraint_search_rounds", 3))
+                )
+                if getattr(self.args, "constraint_pin", True):
+                    self._pin_to_best()
         # torch.cuda.empty_cache()
 
         # `.item()` forces a CUDA sync, blocking the CPU until every kernel
@@ -1314,18 +1558,19 @@ class FilamentOptimizer:
             if getattr(self.args, "stack_search", True):
                 from autoforge.Helper.PixelHeightRefine import apply_stack, search_stack
 
-                kept_new_stack = apply_stack(
+                from autoforge.Helper.ConstraintHelper import feasible
+
+                new_stack = search_stack(
                     self,
-                    search_stack(
-                        self,
-                        max_colors_allowed,
-                        max_swaps_allowed,
-                        rounds=int(getattr(self.args, "stack_search_rounds", 60)),
-                        patience=int(getattr(self.args, "stack_search_patience", 15)),
-                    ),
-                    refine_sweeps,
-                    refine_radius,
+                    max_colors_allowed,
+                    max_swaps_allowed,
+                    rounds=int(getattr(self.args, "stack_search_rounds", 60)),
+                    patience=int(getattr(self.args, "stack_search_patience", 15)),
                 )
+                # Belt and braces: a stack beyond the limits is never taken,
+                # however much better it looks.
+                if feasible(new_stack, max_colors_allowed, max_swaps_allowed):
+                    kept_new_stack = apply_stack(self, new_stack, refine_sweeps, refine_radius)
             if not kept_new_stack:
                 refine_pixel_heights(self, sweeps=refine_sweeps, radius=refine_radius)
             self._refine_left_spikes = True
@@ -1734,6 +1979,87 @@ class FilamentOptimizer:
         self.best_params["height_offsets"] = orig_offsets
         return False
 
+    def _ensure_check_scope(self) -> None:
+        """Keep one composite graph-replay scope open for the rest of a
+        constrained run (closed by ``end_check_scope``): the snapshot
+        candidates and the limit search composite the same shapes at every
+        check, so their graphs are captured once instead of once per check."""
+        if getattr(self, "_check_scope", None) is None:
+            cm = composite_graph_scope()
+            cm.__enter__()
+            self._check_scope = cm
+
+    def end_check_scope(self) -> None:
+        """Release the graphs kept by ``_ensure_check_scope`` (call from the
+        thread that trained)."""
+        cm = getattr(self, "_check_scope", None)
+        if cm is not None:
+            self._check_scope = None
+            cm.__exit__(None, None, None)
+
+    def _constrained_update_best(self, sample: torch.Tensor, effective_logits: torch.Tensor, seed: int, tau_g: float) -> None:
+        """The constrained snapshot: stacks within the limits read out of the
+        current logits, scored on the discrete loss with the current heights.
+
+        Candidates: the Gumbel sample (projected onto the limits if it breaks
+        one, perturb-and-MAP with the same draw), the most likely stack
+        within the limits, and under a colour limit the most likely stacks of
+        the runner-up palettes (which palette is best is decided by the real
+        loss, not by the logits). All are projected in one batched call,
+        de-duplicated, and scored against one shared thickness with a single
+        host sync.
+        """
+        from autoforge.Helper.ConstraintHelper import feasible, project_assignment, top_palettes
+        from autoforge.Helper.OptimizerHelper import deterministic_gumbel_noise
+        from autoforge.Helper.PruningHelper import (
+            _candidate_loss,
+            _eff_thick_from_logits,
+            disc_to_logits,
+            find_color_bands,
+            material_select_from_logits,
+        )
+
+        self._ensure_check_scope()
+        n_mat = self.material_colors.shape[0]
+        logp = torch.log_softmax(self.params["global_logits"].detach().float(), dim=1)
+        seeds = torch.arange(logp.shape[0], dtype=torch.int64, device=logp.device) + seed
+        scores = [logp + deterministic_gumbel_noise(seeds, n_mat), logp]
+        if self.limit_colors is not None:
+            neg = torch.full_like(logp, -1e9)
+            scores += [torch.where(m.view(1, -1), logp, neg) for m in top_palettes(logp, self.limit_colors, 8)[1:]]
+        stacks = project_assignment(torch.stack(scores), self.limit_colors, self.limit_swaps)
+        if feasible(sample, self.limit_colors, self.limit_swaps):
+            stacks[0] = sample.to(stacks.dtype)
+
+        unique, seen = [], set()
+        for row in stacks.cpu().tolist():
+            if tuple(row) not in seen:
+                seen.add(tuple(row))
+                unique.append(row)
+        cands = torch.tensor(unique, dtype=torch.long, device=logp.device)
+
+        eff = _eff_thick_from_logits(effective_logits, self.max_layers, self.h, self.vis_tau)
+        losses = []
+        for dg in cands:
+            cols, tds = material_select_from_logits(
+                disc_to_logits(dg, n_mat, big_pos=1e5), self.material_colors, self.material_TDs,
+                rng_seed=seed, tau=self.vis_tau,
+            )
+            losses.append(_candidate_loss(self, eff, cols, tds))
+        del eff
+        best_loss_t, best_i = torch.min(torch.stack(losses), dim=0)
+        best_loss = float(best_loss_t)  # the one host sync
+        if best_loss < self.best_discrete_loss:
+            dg = cands[int(best_i)]
+            self.best_discrete_loss = best_loss
+            self.best_params = self.get_current_parameters()
+            # The stored solution is the feasible stack itself.
+            self.best_params["global_logits"] = disc_to_logits(dg, n_mat, big_pos=1e5)
+            self.best_tau = tau_g
+            self.best_seed = seed
+            self.best_swaps = len(find_color_bands(dg)) - 1
+            self.best_step = self.num_steps_done
+
     def _maybe_update_best_discrete(self):
         """
         Discretize the current solution, compute the discrete-mode loss,
@@ -1745,49 +2071,57 @@ class FilamentOptimizer:
         with torch.no_grad():
             effective_logits = self._apply_height_offset()
 
+            num_materials = self.material_colors.shape[0]
             # Discretize to get disc_global (per-layer material assignments)
             disc_global, disc_height_image = self.discretize_solution(
                 self.params, tau_g, self.h, self.max_layers, rng_seed=seed
             )
+            if self.constrained:
+                self._constrained_update_best(disc_global, effective_logits, seed, tau_g)
+                return
+            candidates = [disc_global]
 
-            # Build discrete global logits from disc_global to avoid
-            # re-running Gumbel-Softmax inside composite_image_disc.
-            num_materials = self.material_colors.shape[0]
-            from autoforge.Helper.PruningHelper import disc_to_logits
-            disc_global_logits = disc_to_logits(
-                disc_global, num_materials, big_pos=1e5
-            )
+            from autoforge.Helper.PruningHelper import disc_to_logits, find_color_bands
 
-            # Composite using the already-discretized global assignment
-            comp_disc = composite_image_disc(
-                effective_logits,
-                disc_global_logits,
-                tau_g,
-                tau_g,
-                self.h,
-                self.max_layers,
-                self.material_colors,
-                self.material_TDs,
-                self.background,
-                rng_seed=seed,
-                compute_dtype=self.composite_compute_dtype,
-            )
+            for disc_global in candidates:
+                # Build discrete global logits from disc_global to avoid
+                # re-running Gumbel-Softmax inside composite_image_disc.
+                disc_global_logits = disc_to_logits(
+                    disc_global, num_materials, big_pos=1e5
+                )
 
-            current_disc_loss = compute_loss(
-                comp=comp_disc,
-                target=self.target,
-                focus_map=self.focus_map,
-                alpha=self.alpha,
-            ).item()
-            from autoforge.Helper.PruningHelper import find_color_bands
+                # Composite using the already-discretized global assignment
+                comp_disc = composite_image_disc(
+                    effective_logits,
+                    disc_global_logits,
+                    tau_g,
+                    tau_g,
+                    self.h,
+                    self.max_layers,
+                    self.material_colors,
+                    self.material_TDs,
+                    self.background,
+                    rng_seed=seed,
+                    compute_dtype=self.composite_compute_dtype,
+                )
 
-            if current_disc_loss < self.best_discrete_loss:
-                self.best_discrete_loss = current_disc_loss
-                self.best_params = self.get_current_parameters()
-                self.best_tau = tau_g
-                self.best_seed = seed
-                self.best_swaps = len(find_color_bands(disc_global)) - 1
-                self.best_step = self.num_steps_done
+                current_disc_loss = compute_loss(
+                    comp=comp_disc,
+                    target=self.target,
+                    focus_map=self.focus_map,
+                    alpha=self.alpha,
+                ).item()
+
+                if current_disc_loss < self.best_discrete_loss:
+                    self.best_discrete_loss = current_disc_loss
+                    self.best_params = self.get_current_parameters()
+                    if self.constrained:
+                        # The stored solution is the feasible stack itself.
+                        self.best_params["global_logits"] = disc_global_logits.clone()
+                    self.best_tau = tau_g
+                    self.best_seed = seed
+                    self.best_swaps = len(find_color_bands(disc_global)) - 1
+                    self.best_step = self.num_steps_done
 
     @composite_graph_scope()
     def rng_seed_search(

@@ -93,6 +93,11 @@ class OptimizationSettings(CamelCaseModel):
     pruning_max_colors: int = Field(100, ge=1)
     pruning_max_swaps: int = Field(100, ge=0)
     pruning_max_layer: int = Field(75, ge=1)
+    # Limits the optimizer itself keeps to while it runs (--constrained_opt),
+    # instead of pruning a result down afterwards. None = unlimited. Colors
+    # count the base filament, like the pruning dialog's "Max colors".
+    max_colors: Optional[int] = Field(None, ge=2)
+    max_swaps: Optional[int] = Field(None, ge=0)
     # WebUI-only orchestration flag (the CLI/pipeline never reads it): once
     # an optimization job completes, the frontend automatically starts one
     # pruning pass at the result's own current counts (no forced reduction)

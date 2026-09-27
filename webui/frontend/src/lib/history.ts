@@ -214,6 +214,8 @@ const SETTING_NAMES: Record<string, string> = {
   init_heightmap_method: 'heightmap method',
   processing_reduction_factor: 'processing reduction',
   priority_mask: 'focus areas',
+  max_colors: 'color limit',
+  max_swaps: 'swap limit',
   priority_mask_strength: 'focus strength',
 }
 

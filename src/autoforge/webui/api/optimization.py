@@ -266,11 +266,27 @@ async def start_optimization(settings: OptimizationSettings):
                 svc.update_status(job.job_id, "failed", error=friendly_error_message(exc))
                 return
 
+            # What the result has, counted like the pruning dialog counts it
+            # — with color/swap limits set, the UI shows them held.
+            counts = {}
+            try:
+                from ..helpers.sliders import result_counts_from_optimizer
+
+                value = result_counts_from_optimizer(result["optimizer"])
+                if value:
+                    counts = {
+                        "result_colors": value["colors"],
+                        "result_swaps": value["swaps"],
+                        "result_layers": value["layers"],
+                    }
+            except Exception:
+                logger.exception("Could not count the result of job %s", job.job_id)
             svc.update_status(job.job_id, "completed",
                               phase=None,
                               progress=100.0,
                               iteration=settings.iterations,
-                              total_iterations=settings.iterations)
+                              total_iterations=settings.iterations,
+                              **counts)
 
         except Exception as e:
             import traceback

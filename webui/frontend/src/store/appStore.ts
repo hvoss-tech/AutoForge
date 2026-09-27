@@ -272,6 +272,8 @@ export const defaultSettings: OptimizationSettings = {
   pruning_max_colors: 100,
   pruning_max_swaps: 100,
   pruning_max_layer: 75,
+  max_colors: null,
+  max_swaps: null,
   auto_initial_prune: true,
   random_seed: 0,
   device: null,

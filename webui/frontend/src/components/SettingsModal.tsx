@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dial
 import { QUALITY_PRESETS, presetForIterations } from '../lib/settingsPresets'
 import { FilamentPicker } from './FilamentPicker'
 import { effectiveBaseFilamentUuid } from '../lib/baseColor'
+import { RunLimitsEditor } from './RunLimits'
 
 type FieldType = 'number' | 'boolean' | 'select' | 'color'
 
@@ -300,6 +301,15 @@ export const SettingsModal: React.FC = () => {
             <p className="text-[11px] text-gray-400 mt-1.5">
               {QUALITY_PRESETS.find((p) => p.id === activePreset)?.description ?? 'More iterations take longer but usually match the picture more closely.'}
             </p>
+          </section>
+
+          <section data-testid="settings-run-limits">
+            <h3 className="text-xs font-semibold text-gray-200 mb-1">Color &amp; swap limits</h3>
+            <p className="text-[11px] text-gray-400 mb-2">
+              The optimizer keeps to these while it runs, so the result never needs more colors or filament swaps than you allow.
+              Also available from the limits button next to Run.
+            </p>
+            <RunLimitsEditor />
           </section>
 
           <section>

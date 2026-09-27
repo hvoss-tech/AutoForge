@@ -19,6 +19,8 @@ import {
   WifiOff,
 } from 'lucide-react'
 import { PruningModal } from './PruningModal'
+import { RunLimitsButton } from './RunLimits'
+import { describeRunLimits, withinRunLimits, type RunLimits } from '../lib/runLimits'
 import { FileMenu } from './FileMenu'
 import { createProgressTracker, formatDuration, type ProgressTracker } from '../lib/progress'
 import { getWorkflowSteps, type WorkflowStep } from '../lib/workflow'
@@ -333,6 +335,16 @@ const ResultStatus: React.FC = () => {
     return describePruningChange(pruningBaseline, resultCounts(buildPrintPlan(colorSliders, [], settings)))
   }, [pruningBaseline, colorSliders, settings])
 
+  // What the result on screen has now (edits and pruning included), next to
+  // the limits its run was started with.
+  const counts = useMemo(
+    () => (colorSliders.length ? resultCounts(buildPrintPlan(colorSliders, [], settings)) : null),
+    [colorSliders, settings],
+  )
+  const runLimits = (currentJob ? runInputsByJob[currentJob.job_id]?.settings : undefined) as RunLimits | undefined
+  const limitsText = runLimits ? describeRunLimits(runLimits) : null
+  const withinLimits = counts && runLimits ? withinRunLimits(runLimits, counts) : true
+
   const stale = reasons.length > 0
   const pruned = pruningJob?.status === 'completed'
   const pruneCancelled = pruningJob?.status === 'cancelled'
@@ -355,6 +367,19 @@ const ResultStatus: React.FC = () => {
         <span className="flex items-center gap-1.5" data-testid="job-done-badge">
           <Check className="w-3.5 h-3.5 text-emerald-500" />
           <span className="text-xs font-medium text-emerald-600">Done</span>
+        </span>
+      )}
+      {counts && (
+        <span
+          className={`text-xs tabular-nums ${withinLimits ? 'text-gray-300' : 'text-amber-500'}`}
+          title={limitsText ? `This run was limited to ${limitsText}${withinLimits ? '' : ' — the result was changed since and no longer keeps to it'}` : 'Colors (base included) and filament swaps of this result'}
+          data-testid="result-counts"
+          data-colors={counts.colors}
+          data-swaps={counts.swaps}
+          data-within-limits={withinLimits}
+        >
+          <span aria-hidden className="text-gray-500">· </span>
+          {counts.colors} colors · {counts.swaps} {counts.swaps === 1 ? 'swap' : 'swaps'}
         </span>
       )}
       {pruned && (
@@ -632,6 +657,8 @@ export const TopBar: React.FC = () => {
             </span>
           )
         )}
+
+        {!isActive && <RunLimitsButton />}
 
         {currentJob?.status === 'running' ? (
           <button

@@ -1037,86 +1037,117 @@ def _runs_from_materials(mats: torch.Tensor):
 # --------------------------------------------------------------------------
 _GRAPH_WARM_CALLS: Final[int] = 3
 _GRAPH_CACHE_SIZE: Final[int] = 4
-_graph_cache: "OrderedDict[tuple, dict]" = OrderedDict()
-_graph_pool = None
-_graph_scope_depth = 0
+# Scope depth, cache and memory pool are per thread. They used to be
+# process-wide: while pruning held a scope in its thread, every other thread
+# that composited (the webui's preview callback, slider re-renders from the
+# page) went through the same unlocked cache and shared pool, and the two
+# threads' captures and evictions corrupted each other - "it->second->
+# use_count > 0 INTERNAL ASSERT FAILED" in capture_begin, after which the
+# process's CUDA RNG was unusable for every later run ("Offset increment
+# outside graph capture encountered unexpectedly"). A scope now only ever
+# affects the thread that opened it; any other thread composites eagerly.
+_graph_state = threading.local()
+# Captures are serialised process-wide, and so are composites from threads
+# without a scope of their own: CUDA does not let another thread capture, or
+# launch the allocations/kernels of a composite, in the middle of a capture
+# (cudaErrorIllegalState). A capture takes milliseconds, so a preview render
+# waiting for one is not noticeable; replays never take the lock.
+_capture_lock = threading.RLock()
+
+
+def _graph_thread_state():
+    st = _graph_state
+    if not hasattr(st, "depth"):
+        st.depth = 0
+        st.cache = OrderedDict()
+        st.pool = None
+    return st
 
 
 @contextmanager
 def composite_graph_scope():
     """Enable CUDA graph replay of repeated composites for the enclosed block
-    (also usable as a decorator). Captured graphs and their memory are
-    released when the outermost scope exits."""
-    global _graph_scope_depth, _graph_pool
-    _graph_scope_depth += 1
+    in the current thread (also usable as a decorator). Captured graphs and
+    their memory are released when the thread's outermost scope exits."""
+    st = _graph_thread_state()
+    st.depth += 1
     try:
         yield
     finally:
-        _graph_scope_depth -= 1
-        if _graph_scope_depth == 0:
-            _graph_cache.clear()
-            _graph_pool = None
+        st.depth -= 1
+        if st.depth == 0:
+            st.cache.clear()
+            st.pool = None
 
 
 def _replay_captured(fn, key: str, tensors: list, *rest):
     """``fn(*tensors, *rest)``, replayed from a captured CUDA graph once the
     same call (shapes, dtypes and non-tensor arguments) has been seen
-    ``_GRAPH_WARM_CALLS`` times inside a ``composite_graph_scope``. Falls
-    back to a plain call outside a scope, off CUDA, while a graph is already
-    being captured, or when gradients are needed."""
-    global _graph_pool
-    if (
-        _graph_scope_depth == 0
-        or not tensors[0].is_cuda
-        or torch.cuda.is_current_stream_capturing()
-        or (torch.is_grad_enabled() and any(t.requires_grad for t in tensors))
-    ):
+    ``_GRAPH_WARM_CALLS`` times inside a ``composite_graph_scope`` of this
+    thread. Falls back to a plain call outside a scope, off CUDA, while a
+    graph is already being captured, or when gradients are needed."""
+    st = _graph_thread_state()
+    if not tensors[0].is_cuda or torch.cuda.is_current_stream_capturing():
         return fn(*tensors, *rest)
+    if st.depth == 0 or (torch.is_grad_enabled() and any(t.requires_grad for t in tensors)):
+        with _capture_lock:
+            return fn(*tensors, *rest)
     full_key = (
         key,
         tuple((tuple(t.shape), t.dtype, t.device, t.stride()) for t in tensors),
         rest,
     )
-    entry = _graph_cache.get(full_key)
+    cache = st.cache
+    entry = cache.get(full_key)
     if entry is None:
-        entry = {"calls": 0, "graph": None, "threads": set()}
-        _graph_cache[full_key] = entry
-        while len(_graph_cache) > _GRAPH_CACHE_SIZE:
-            _graph_cache.popitem(last=False)
+        entry = {"calls": 0, "graph": None}
+        cache[full_key] = entry
+        while len(cache) > _GRAPH_CACHE_SIZE:
+            cache.popitem(last=False)
     else:
-        _graph_cache.move_to_end(full_key)
+        cache.move_to_end(full_key)
 
     if entry["graph"] is None:
         entry["calls"] += 1
-        # Capture only in a thread that has already run this call eagerly.
-        # cuBLAS (and other libraries) create their per-thread handles
-        # lazily on first use, and creating one during capture fails
-        # (CUBLAS_STATUS_NOT_INITIALIZED, which also invalidates the
-        # capture). Pruning scores candidates from joblib worker threads, so
-        # the warm-up calls can all have happened on other threads.
-        tid = threading.get_ident()
-        if entry["calls"] <= _GRAPH_WARM_CALLS or tid not in entry["threads"]:
-            entry["threads"].add(tid)
+        # Capture only after the call has run eagerly in this thread: cuBLAS
+        # (and other libraries) create their per-thread handles lazily on
+        # first use, and creating one during capture fails
+        # (CUBLAS_STATUS_NOT_INITIALIZED, which also invalidates the capture).
+        if entry["calls"] <= _GRAPH_WARM_CALLS:
             return fn(*tensors, *rest)
-        if _graph_pool is None:
-            _graph_pool = torch.cuda.graph_pool_handle()
-        static_in = [t.clone() for t in tensors]
-        graph = torch.cuda.CUDAGraph()
-        with torch.no_grad():
-            # The call has already run eagerly _GRAPH_WARM_CALLS times, so all
-            # lazy initialisation is done; no separate warm-up run is needed.
-            # All captured composites share one memory pool: they are only
-            # ever replayed one at a time and their outputs are copied out.
-            with torch.cuda.graph(
-                graph, pool=_graph_pool, capture_error_mode="thread_local"
-            ):
-                static_out = fn(*static_in, *rest)
-        entry.update(graph=graph, inputs=static_in, output=static_out)
+        with _capture_lock:
+            _capture(fn, entry, st, tensors, rest)
 
     for dst, src in zip(entry["inputs"], tensors):
         dst.copy_(src)
     entry["graph"].replay()
     return entry["output"].clone()
+
+
+def _capture(fn, entry: dict, st, tensors: list, rest: tuple) -> None:
+    """Capture ``fn(*tensors, *rest)`` into ``entry`` (caller holds
+    ``_capture_lock``)."""
+    # A pool lives only as long as a graph captured into it: once the cache
+    # has evicted the last of them (layer pruning changes the shape after
+    # every removal, so shapes that never get captured push the only
+    # captured one out) the pool's use count is zero and capturing into it
+    # again trips "it->second->use_count > 0 INTERNAL ASSERT FAILED". Start
+    # a fresh pool then.
+    if st.pool is None or not any(e["graph"] is not None for e in st.cache.values()):
+        st.pool = torch.cuda.graph_pool_handle()
+    static_in = [t.clone() for t in tensors]
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad():
+        # The call has already run eagerly _GRAPH_WARM_CALLS times, so all
+        # lazy initialisation is done; no separate warm-up run is needed.
+        # All of a thread's captured composites share one memory pool: they
+        # are only ever replayed one at a time and their outputs are copied
+        # out.
+        with torch.cuda.graph(
+            graph, pool=st.pool, capture_error_mode="thread_local"
+        ):
+            static_out = fn(*static_in, *rest)
+    entry.update(graph=graph, inputs=static_in, output=static_out)
 
 
 def composite_image_disc(

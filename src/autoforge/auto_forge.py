@@ -18,6 +18,7 @@ behavior should have changed relative to the previous monolithic version.
 
 import argparse
 import copy
+import json
 import sys
 import os
 import traceback
@@ -307,6 +308,78 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Max number of swaps allowed after pruning",
+    )
+
+    parser.add_argument(
+        "--constrained_opt",
+        default=False,
+        help="Hold --pruning_max_colors / --pruning_max_swaps during the optimization itself instead of pruning afterwards",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--constraint_rho",
+        type=float,
+        default=0.0,
+        help="--constrained_opt: final weight of the pull toward the nearest stack within the limits",
+    )
+    parser.add_argument(
+        "--constraint_start",
+        type=float,
+        default=0.1,
+        help="--constrained_opt: fraction of the iterations after which the pull starts ramping up",
+    )
+    parser.add_argument(
+        "--constraint_full",
+        type=float,
+        default=0.6,
+        help="--constrained_opt: fraction of the iterations at which the pull reaches --constraint_rho",
+    )
+
+    parser.add_argument(
+        "--constraint_swap_margin",
+        type=float,
+        default=1.0,
+        help="--constrained_opt: the expected swaps are held at this fraction of the swap limit",
+    )
+    parser.add_argument(
+        "--constraint_dual_lr",
+        type=float,
+        default=0.01,
+        help="--constrained_opt: dual ascent step for the multipliers on the expected colour/swap counts",
+    )
+    parser.add_argument(
+        "--constraint_linear_moves",
+        default=False,
+        help="--constrained_opt: add linearized (Frank-Wolfe) moves to the local search",
+        action=argparse.BooleanOptionalAction,
+    )
+
+    parser.add_argument(
+        "--constraint_pin",
+        default=True,
+        help="--constrained_opt: in the final phase train the heights on the best feasible stack (pinned), alternating with the stack search",
+        action=argparse.BooleanOptionalAction,
+    )
+
+    parser.add_argument(
+        "--constraint_search_rounds",
+        type=int,
+        default=3,
+        help="--constrained_opt: rounds of feasible local search on the best stack at each discrete check once the pull is at full strength",
+    )
+
+    parser.add_argument(
+        "--prune_sweep",
+        type=str,
+        default="",
+        help="Experiment mode (with --minimal_postprocess): prune the trained solution to each 'colors:swaps' limit in this comma separated list",
+    )
+
+    parser.add_argument(
+        "--minimal_postprocess",
+        default=False,
+        help="Experiment mode: after training skip every refinement step; with --perform_pruning only the colour and swap pruning run",
+        action=argparse.BooleanOptionalAction,
     )
 
     parser.add_argument(
@@ -881,6 +954,65 @@ def _run_optimization_loop(
     optimizer.release_cuda_graph()
 
 
+def _prune_colors_swaps_only(optimizer: FilamentOptimizer, args) -> None:
+    """Only the colour and swap reductions of ``FilamentOptimizer.prune``,
+    with the same limits and the same non-worsening guard."""
+    from autoforge.Helper.PruningHelper import prune_num_colors, prune_num_swaps
+
+    max_colors = max(1, args.pruning_max_colors - (2 if args.flatforge else 1))
+    optimizer._run_non_worsening(
+        "Reducing colors",
+        lambda: prune_num_colors(
+            optimizer,
+            max_colors,
+            optimizer.vis_tau,
+            None,
+            fast=args.fast_pruning,
+            chunking_percent=args.fast_pruning_percent,
+            pruning_batch_size=args.pruning_batch_size,
+        ),
+        forced=optimizer.solution_counts()[0] > max_colors,
+    )
+    optimizer._run_non_worsening(
+        "Reducing swaps",
+        lambda: prune_num_swaps(
+            optimizer,
+            args.pruning_max_swaps,
+            optimizer.vis_tau,
+            None,
+            fast=args.fast_pruning,
+            chunking_percent=args.fast_pruning_percent,
+            pruning_batch_size=args.pruning_batch_size,
+        ),
+        forced=optimizer.solution_counts()[1] > args.pruning_max_swaps,
+    )
+
+
+def _prune_sweep(optimizer: FilamentOptimizer, args) -> None:
+    """Experiment harness: prune one trained solution to several colour/swap
+    limits (``--prune_sweep "C:S,C:S,..."``), each from the same starting
+    point, and write every result to prune_sweep.json. The last
+    configuration's result stays in the optimizer for the normal export."""
+    snapshot = optimizer.solution_snapshot()
+    results = []
+    for spec in args.prune_sweep.split(","):
+        colors, swaps = (int(v) for v in spec.split(":"))
+        optimizer.restore_solution_snapshot(
+            {**snapshot, "best_params": {k: v.clone() for k, v in snapshot["best_params"].items()}}
+        )
+        args.pruning_max_colors, args.pruning_max_swaps = colors, swaps
+        _prune_colors_swaps_only(optimizer, args)
+        loss = PruningHelper.get_initial_loss(
+            optimizer.best_params["global_logits"].shape[0], optimizer
+        )
+        n_colors, n_swaps, _ = optimizer.solution_counts()
+        results.append({"max_colors": colors, "max_swaps": swaps, "loss": loss,
+                        "colors": n_colors, "swaps": n_swaps})
+        print(f"PRUNE_SWEEP {colors}:{swaps} loss={loss:.4f} colors={n_colors} swaps={n_swaps}")
+    with open(os.path.join(args.output_folder, "prune_sweep.json"), "w") as f:
+        json.dump(results, f)
+
+
 def _post_optimize_and_export(
     args,
     optimizer: FilamentOptimizer,
@@ -928,7 +1060,12 @@ def _post_optimize_and_export(
 
     with torch.no_grad():
         with safe_autocast(device):
-            if args.perform_pruning:
+            if args.minimal_postprocess:
+                if args.perform_pruning and args.prune_sweep:
+                    _prune_sweep(optimizer, args)
+                elif args.perform_pruning:
+                    _prune_colors_swaps_only(optimizer, args)
+            elif args.perform_pruning:
                 # Same post-hoc height-offset fine-tune as the no-pruning
                 # path below, run before any pruning phase touches
                 # best_params - pruning's own greedy color/swap/layer search
@@ -996,6 +1133,9 @@ def _post_optimize_and_export(
             )
             with open(os.path.join(args.output_folder, "final_loss.txt"), "w") as f:
                 f.write(f"{final_loss}")
+            n_colors, n_swaps, _ = optimizer.solution_counts()
+            with open(os.path.join(args.output_folder, "final_counts.json"), "w") as f:
+                json.dump({"colors": n_colors, "swaps": n_swaps}, f)
 
             print("Done. Saving outputs...")
             comp_disc = optimizer.get_best_discretized_image()
@@ -1236,6 +1376,9 @@ def start(args) -> float:
     with torch.no_grad():
         for _ in range(60):
             optimizer._maybe_update_best_discrete()
+        if args.constrained_opt:
+            optimizer.constrained_local_search(compound=True)
+        optimizer.end_check_scope()
 
     empty_cache(device)
 

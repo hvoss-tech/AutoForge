@@ -21,6 +21,7 @@ from autoforge.Helper.OptimizerHelper import (
     material_run_starts,
 )
 from autoforge.Loss.LossFunctions import compute_loss
+from autoforge.Helper.ImageHelper import srgb_to_lab
 from autoforge.Modules.Optimizer import FilamentOptimizer, _compute_height_offset_term
 
 # One global lock that serialises every call that needs GPU / VRAM
@@ -100,6 +101,38 @@ def _compose_candidate(
         [eff_thick, material_colors, material_TDs, background],
         float(h),
     )
+
+
+def _candidate_loss(optimizer, eff_thick, cols, tds) -> torch.Tensor:
+    """0-dim discrete loss of one candidate's per-layer materials.
+
+    Without a focus map or alpha mask the loss is a plain Lab MSE, so it is
+    replayed from the same captured graph as the composite (one launch per
+    candidate instead of the graph plus ~15 eager loss kernels) - the same
+    ops as compute_loss, so the same result."""
+    if optimizer.focus_map is None and optimizer.alpha is None:
+        target_lab = getattr(optimizer.target, "_af_lab_cache", None)
+        if target_lab is None or target_lab.dtype != torch.float32:
+            target_lab = srgb_to_lab(optimizer.target)
+            try:
+                optimizer.target._af_lab_cache = target_lab
+            except Exception:
+                pass
+        return _replay_captured(
+            _compose_loss_impl,
+            "compose_loss",
+            [eff_thick, cols, tds, optimizer.background, target_lab],
+            float(optimizer.h),
+        )
+    comp = _compose_candidate(eff_thick, cols, tds, optimizer.background, optimizer.h)
+    return compute_loss(
+        comp=comp, target=optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha,
+    )
+
+
+def _compose_loss_impl(eff_thick, material_colors, material_TDs, background, target_lab, h: float):
+    comp = _compose_candidate_impl(eff_thick, material_colors, material_TDs, background, h)
+    return F.mse_loss(srgb_to_lab(comp), target_lab)
 
 
 def _compose_candidate_impl(
@@ -347,14 +380,7 @@ def _eval_candidates_batch(
         # Composite + loss per candidate — iterative, no [B, L, H, W]
         for b in range(len(chunk)):
             with _gpu_lock, torch.no_grad():
-                comp = _compose_candidate(
-                    eff_thick, cols[b], tds[b], optimizer.background, optimizer.h,
-                )
-                loss = compute_loss(
-                    comp=comp, target=optimizer.target, focus_map=optimizer.focus_map,
-                    alpha=optimizer.alpha,
-                )
-            losses.append(loss)
+                losses.append(_candidate_loss(optimizer, eff_thick, cols[b], tds[b]))
 
     best_loss_t, best_idx_t = torch.min(torch.stack(losses), dim=0)
     best_idx = int(best_idx_t.item())

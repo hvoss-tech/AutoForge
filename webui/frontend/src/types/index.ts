@@ -46,6 +46,10 @@ export interface OptimizationSettings {
   pruning_max_colors: number
   pruning_max_swaps: number
   pruning_max_layer: number
+  /** Limits the optimizer keeps to while it runs (null = unlimited). Colors
+   * count the base filament, like the pruning dialog's "Max colors". */
+  max_colors: number | null
+  max_swaps: number | null
   /** Run one unlimited pruning pass automatically once an optimization
    * completes (see appStore.setCurrentJob). */
   auto_initial_prune: boolean
@@ -82,8 +86,8 @@ export interface JobStatus {
   completed_at: string | null
   preview_image: string | null
   phase: string | null
-  /** Live counts of the solution while pruning runs (see models.JobStatus).
-   * Null until the job reports them — pruning is the only thing that does. */
+  /** Counts of the solution (see models.JobStatus): live while pruning runs,
+   * and the result's own once an optimization completes. */
   result_colors?: number | null
   result_swaps?: number | null
   result_layers?: number | null

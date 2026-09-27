@@ -672,7 +672,14 @@ def search_stack(
         def descend(c, lo, hi, sweeps=3):
             """Parallel coordinate descent of stacks c [B,L] over layers lo..hi."""
             B = c.shape[0]
-            cl = proxy(c)
+            # A random move can break the colour/swap limits by itself (a
+            # segment fill adds a colour, an insert adds swaps); such a start
+            # scores inf, so only stacks within the limits can ever win.
+            cl = torch.where(
+                _within_limits(c, max_colors, max_swaps),
+                proxy(c),
+                torch.full((B,), float("inf"), device=dev),
+            )
             ar = torch.arange(M, device=dev)
             rows = torch.arange(B, device=dev)
             for _ in range(sweeps):
@@ -721,5 +728,9 @@ def search_stack(
                     break
     if verbose:
         print(f"Stack search: proxy loss {start:.4f} -> {cd:.4f} (descent) -> {best:.4f}")
+    if not bool(_within_limits(cur[None], max_colors, max_swaps)[0]):
+        # Never hand back a stack beyond the limits (the start itself may
+        # be one, when the limits are tighter than the solution).
+        return init_dg
     return cur
 

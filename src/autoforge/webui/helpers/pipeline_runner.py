@@ -108,7 +108,32 @@ _DEFAULTS = {
     "init_heightmap_method": "kmeans",
     "priority_mask": "",
     "priority_mask_strength": 10.0,
+    # Colour/swap limits held during the optimization (see run_limit_args).
+    "max_colors": None,
+    "max_swaps": None,
+    "constrained_opt": False,
+    "constraint_rho": 0.0,
+    "constraint_start": 0.1,
+    "constraint_full": 0.6,
+    "constraint_dual_lr": 0.01,
+    "constraint_swap_margin": 1.0,
+    "constraint_linear_moves": False,
+    "constraint_pin": True,
+    "constraint_search_rounds": 3,
 }
+
+
+def run_limit_args(ns: argparse.Namespace) -> None:
+    """The webui's "max colors / max swaps" settings (None = unlimited) as
+    the CLI's --constrained_opt with --pruning_max_colors/--pruning_max_swaps:
+    the optimizer keeps to them while it runs instead of pruning afterwards."""
+    max_colors = getattr(ns, "max_colors", None)
+    max_swaps = getattr(ns, "max_swaps", None)
+    if max_colors is None and max_swaps is None:
+        return
+    ns.constrained_opt = True
+    ns.pruning_max_colors = int(max_colors) if max_colors is not None else 100
+    ns.pruning_max_swaps = int(max_swaps) if max_swaps is not None else 100
 
 
 def _make_settings(overrides: dict) -> argparse.Namespace:
@@ -116,6 +141,7 @@ def _make_settings(overrides: dict) -> argparse.Namespace:
     ns = argparse.Namespace(**(_DEFAULTS.copy()))
     for k, v in overrides.items():
         setattr(ns, k, v)
+    run_limit_args(ns)
     return ns
 
 
@@ -381,7 +407,17 @@ def run_pipeline(
         pause_event=pause_event,
     )
 
-    state["cancelled"] = cancel_event.is_set() if cancel_event is not None else False
+    cancelled = cancel_event is not None and cancel_event.is_set()
+    if not cancelled and getattr(args, "constrained_opt", False):
+        # Same finish as the CLI: a last search over stacks within the
+        # limits, scored on the real loss (never leaves them).
+        optimizer.constrained_local_search(
+            compound=True,
+            should_stop=(lambda: cancel_event.is_set()) if cancel_event is not None else None,
+        )
+        cancelled = cancel_event is not None and cancel_event.is_set()
+    optimizer.end_check_scope()
+    state["cancelled"] = cancelled
     return state
 
 
