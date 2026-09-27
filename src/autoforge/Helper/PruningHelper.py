@@ -9,11 +9,16 @@ import threading
 import numpy as np
 
 from autoforge.Helper.OptimizerHelper import (
+    _layer_opacity,
+    _replay_captured,
     batched_layer_material_indices,
+    composite_graph_scope,
     composite_image_disc,
     adaptive_round,
     bleed_layer_effect,
     deterministic_gumbel_noise,
+    layer_coverage_params,
+    material_run_starts,
 )
 from autoforge.Loss.LossFunctions import compute_loss
 from autoforge.Modules.Optimizer import FilamentOptimizer, _compute_height_offset_term
@@ -80,21 +85,33 @@ def _make_shared_eff_thick(optimizer: FilamentOptimizer) -> torch.Tensor:
     )
 
 
-def _opacity_from_ratio(ratio: torch.Tensor) -> torch.Tensor:
-    """ratio [H,W] → opac [H,W]  (same formula as composite_image_disc) ."""
-    o, A, kk, bb = -2.9864511e-02, 4.0532556e-01, 8.2597107e+01, 1.2547257e+00
-    return (o + A * torch.log1p(kk * ratio) + bb * ratio).clamp(0, 1)
-
-
 def _compose_candidate(
     eff_thick: torch.Tensor,
     material_colors: torch.Tensor,
     material_TDs: torch.Tensor,
     background: torch.Tensor,
+    h: float,
+) -> torch.Tensor:
+    """``_compose_candidate_impl``; inside a ``composite_graph_scope`` repeated
+    same-shape calls replay a captured CUDA graph (identical results)."""
+    return _replay_captured(
+        _compose_candidate_impl,
+        "compose_candidate",
+        [eff_thick, material_colors, material_TDs, background],
+        float(h),
+    )
+
+
+def _compose_candidate_impl(
+    eff_thick: torch.Tensor,
+    material_colors: torch.Tensor,
+    material_TDs: torch.Tensor,
+    background: torch.Tensor,
+    h: float,
 ) -> torch.Tensor:
     """
-    Iterative top-to-bottom compositing for one candidate.
-    No [L, H, W] intermediates created; just [H,W] temporaries.
+    Iterative compositing for one candidate (same model as
+    composite_image_disc). No [L, H, W] intermediates beyond one chunk.
 
     Parameters
     ----------
@@ -102,44 +119,80 @@ def _compose_candidate(
     material_colors : [L, 3]  per-layer material color
     material_TDs : [L]  per-layer transmission distance
     background : [3]  background color
+    h : layer height
 
     Returns [H, W, 3]
     """
-    device = eff_thick.device
-    L, H, W = eff_thick.shape
-    comp = torch.zeros(H, W, 3, device=device, dtype=torch.float32)
-    remain = torch.ones(H, W, device=device, dtype=torch.float32)
+    run_start = material_run_starts(material_colors, material_TDs)
+    reach, slow_reach, cov_w = layer_coverage_params(
+        material_colors, material_TDs, run_start, background, h
+    )
+    return _compose_chunks(
+        eff_thick, material_colors, run_start, reach, slow_reach, cov_w,
+        background, h, LAYER_CHUNK,
+    )
 
-    # Walk the stack top-to-bottom in chunks of layers. Two reasons for the
+
+@torch.jit.script
+def _compose_chunks(
+    eff_thick: torch.Tensor,
+    material_colors: torch.Tensor,
+    run_start: torch.Tensor,
+    reach: torch.Tensor,
+    slow_reach: torch.Tensor,
+    cov_w: torch.Tensor,
+    background: torch.Tensor,
+    h: float,
+    layer_chunk: int,
+) -> torch.Tensor:
+    """The chunked compositing walk of ``_compose_candidate`` (scripted: it
+    is a few dozen small ops per chunk, called once per pruning candidate)."""
+    L = int(eff_thick.shape[0])
+    H = int(eff_thick.shape[1])
+    W = int(eff_thick.shape[2])
+    device = eff_thick.device
+    comp = background.to(torch.float32).view(1, 1, 3).expand(H, W, 3)
+    carry_thick = torch.zeros(H, W, device=device, dtype=torch.float32)
+    carry_cov = torch.zeros_like(carry_thick)
+
+    # Walk the stack bottom-to-top in chunks of layers. Two reasons for the
     # chunking rather than one [L,H,W] pass:
-    #  * VRAM. The one-shot version needed ~7 live [L,H,W] tensors (ratio,
-    #    opacity, its flip, transmittance, the shifted copy, the cumulative
-    #    product and the weights) - about 130MB at full output resolution
-    #    with L=75 - which made the pruning phases the pipeline's high-water
-    #    mark once fine_tune_height_offsets was brought down.
-    #  * It costs nothing. At LAYER_CHUNK=25 this is 3 Python iterations, not
-    #    the 75 the original per-layer loop ran (that loop's 69,760 calls to
-    #    _opacity_from_ratio were 4.3s of a 15.3s post-optimize phase).
-    hi = L
-    while hi > 0:
-        lo = max(0, hi - LAYER_CHUNK)
-        # Reverse each slice so the chunk is ordered top-to-bottom, matching
-        # the direction the transmittance accumulates in.
-        eff_c = eff_thick[lo:hi].flip(0)                                   # [k,H,W]
-        opac = _opacity_from_ratio(eff_c / material_TDs[lo:hi].flip(0).view(-1, 1, 1))
-        del eff_c
+    #  * VRAM. The one-shot version needed ~7 live [L,H,W] tensors (opacity,
+    #    its flip, transmittance, the shifted copy, the cumulative product
+    #    and the weights) - about 130MB at full output resolution with L=75 -
+    #    which made the pruning phases the pipeline's high-water mark once
+    #    fine_tune_height_offsets was brought down.
+    #  * It costs nothing. At layer_chunk=25 this is 3 iterations, not the 75
+    #    a per-layer loop would run.
+    lo = 0
+    while lo < L:
+        hi = min(L, lo + layer_chunk)
+        opac, carry_thick, carry_cov = _layer_opacity(
+            eff_thick[lo:hi],
+            reach[lo:hi],
+            slow_reach[lo:hi],
+            cov_w[lo:hi],
+            run_start[lo:hi],
+            lo,
+            h,
+            carry_thick,
+            carry_cov,
+        )
+        # Reverse the slice so it is ordered top-to-bottom, matching the
+        # direction the transmittance accumulates in.
+        opac = opac.flip(0)
         trans = 1.0 - opac
         rem_local = torch.cumprod(
             torch.cat([torch.ones_like(trans[:1]), trans[:-1]], dim=0), dim=0
         )                                                                 # [k,H,W]
-        comp = comp + remain.unsqueeze(-1) * torch.einsum(
-            "lhw,lc->hwc", rem_local * opac, material_colors[lo:hi].flip(0)
+        contrib = torch.einsum(
+            "lhw,lc->hwc",
+            rem_local * opac,
+            material_colors[lo:hi].flip(0).to(torch.float32),
         )
-        remain = remain * (rem_local[-1] * trans[-1])
-        del opac, trans, rem_local
-        hi = lo
+        comp = contrib + (rem_local[-1] * trans[-1]).unsqueeze(-1) * comp
+        lo = hi
 
-    comp = comp + remain.unsqueeze(-1) * background
     return comp * 255.0
 
 
@@ -295,7 +348,7 @@ def _eval_candidates_batch(
         for b in range(len(chunk)):
             with _gpu_lock, torch.no_grad():
                 comp = _compose_candidate(
-                    eff_thick, cols[b], tds[b], optimizer.background,
+                    eff_thick, cols[b], tds[b], optimizer.background, optimizer.h,
                 )
                 loss = compute_loss(
                     comp=comp, target=optimizer.target, focus_map=optimizer.focus_map,
@@ -336,6 +389,7 @@ def _chunked(iterable, chunk_size):
         yield iterable[i : i + chunk_size]
 
 
+@composite_graph_scope()
 def prune_num_colors(
     optimizer: FilamentOptimizer,
     max_colors_allowed: int,
@@ -519,6 +573,7 @@ def prune_num_colors(
     return best_dg
 
 
+@composite_graph_scope()
 def prune_num_swaps(
     optimizer: FilamentOptimizer,
     max_swaps_allowed: int,
@@ -833,6 +888,7 @@ def remove_layer_from_solution(
     return new_params, new_max_layers
 
 
+@composite_graph_scope()
 def prune_redundant_layers(
     optimizer: FilamentOptimizer,
     perception_loss_module,  # kept for API compatibility
@@ -1308,6 +1364,7 @@ def smooth_coplanar_faces(
     return smoothed_height_logits
 
 
+@composite_graph_scope()
 def optimise_swap_positions(
     optimizer: FilamentOptimizer,
     n_jobs: int | None = -1,

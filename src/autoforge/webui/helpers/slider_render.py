@@ -7,7 +7,7 @@ its own ``layer``) and assigns one filament (color + transmission distance)
 to that run. Editing a slider only changes *which material occupies which
 layer band* — the per-pixel height solution from the last completed
 optimization is untouched. That means a full re-render only needs the
-Beer-Lambert-style top-down compositing pass (the same physics as
+top-down compositing pass (the same physics as
 ``OptimizerHelper.composite_image_disc``), driven by the layer→material
 mapping implied by the slider stack instead of the optimizer's learned
 ``global_logits``.
@@ -25,22 +25,17 @@ import numpy as np
 import torch
 
 from autoforge.Helper.FilamentHelper import hex_to_rgb
-from autoforge.Helper.OptimizerHelper import bleed_layer_effect
+from autoforge.Helper.OptimizerHelper import (
+    _layer_opacity,
+    bleed_layer_effect,
+    layer_coverage_params,
+    material_run_starts,
+)
 from autoforge.webui.helpers.colored_mesh import (
     generate_colored_preview_mesh,
     preview_mesh_max_dim,
     top_vertex_pixel_indices,
 )
-
-# Same empirical opacity-vs-thickness curve used by composite_image_disc /
-# composite_image_cont — keep in sync with OptimizerHelper.py.
-_OPAC_O, _OPAC_A, _OPAC_K, _OPAC_B = (
-    -2.9864511e-02,
-    4.0532556e-01,
-    8.2597107e01,
-    1.2547257e00,
-)
-
 
 def _atomic_write_bytes(path: str, data: bytes) -> None:
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -126,9 +121,10 @@ def composite_from_slider_stack(
     h: float,
     max_layers: int,
 ) -> torch.Tensor:
-    """Beer-Lambert top-down compositing for an explicit, already-discrete
-    layer→material assignment (no Gumbel-softmax sampling needed since the
-    assignment is fully determined by the slider stack)."""
+    """Top-down compositing for an explicit, already-discrete layer→material
+    assignment (no Gumbel-softmax sampling needed since the assignment is
+    fully determined by the slider stack). Same opacity model as
+    ``OptimizerHelper.composite_image_disc``."""
     device = disc_height_image.device
     idx_t = torch.as_tensor(layer_material_idx, dtype=torch.long, device=device)
     layer_colors = material_colors[idx_t]  # [L,3]
@@ -140,10 +136,15 @@ def composite_from_slider_stack(
 
     p_print_bleed = bleed_layer_effect(p_print, strength=0.1)
     eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
-    thick_ratio = eff_thick / layer_TDs.view(-1, 1, 1)
 
-    opac = _OPAC_O + (_OPAC_A * torch.log1p(_OPAC_K * thick_ratio) + _OPAC_B * thick_ratio)
-    opac = torch.clamp(opac, 0.0, 1.0)
+    run_start = material_run_starts(layer_colors, layer_TDs)
+    reach, slow_reach, cov_w = layer_coverage_params(
+        layer_colors, layer_TDs, run_start, background, h
+    )
+    zero_hw = torch.zeros_like(z_int, dtype=torch.float32)
+    opac, _, _ = _layer_opacity(
+        eff_thick, reach, slow_reach, cov_w, run_start, 0, h, zero_hw, zero_hw
+    )
 
     opac_fb = torch.flip(opac, dims=[0])
     colors_fb = torch.flip(layer_colors, dims=[0])

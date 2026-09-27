@@ -20,6 +20,7 @@ from autoforge.Helper.DeviceUtils import (
 )
 from autoforge.Helper.OptimizerHelper import (
     batched_layer_material_indices,
+    composite_graph_scope,
     composite_image_cont,
     composite_image_disc,
     PrecisionManager,
@@ -1727,6 +1728,7 @@ class FilamentOptimizer:
                 self.best_swaps = len(find_color_bands(disc_global)) - 1
                 self.best_step = self.num_steps_done
 
+    @composite_graph_scope()
     def rng_seed_search(
         self,
         start_loss: float,
@@ -1795,7 +1797,7 @@ class FilamentOptimizer:
                 )
                 for b, seed in enumerate(batch_seeds):
                     comp_disc = _compose_candidate(
-                        shared_eff, cols_b[b], tds_b[b], self.background
+                        shared_eff, cols_b[b], tds_b[b], self.background, self.h
                     )
                     current_disc_loss = compute_loss(
                         comp=comp_disc,

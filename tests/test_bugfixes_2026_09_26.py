@@ -220,6 +220,7 @@ class _BatchOptimizer:
         self.alpha = None
         self.best_seed = 7
         self.vis_tau = 0.01
+        self.h = 0.04  # layer height; the eff_thick below is scaled to it
 
 
 def test_pruning_batch_size_chunks_without_changing_the_result(monkeypatch):
