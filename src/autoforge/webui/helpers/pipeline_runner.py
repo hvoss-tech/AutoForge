@@ -112,6 +112,7 @@ _DEFAULTS = {
     "max_colors": None,
     "max_swaps": None,
     "constrained_opt": False,
+    "optimize_background": True,
     "constraint_rho": 0.0,
     "constraint_start": 0.1,
     "constraint_full": 0.6,
@@ -417,6 +418,10 @@ def run_pipeline(
         )
         cancelled = cancel_event is not None and cancel_event.is_set()
     optimizer.end_check_scope()
+    if not cancelled:
+        optimizer.finalize_background(args, state.get("material_names"))
+        # Slider re-renders composite over this tensor.
+        state["background"] = optimizer.background.detach().clone()
     state["cancelled"] = cancelled
     return state
 
@@ -749,6 +754,7 @@ def export_results(
                     args.background_height,
                     material_names,
                     getattr(args, "background_material_name", None),
+                    optimizer.base_material,
                 )
                 swap_path = os.path.join(
                     args.output_folder, "swap_instructions.txt"

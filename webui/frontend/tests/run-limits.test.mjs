@@ -43,11 +43,15 @@ test('the summary names only what is limited', () => {
   assert.equal(describeRunLimits({ max_colors: 3, max_swaps: 0 }), 'at most 3 colors · 0 swaps')
 })
 
-test('a color limit at or above the active filaments (plus base) is flagged as having no effect', () => {
+test('a color limit the active filaments can never exceed is flagged as having no effect', () => {
   assert.equal(colorLimitNote(null, 4), null)
-  assert.equal(colorLimitNote(4, 4), null)
-  assert.match(colorLimitNote(5, 4), /4 filaments active/)
+  // The base is one of the 4 filaments: at most 4 colors anyway.
+  assert.equal(colorLimitNote(3, 4), null)
+  assert.match(colorLimitNote(4, 4), /4 filaments active/)
   assert.match(colorLimitNote(9, 1), /1 filament active/)
+  // A custom base color is one color more.
+  assert.equal(colorLimitNote(4, 4, false), null)
+  assert.match(colorLimitNote(5, 4, false), /4 filaments active/)
   assert.equal(colorLimitNote(5, 0), null) // nothing active yet: nothing to say
 })
 
@@ -64,4 +68,22 @@ test('changing a limit makes an existing result out of date, and is named readab
   assert.deepEqual(staleReasons(run, { max_colors: null, max_swaps: 10 }, []), [])
   assert.equal(settingName('max_colors'), 'color limit')
   assert.equal(settingName('max_swaps'), 'swap limit')
+})
+
+test('the base filament is one of the colors: a band reusing it is not counted twice', async () => {
+  const { resultCounts } = await import('../src/lib/pruning.ts')
+  const { buildPrintPlan } = await import('../src/lib/printPlan.ts')
+  const sliders = [
+    { td: 1, layer: 3, depth_mm: 0, filament_uuid: 'black', enabled: true },
+    { td: 1, layer: 6, depth_mm: 0, filament_uuid: 'red', enabled: true },
+    { td: 1, layer: 9, depth_mm: 0, filament_uuid: 'white', enabled: true },
+  ]
+  const plan = buildPrintPlan(sliders, [], { layer_height: 0.04, background_height: 0.24 })
+  assert.equal(plan.colors, 3)
+  // Base in black, which a band also uses: black, red, white = 3 colors.
+  assert.equal(resultCounts(plan, 'black').colors, 3)
+  // Base in a fourth filament: 4 colors.
+  assert.equal(resultCounts(plan, 'grey').colors, 4)
+  // Base unknown / a custom color: one more than the bands.
+  assert.equal(resultCounts(plan).colors, 4)
 })

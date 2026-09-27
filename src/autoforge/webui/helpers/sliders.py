@@ -120,11 +120,13 @@ def result_counts_from_optimizer(optimizer) -> dict | None:
     """``{"colors", "swaps", "layers"}`` for the optimizer's current discrete
     solution, counted exactly the way the pruning dialog counts them:
 
-    * ``colors`` — distinct materials in the printed stack, **plus one** for
-      the base/background color (this is the number the pruner's
-      ``max_colors`` limits).
-    * ``swaps`` — filament changes after the first color layer, i.e. one
-      fewer than the number of contiguous same-material runs.
+    * ``colors`` — distinct filaments of the print, the base included: the
+      printed stack's materials plus the base filament, counted once when a
+      layer reuses it (a custom base color that is no filament counts as one
+      more). This is the number the pruner's ``max_colors`` limits.
+    * ``swaps`` — every filament change from the base up: one fewer than
+      the number of contiguous same-material runs, plus the change from the
+      base to the first layer unless that layer is in the base filament.
     * ``layers`` — the top print layer.
 
     This is what makes the pruning overlay live: pruning mutates the
@@ -143,9 +145,15 @@ def result_counts_from_optimizer(optimizer) -> dict | None:
         return {"colors": 1, "swaps": 0, "layers": max(0, max_layer)}
 
     runs = 1 + int(np.count_nonzero(stack[1:] != stack[:-1]))
+    base = getattr(optimizer, "base_material", None)
+    # The base is band 0: the change from the base to the first layer is a
+    # swap unless that layer is in the base filament.
+    first_is_base = base is not None and int(stack[0]) == base
+    layer_colors = {int(m) for m in np.unique(stack)}
+    layer_colors.discard(base)
     return {
-        "colors": int(np.unique(stack).size) + 1,
-        "swaps": runs - 1,
+        "colors": len(layer_colors) + 1,
+        "swaps": runs - 1 + (0 if first_is_base else 1),
         "layers": max_layer,
     }
 

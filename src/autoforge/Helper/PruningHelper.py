@@ -465,28 +465,38 @@ def prune_num_colors(
     best_dg = disc_global.clone()
     best_loss = get_image_loss(best_dg)
 
+    # The base filament is free: a layer in it adds no color to the print,
+    # so it doesn't count against max_colors_allowed (the colors *besides*
+    # the base) and every color may be merged into it.
+    base = getattr(optimizer, "base_material", None)
+
+    def layer_colors(dg):
+        mats = torch.unique(dg).tolist()
+        return [m for m in mats if m != base]
+
     distinct_mats = torch.unique(best_dg)
 
     print(
-        f"PRUNING: Color - initial loss={best_loss:.4f}, initial colors={len(distinct_mats)}"
+        f"PRUNING: Color - initial loss={best_loss:.4f}, initial colors={len(layer_colors(best_dg))} besides the base"
     )
 
     tbar = tqdm(total=100, leave=False)
 
     while True:
-        distinct_mats = torch.unique(best_dg)
-
-        if len(distinct_mats) <= 1:
-            break
-
         # A single .tolist() (one sync) instead of calling c_from.item()/
         # c_to.item() (plus an implicit sync from the `!=` bool test) on
         # every one of the O(N^2) pairs below.
-        distinct_mats_list = distinct_mats.tolist()
+        colors_now = layer_colors(best_dg)
+        distinct_mats = colors_now
+        targets = colors_now + ([base] if base is not None else [])
+
+        if len(colors_now) == 0 or (len(targets) <= 1):
+            break
+
         merge_pairs = [
             (c_from, c_to)
-            for c_from in distinct_mats_list
-            for c_to in distinct_mats_list
+            for c_from in colors_now
+            for c_to in targets
             if c_from != c_to
         ]
 
@@ -586,14 +596,14 @@ def prune_num_colors(
         best_dg, num_materials=num_materials, big_pos=1e5
     )
 
-    final_colors = torch.unique(best_dg)
+    final_colors = layer_colors(best_dg)
 
     assert len(final_colors) <= max_colors_allowed, (
         f"Color pruning failed: {len(final_colors)} > {max_colors_allowed}"
     )
 
     print(
-        f"PRUNING: Color - final loss={best_loss:.4f}, final colors={len(final_colors)}"
+        f"PRUNING: Color - final loss={best_loss:.4f}, final colors={len(final_colors)} besides the base"
     )
 
     return best_dg
@@ -646,8 +656,22 @@ def prune_num_swaps(
     best_dg = disc_global.clone()
     best_loss = get_image_loss(best_dg)
 
+    # The base is band 0: the change from the base to the first layer is a
+    # swap like any other (none when that layer is in the base filament), and
+    # recolouring the first band to the base filament removes it. -1 is a base
+    # colour that is no filament (that first change is always there).
+    base = getattr(optimizer, "base_material", None)
+    base = -1 if base is None else int(base)
+
+    def count_swaps(dg_bands):
+        return len(dg_bands) - 1 + (0 if dg_bands[0][2] == base else 1)
+
+    if base < 0:
+        # Printing on a base that is no filament always takes that first swap.
+        max_swaps_allowed = max(max_swaps_allowed, 1)
+
     bands = find_color_bands(best_dg)
-    num_swaps = len(bands) - 1
+    num_swaps = count_swaps(bands)
 
     print(f"PRUNING: Swap - initial loss={best_loss:.4f}, initial swaps={num_swaps:d}")
 
@@ -655,17 +679,20 @@ def prune_num_swaps(
 
     while True:
         bands = find_color_bands(best_dg)
-        num_swaps = len(bands) - 1
+        num_swaps = count_swaps(bands)
 
         if num_swaps == 0:
             break
 
         merge_specs = [
             (bands[i], bands[i + 1], dirn)
-            for i in range(num_swaps)
+            for i in range(len(bands) - 1)
             for dirn in ("forward", "backward")
             if bands[i][2] != bands[i + 1][2]
         ]
+        if base >= 0 and bands[0][2] != base:
+            # The first band in the base filament: a pseudo band for the base.
+            merge_specs.append(((-1, -1, base), bands[0], "forward"))
 
         tbar.set_description(
             f"Swaps {num_swaps} | Loss {best_loss:.4f} | Merge swaps {len(merge_specs)}"
@@ -732,7 +759,7 @@ def prune_num_swaps(
                     best_candidate_loss = merge_loss
 
             bands = find_color_bands(best_dg)
-            num_swaps = len(bands) - 1
+            num_swaps = count_swaps(bands)
 
             # If no acceptable merge but we still exceed swap budget,
             # force the best candidate.
@@ -765,7 +792,7 @@ def prune_num_swaps(
                 break
 
     print(
-        f"PRUNING: Swap - final loss={best_loss:.4f}, final swaps={len(find_color_bands(best_dg)) - 1:d}"
+        f"PRUNING: Swap - final loss={best_loss:.4f}, final swaps={count_swaps(find_color_bands(best_dg)):d}"
     )
 
     tbar.close()
@@ -775,7 +802,7 @@ def prune_num_swaps(
     )
 
     # safety check
-    final_swaps = len(find_color_bands(best_dg)) - 1
+    final_swaps = count_swaps(find_color_bands(best_dg))
     assert final_swaps <= max_swaps_allowed, (
         f"Swap pruning failed: {final_swaps} swaps > {max_swaps_allowed}"
     )

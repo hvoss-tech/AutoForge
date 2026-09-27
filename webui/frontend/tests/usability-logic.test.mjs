@@ -30,14 +30,25 @@ test('print plan', async (t) => {
   await t.test('counts: adjacent bands of the same filament are no swap', () => {
     const plan = buildPrintPlan([s(2, 'k'), s(5, 'k'), s(9, 'w'), s(12, 'k')], [black, white], settings)
     assert.equal(plan.colors, 2)
-    assert.equal(plan.swaps, 2)
+    // Swaps count every filament change from the base up; with no known base
+    // filament the change from the base to the first band is one of them.
+    assert.equal(plan.swaps, 3)
     assert.equal(plan.topLayer, 12)
     assert.equal(plan.totalHeightMm, 0.72)
     assert.deepEqual(plan.swapsList.map((x) => [x.layerNumber, x.heightMm, x.filament.name]), [[2, 0.28, 'Black'], [7, 0.48, 'White'], [11, 0.64, 'Black']])
   })
 
   await t.test('counts work without the filament list (keyed by uuid)', () => {
-    assert.equal(buildPrintPlan([s(2, 'k'), s(5, 'k'), s(9, 'w')], [], settings).swaps, 1)
+    assert.equal(buildPrintPlan([s(2, 'k'), s(5, 'k'), s(9, 'w')], [], settings).swaps, 2)
+  })
+
+  await t.test('a first band in the base filament is no swap and not listed as one', () => {
+    const withBase = { ...settings, base_filament_uuid: 'k' }
+    const plan = buildPrintPlan([s(2, 'k'), s(5, 'k'), s(9, 'w'), s(12, 'k')], [black, white], withBase)
+    assert.equal(plan.swaps, 2)
+    assert.deepEqual(plan.swapsList.map((x) => x.filament.name), ['White', 'Black'])
+    // A base in another filament: the first band is a real change.
+    assert.equal(buildPrintPlan([s(2, 'k'), s(9, 'w')], [black, white], { ...settings, base_filament_uuid: 'w' }).swaps, 2)
   })
 
   await t.test('instructions text matches the optimizer wording', () => {

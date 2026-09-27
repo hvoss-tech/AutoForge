@@ -26,8 +26,11 @@ export interface PrintPlan {
   bands: PlanBand[]
   /** Distinct filaments used by the layer bands (the base is extra). */
   colors: number
-  /** Filament changes after the first color layer (= bands - 1, the same
-   * count the pruner limits). */
+  /** Those filaments' uuids ('unassigned' for bands without one). */
+  colorKeys: string[]
+  /** Filament changes from the base up, the same count the optimizer and
+   * the pruner limit: the base is band 0, so the change from the base to the
+   * first band is a swap unless that band is in the base filament. */
   swaps: number
   topLayer: number
   totalHeightMm: number
@@ -38,6 +41,8 @@ export interface PlanSettings {
   layer_height: number
   background_height: number
   background_color?: string
+  /** The base's filament, when it is one ('' / absent: a custom color). */
+  base_filament_uuid?: string
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100
@@ -89,8 +94,11 @@ export function buildPrintPlan(sliders: ColorSliderConfig[], filaments: Filament
 
   // Adjacent bands with the same filament are one continuous color: no swap.
   const swapsList: PlanSwap[] = []
+  const baseKey = settings.base_filament_uuid || null
   bands.forEach((b, i) => {
     if (i > 0 && key(bands[i - 1]) === key(b)) return
+    // A first band in the base filament just carries on printing it.
+    if (i === 0 && baseKey && key(b) === baseKey) return
     const printLayer = b.startLayer
     swapsList.push({ layerNumber: printLayer + 1, heightMm: round2(printLayer * lh + base), filament: b.filament })
   })
@@ -99,7 +107,8 @@ export function buildPrintPlan(sliders: ColorSliderConfig[], filaments: Filament
   return {
     bands,
     colors: new Set(bands.map(key)).size,
-    swaps: Math.max(0, swapsList.length - 1),
+    colorKeys: [...new Set(bands.map(key))],
+    swaps: swapsList.length,
     topLayer,
     totalHeightMm: round2(base + topLayer * lh),
     swapsList,

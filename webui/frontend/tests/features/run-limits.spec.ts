@@ -74,7 +74,7 @@ test('limits are kept sensible: at least base + one color, and a warning when th
   await byTestId(page, 'run-limit-max_colors-value').blur()
   await expect.poll(async () => (await savedLimits(request)).colors).toBe(2)
 
-  // With 4 filaments active a limit of 5 or more can't change anything.
+  // With 4 filaments active (the base is one of them) a limit of 4 or more can't change anything.
   await expect(byTestId(page, 'run-limit-max_colors-note')).toHaveCount(0)
   await typeInto(page, 'run-limit-max_colors-value', '6')
   await expect(byTestId(page, 'run-limit-max_colors-note')).toContainText('4 filaments active')

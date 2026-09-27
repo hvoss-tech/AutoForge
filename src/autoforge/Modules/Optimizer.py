@@ -238,6 +238,28 @@ class FilamentOptimizer:
             "height_offsets": self.height_offsets,
         }
 
+        # The filament the base is printed in (None for a custom base
+        # color). A layer in the same filament adds no color to the print, so
+        # every color count and limit below leaves it out: "8 colors" means
+        # the base plus at most 7 others.
+        from autoforge.Helper.ConstraintHelper import base_material_index
+
+        self.base_material = base_material_index(self.background, self.material_colors)
+
+        # --optimize_background: the base's filament is chosen by the
+        # optimizer like every layer's (a Gumbel-softmax over the filaments,
+        # started at the automatic pick); its height stays the fixed base
+        # height and, as before, it is treated as opaque.
+        self.bg_logits = None
+        # Only while the base is automatic: a base the user picked stays theirs.
+        # (On by default through the CLI and webui settings; off for callers
+        # that don't say.)
+        if getattr(args, "optimize_background", False) and getattr(args, "auto_background_color", True):
+            init = torch.zeros(material_colors.shape[0], dtype=torch.float32, device=device)
+            if self.base_material is not None:
+                init[self.base_material] = 2.0
+            self.bg_logits = torch.nn.Parameter(init)
+            self._bg_gumbel_exp = torch.empty_like(init)
         self._setup_constraints(args)
 
         # Tau schedule
@@ -251,7 +273,8 @@ class FilamentOptimizer:
 
         # Initialize optimizer
         self.optimizer = CAdamW(
-            [self.params["global_logits"], self.height_offsets],
+            [self.params["global_logits"], self.height_offsets]
+            + ([self.bg_logits] if self.bg_logits is not None else []),
             lr=self.learning_rate,
         )
 
@@ -363,11 +386,14 @@ class FilamentOptimizer:
         self.limit_colors = None
         self.limit_swaps = None
         if getattr(args, "constrained_opt", False):
-            colors = max(1, args.pruning_max_colors - (2 if args.flatforge else 1))
-            if colors < n_mat:
+            # Colors besides the base (and the clear filament in FlatForge).
+            colors = max(0, args.pruning_max_colors - (2 if args.flatforge else 1))
+            if colors < n_mat - (1 if self.base_material is not None else 0):
                 self.limit_colors = colors
-            if args.pruning_max_swaps < self.max_layers - 1:
-                self.limit_swaps = args.pruning_max_swaps
+            # Swaps count the change from the base to the first layer too.
+            if args.pruning_max_swaps < self.max_layers:
+                # A base that is no filament always takes the first swap.
+                self.limit_swaps = max(args.pruning_max_swaps, 1 if self.base_material is None else 0)
         self.constrained = self.limit_colors is not None or self.limit_swaps is not None
         if self.constrained:
             # Static buffers, updated in place, so the captured training graph
@@ -392,6 +418,11 @@ class FilamentOptimizer:
                 device=self.device,
             )
             self._viol = torch.zeros(2, dtype=torch.float32, device=self.device)
+            self._color_mask = torch.ones(n_mat, dtype=torch.float32, device=self.device)
+            self._base_onehot = torch.zeros(n_mat, dtype=torch.float32, device=self.device)
+            if self.base_material is not None:
+                self._color_mask[self.base_material] = 0.0
+                self._base_onehot[self.base_material] = 1.0
             self._lagr_gate = torch.zeros((), dtype=torch.float32, device=self.device)
 
     def _expected_counts(self, global_logits: torch.Tensor) -> torch.Tensor:
@@ -399,15 +430,24 @@ class FilamentOptimizer:
         softmax(global_logits) - the distribution the discrete snapshots
         sample from. Differentiable."""
         p = torch.softmax(global_logits.float(), dim=1)
-        e_swaps = (1.0 - (p[1:] * p[:-1]).sum(dim=1)).sum()
+        # The base is band 0: a first layer in another filament is a swap.
+        e_swaps = (1.0 - (p[1:] * p[:-1]).sum(dim=1)).sum() + (1.0 - (p[0] * self._base_onehot).sum())
         log_absent = torch.log1p(-p.clamp(max=1.0 - 1e-6)).sum(dim=0)  # [M]
-        e_colors = (1.0 - torch.exp(log_absent)).sum()
+        # Layers in the base filament add no color (in-place buffer, so a
+        # captured training graph follows a base that changes).
+        e_colors = ((1.0 - torch.exp(log_absent)) * self._color_mask).sum()
         return torch.stack([e_colors, e_swaps])
+
+    @property
+    def base_code(self) -> int:
+        """The base for the limits (see ConstraintHelper.project_assignment):
+        its filament index, or -1 for a base color that is no filament."""
+        return self.base_material if self.base_material is not None else -1
 
     def project_feasible(self, score: torch.Tensor) -> torch.Tensor:
         from autoforge.Helper.ConstraintHelper import project_assignment
 
-        return project_assignment(score, self.limit_colors, self.limit_swaps)
+        return project_assignment(score, self.limit_colors, self.limit_swaps, self.base_code)
 
     def _dual_step(self) -> None:
         """Dual ascent on the multipliers: grow them while the expected
@@ -487,6 +527,9 @@ class FilamentOptimizer:
             disc_to_logits(dg, self.material_colors.shape[0], big_pos=20.0)
         )
         self.height_offsets.copy_(self.best_params["height_offsets"])
+        if self.bg_logits is not None and "background_index" in self.best_params:
+            self.bg_logits.fill_(-20.0)
+            self.bg_logits[int(self.best_params["background_index"])] = 20.0
 
     def _compound_move(self, dg, cur_loss, cands, shared, rng, n_free: int = 3):
         """Two-step move out of a local optimum at the limit: one of the
@@ -495,10 +538,10 @@ class FilamentOptimizer:
         from autoforge.Helper.ConstraintHelper import count_colors_swaps, neighbour_stacks
         from autoforge.Helper.PruningHelper import _eval_candidates_batch
 
-        c0, s0 = count_colors_swaps(dg)
+        c0, s0 = count_colors_swaps(dg, self.base_code)
         freeing = []
         for cand in cands:
-            c, s_ = count_colors_swaps(cand)
+            c, s_ = count_colors_swaps(cand, self.base_code)
             if c < c0 or s_ < s0:
                 freeing.append(cand)
         if not freeing:
@@ -507,7 +550,7 @@ class FilamentOptimizer:
         scored.sort()
         n_mat = self.material_colors.shape[0]
         for _, i in scored[:n_free]:
-            second = neighbour_stacks(freeing[i], n_mat, self.limit_colors, self.limit_swaps)
+            second = neighbour_stacks(freeing[i], n_mat, self.limit_colors, self.limit_swaps, self.base_code)
             order = rng.permutation(len(second))
             for lo in range(0, len(second), 256):
                 chunk = [second[j] for j in order[lo:lo + 256]]
@@ -542,7 +585,7 @@ class FilamentOptimizer:
         for _ in range(max_rounds):
             if should_stop is not None and should_stop():
                 break
-            cands = neighbour_stacks(dg, n_mat, self.limit_colors, self.limit_swaps)
+            cands = neighbour_stacks(dg, n_mat, self.limit_colors, self.limit_swaps, self.base_code)
             if self.constrained and getattr(self.args, "constraint_linear_moves", False):
                 cands += self._linearized_candidates(dg)
             if not cands:
@@ -673,7 +716,7 @@ class FilamentOptimizer:
             max_layers=self.max_layers,
             material_colors=self.material_colors,
             material_TDs=self.material_TDs,
-            background=self.background,
+            background=self._soft_background(tau_global) if self.bg_logits is not None else self.background,
             add_penalty_loss=10.0,
             focus_map=self.focus_map,
             alpha=self.alpha,
@@ -785,7 +828,49 @@ class FilamentOptimizer:
             self.optimizer.zero_grad(set_to_none=False)
 
     def _validated_params(self):
-        return [self.params["global_logits"], self.height_offsets]
+        return [self.params["global_logits"], self.height_offsets] + (
+            [self.bg_logits] if self.bg_logits is not None else []
+        )
+
+    def _soft_background(self, tau: float) -> torch.Tensor:
+        """The base color during training with --optimize_background: a
+        Gumbel-softmax mix of the filaments (noise drawn in ``step``, outside
+        any captured graph), like each layer's material."""
+        p = torch.softmax((self.bg_logits - torch.log(self._bg_gumbel_exp)) / tau, dim=0)
+        return p @ self.material_colors
+
+    def _use_background(self, index) -> None:
+        """Make filament ``index`` the base: its color composites every
+        discrete solution, and it is the color-free material of the limits."""
+        if index is None:
+            return
+        index = int(index)
+        self.background = self.material_colors[index].detach().clone()
+        self.base_material = index
+        mask = getattr(self, "_color_mask", None)
+        if mask is not None:
+            mask.fill_(1.0)
+            mask[index] = 0.0
+            self._base_onehot.zero_()
+            self._base_onehot[index] = 1.0
+
+    def finalize_background(self, args, material_names=None) -> None:
+        """After training with --optimize_background: the best solution's
+        base filament becomes the base everywhere (export, counts, limits,
+        and - through ``args`` - the swap instructions and project file)."""
+        if self.bg_logits is None or self.best_params is None:
+            return
+        idx = self.best_params.get("background_index")
+        if idx is None:
+            return
+        idx = int(idx)
+        self._use_background(idx)
+        rgb = [int(round(float(c) * 255)) for c in self.material_colors[idx].tolist()]
+        args.background_color = "#" + "".join(f"{c:02X}" for c in rgb)
+        args.background_material_index = idx
+        if material_names is not None and idx < len(material_names):
+            args.background_material_name = material_names[idx]
+        print(f"Optimized base filament: index {idx} ({args.background_color})")
 
     def _graph_replay_matches_eager(
         self, tau_height: float, tau_global: float
@@ -900,6 +985,8 @@ class FilamentOptimizer:
         # Draw this step's Gumbel noise here, outside any captured region, so
         # the eager and graph-replay paths consume the identical random stream.
         self._gumbel_exp.exponential_()
+        if self.bg_logits is not None:
+            self._bg_gumbel_exp.exponential_()
 
         if self._graph is not None and self._graph_tau == (tau_height, tau_global):
             self._graph.replay()
@@ -1205,11 +1292,14 @@ class FilamentOptimizer:
         Returns:
             Dict[str, torch.Tensor]: Current parameters.
         """
-        return {
+        params = {
             "pixel_height_logits": self.pixel_height_logits.detach().clone(),
             "global_logits": self.params["global_logits"].detach().clone(),
             "height_offsets": self.height_offsets.detach().clone(),
         }
+        if self.bg_logits is not None and self.base_material is not None:
+            params["background_index"] = torch.tensor(self.base_material)
+        return params
 
     def get_discretized_solution(
         self, best: bool = False, custom_height_logits: torch.Tensor = None, apply_height_offset: bool = True
@@ -1569,7 +1659,7 @@ class FilamentOptimizer:
                 )
                 # Belt and braces: a stack beyond the limits is never taken,
                 # however much better it looks.
-                if feasible(new_stack, max_colors_allowed, max_swaps_allowed):
+                if feasible(new_stack, max_colors_allowed, max_swaps_allowed, self.base_code):
                     kept_new_stack = apply_stack(self, new_stack, refine_sweeps, refine_radius)
             if not kept_new_stack:
                 refine_pixel_heights(self, sweeps=refine_sweeps, radius=refine_radius)
@@ -1647,17 +1737,30 @@ class FilamentOptimizer:
 
     def solution_counts(self) -> tuple[int, int, int]:
         """``(colors, swaps, layers)`` of the current solution, in the same
-        terms the pruning limits are expressed in."""
+        terms the pruning limits are expressed in: ``colors`` counts the
+        layer filaments *besides* the base filament (the print has one color
+        more), and ``swaps`` every filament change from the base up - the
+        change from the base to the first layer included, unless that layer
+        is in the base filament. See ``print_colors``."""
         from autoforge.Helper.PruningHelper import find_color_bands
 
         disc_global, _disc_height = self.get_discretized_solution(best=True)
         if disc_global is None:
             return (0, 0, int(self.max_layers))
+        mats = set(torch.unique(disc_global).tolist())
+        mats.discard(self.base_material)
+        # Swaps: every filament change from the base up (the base is band 0).
+        first_is_base = self.base_material is not None and int(disc_global[0]) == self.base_material
         return (
-            int(torch.unique(disc_global).numel()),
-            max(0, len(find_color_bands(disc_global)) - 1),
+            len(mats),
+            max(0, len(find_color_bands(disc_global)) - 1) + (0 if first_is_base else 1),
             int(self.max_layers),
         )
+
+    def print_colors(self) -> int:
+        """Distinct filaments the print uses, the base included (a layer in
+        the base filament is not counted twice) - what "max colors" limits."""
+        return self.solution_counts()[0] + 1
 
     def solution_snapshot(self) -> dict:
         """Everything a pruning phase can change, cloned."""
@@ -2026,9 +2129,9 @@ class FilamentOptimizer:
         scores = [logp + deterministic_gumbel_noise(seeds, n_mat), logp]
         if self.limit_colors is not None:
             neg = torch.full_like(logp, -1e9)
-            scores += [torch.where(m.view(1, -1), logp, neg) for m in top_palettes(logp, self.limit_colors, 8)[1:]]
-        stacks = project_assignment(torch.stack(scores), self.limit_colors, self.limit_swaps)
-        if feasible(sample, self.limit_colors, self.limit_swaps):
+            scores += [torch.where(m.view(1, -1), logp, neg) for m in top_palettes(logp, self.limit_colors, 8, self.base_code)[1:]]
+        stacks = project_assignment(torch.stack(scores), self.limit_colors, self.limit_swaps, self.base_code)
+        if feasible(sample, self.limit_colors, self.limit_swaps, self.base_code):
             stacks[0] = sample.to(stacks.dtype)
 
         unique, seen = [], set()
@@ -2061,6 +2164,16 @@ class FilamentOptimizer:
             self.best_step = self.num_steps_done
 
     def _maybe_update_best_discrete(self):
+        if self.bg_logits is None:
+            return self._update_best_discrete()
+        self._use_background(int(self.bg_logits.detach().argmax()))
+        try:
+            return self._update_best_discrete()
+        finally:
+            if self.best_params is not None and "background_index" in self.best_params:
+                self._use_background(self.best_params["background_index"])
+
+    def _update_best_discrete(self):
         """
         Discretize the current solution, compute the discrete-mode loss,
         and update the best solution if it improves.

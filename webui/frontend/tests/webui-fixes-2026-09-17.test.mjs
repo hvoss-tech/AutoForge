@@ -210,9 +210,12 @@ test('the base color', async (t) => {
     assert.equal(baseLayerCount({ ...settings, background_height: 0 }), 0)
   })
 
-  await t.test('withEffectiveBaseColor leaves settings alone when nothing changed', () => {
-    assert.equal(withEffectiveBaseColor(settings, null), settings)
-    assert.equal(withEffectiveBaseColor(settings, { color: '#000000' }), settings)
+  await t.test('withEffectiveBaseColor keeps the settings, adding the base filament', () => {
+    assert.deepEqual(withEffectiveBaseColor(settings, null), { ...settings, base_filament_uuid: '' })
+    assert.deepEqual(withEffectiveBaseColor(settings, { color: '#000000', filament_uuid: 'k' }), {
+      ...settings,
+      base_filament_uuid: 'k',
+    })
   })
 
   await t.test('the swap instructions name the color the print really starts with', () => {

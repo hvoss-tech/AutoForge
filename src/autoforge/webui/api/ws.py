@@ -51,6 +51,7 @@ def broadcast_preview(
     min_layer: int | None = None,
     max_layer: int | None = None,
     render_id: str | None = None,
+    base: dict | None = None,
 ):
     """Send a preview update to all connected preview clients (thread-safe).
 
@@ -73,6 +74,10 @@ def broadcast_preview(
         payload["max_layer"] = max_layer
     if render_id:
         payload["render_id"] = str(render_id)
+    if base:
+        # The base the optimizer currently uses (it chooses the base
+        # filament too), so the base row follows the live preview.
+        payload["base"] = base
     _send_to_all(json.dumps(payload))
 
 

@@ -91,7 +91,7 @@ export const PrintPlanPanel: React.FC = () => {
               <td className="px-3 py-1.5 tabular-nums">{(settings.background_height || 0).toFixed(2)} mm</td>
               <td className="px-3 py-1.5">
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="w-3 h-3 rounded-full border border-gray-600" style={{ backgroundColor: settings.background_color }} />
+                  <span className="w-3 h-3 rounded-full border border-gray-600" style={{ backgroundColor: settings.background_color }} data-testid="plan-base-swatch" />
                   Base / background color
                 </span>
               </td>

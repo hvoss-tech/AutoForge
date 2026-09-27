@@ -446,9 +446,14 @@ def generate_swap_instructions(
     background_height,
     material_names,
     background_material_name=None,
+    background_material_index=None,
 ):
     """
     Generate swap instructions based on discrete material assignments.
+
+    With ``background_material_index`` (the base's filament), a first layer
+    in the base filament is no swap: the instructions carry on in the base
+    filament until the first real change.
 
     Args:
         discrete_global (jnp.ndarray): Array of discrete global material assignments.
@@ -485,6 +490,8 @@ def generate_swap_instructions(
         f"Start with {start_bg_name}, with a layer height of {background_height:.2f}mm for the first layer."
     )
     for i in range(0, L):
+        if i == 0 and background_material_index is not None and int(discrete_global[0]) == int(background_material_index):
+            continue
         if i == 0 or int(discrete_global[i]) != int(discrete_global[i - 1]):
             ie = i + 1
             instructions.append(

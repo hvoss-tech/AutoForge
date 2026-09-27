@@ -72,8 +72,8 @@ def _run(image, folder, args, limit_args):
 
 
 def _finish(res, image, col, max_colors, max_swaps):
-    # Colour limits count the background filament, like the pruning CLI does.
-    res["ok"] = 0 <= res["colors"] <= max_colors - 1 and 0 <= res["swaps"] <= max_swaps
+    # "colors" is the print's filament count, the base included.
+    res["ok"] = 0 <= res["colors"] <= max_colors and 0 <= res["swaps"] <= max_swaps
     res.update({"image": image, "config": col})
     return res
 

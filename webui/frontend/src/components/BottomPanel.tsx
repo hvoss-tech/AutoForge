@@ -5,6 +5,7 @@ import { ColorSliders } from './ColorSliders'
 import { PrintPlanPanel } from './PrintPlanPanel'
 import { useSliderPreviewRender } from '../hooks/useSliderPreviewRender'
 import { buildPrintPlan } from '../lib/printPlan'
+import { withEffectiveBaseColor } from '../lib/baseColor'
 import { onUiCommand } from '../lib/uiEvents'
 import { useFlash } from '../hooks/usePersistentState'
 
@@ -15,7 +16,11 @@ export const BottomPanel: React.FC = () => {
   const colorSliders = useAppStore((s) => s.colorSliders)
   const settings = useAppStore((s) => s.settings)
   const isRendering = useSliderPreviewRender()
-  const swaps = React.useMemo(() => buildPrintPlan(colorSliders, [], settings).swaps, [colorSliders, settings])
+  const resolvedBase = useAppStore((s) => s.resolvedBase)
+  const swaps = React.useMemo(
+    () => buildPrintPlan(colorSliders, [], withEffectiveBaseColor(settings, resolvedBase)).swaps,
+    [colorSliders, settings, resolvedBase],
+  )
   const [flashing, flash] = useFlash()
 
   // The "Adjust" workflow step.

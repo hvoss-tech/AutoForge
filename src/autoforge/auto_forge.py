@@ -311,6 +311,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--optimize_background",
+        default=True,
+        help="With --auto_background_color: the optimizer chooses the base filament like any layer's, starting from the filament closest to the image's dominant color (the base keeps its --background_height)",
+        action=argparse.BooleanOptionalAction,
+    )
+
+    parser.add_argument(
         "--constrained_opt",
         default=False,
         help="Hold --pruning_max_colors / --pruning_max_swaps during the optimization itself instead of pruning afterwards",
@@ -1005,7 +1012,8 @@ def _prune_sweep(optimizer: FilamentOptimizer, args) -> None:
         loss = PruningHelper.get_initial_loss(
             optimizer.best_params["global_logits"].shape[0], optimizer
         )
-        n_colors, n_swaps, _ = optimizer.solution_counts()
+        _, n_swaps, _ = optimizer.solution_counts()
+        n_colors = optimizer.print_colors()
         results.append({"max_colors": colors, "max_swaps": swaps, "loss": loss,
                         "colors": n_colors, "swaps": n_swaps})
         print(f"PRUNE_SWEEP {colors}:{swaps} loss={loss:.4f} colors={n_colors} swaps={n_swaps}")
@@ -1133,9 +1141,10 @@ def _post_optimize_and_export(
             )
             with open(os.path.join(args.output_folder, "final_loss.txt"), "w") as f:
                 f.write(f"{final_loss}")
-            n_colors, n_swaps, _ = optimizer.solution_counts()
+            _, n_swaps, _ = optimizer.solution_counts()
             with open(os.path.join(args.output_folder, "final_counts.json"), "w") as f:
-                json.dump({"colors": n_colors, "swaps": n_swaps}, f)
+                # colors: filaments of the print, the base included.
+                json.dump({"colors": optimizer.print_colors(), "swaps": n_swaps}, f)
 
             print("Done. Saving outputs...")
             comp_disc = optimizer.get_best_discretized_image()
@@ -1195,6 +1204,7 @@ def _post_optimize_and_export(
                     args.background_height,
                     material_names,
                     getattr(args, "background_material_name", None),
+                    optimizer.base_material,
                 )
                 with open(
                     os.path.join(args.output_folder, "swap_instructions.txt"), "w"
@@ -1379,6 +1389,14 @@ def start(args) -> float:
         if args.constrained_opt:
             optimizer.constrained_local_search(compound=True)
         optimizer.end_check_scope()
+    optimizer.finalize_background(args, material_names)
+    if optimizer.bg_logits is not None:
+        try:
+            with open(os.path.join(args.output_folder, "auto_background_color.txt"), "a") as f:
+                f.write(f"optimized_filament_color={args.background_color}\n")
+                f.write(f"optimized_filament_index={args.background_material_index}\n")
+        except Exception:
+            traceback.print_exc()
 
     empty_cache(device)
 

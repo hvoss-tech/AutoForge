@@ -312,8 +312,12 @@ def test_prune_num_colors_phase_respects_the_colour_budget():
     prune_num_colors(opt, 2, opt.vis_tau, None)
 
     dg_after, _ = opt.get_discretized_solution(best=True)
-    assert count_distinct_colors(dg_after) <= max(2, 1)
-    assert count_distinct_colors(dg_after) <= count_distinct_colors(dg_before)
+    # The budget is the colors besides the base filament (a layer reusing it
+    # adds no color), so the base is left out of the count.
+    base = opt.base_material
+    besides_base = lambda dg: len(set(dg.tolist()) - {base})
+    assert besides_base(dg_after) <= 2
+    assert besides_base(dg_after) <= besides_base(dg_before)
     assert opt.best_discrete_loss <= loss_before + 1e-3
 
 

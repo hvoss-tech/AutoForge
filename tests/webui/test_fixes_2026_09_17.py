@@ -230,9 +230,14 @@ def test_result_counts_match_how_the_dialog_counts():
     from autoforge.webui.helpers.sliders import result_counts_from_optimizer
 
     # Three materials in four runs over 8 layers: 3 distinct + base = 4
-    # colors, 4 runs - 1 = 3 swaps, top layer 8.
+    # colors; swaps count from the base up (the base is no filament here), so
+    # 4 runs = 4 swaps; top layer 8.
     counts = result_counts_from_optimizer(_FakeOptimizer([0, 0, 1, 1, 2, 2, 0, 0], 8))
-    assert counts == {"colors": 4, "swaps": 3, "layers": 8}
+    assert counts == {"colors": 4, "swaps": 4, "layers": 8}
+    # With the base in filament 0: the first run is no swap, and no extra color.
+    fake = _FakeOptimizer([0, 0, 1, 1, 2, 2, 0, 0], 8)
+    fake.base_material = 0
+    assert result_counts_from_optimizer(fake) == {"colors": 3, "swaps": 3, "layers": 8}
 
 
 def test_result_counts_ignore_layers_above_the_height_map():
@@ -242,17 +247,22 @@ def test_result_counts_ignore_layers_above_the_height_map():
     # actually reaches are printed — counting the rest inflated both colors
     # and swaps versus what the dialog shows.
     counts = result_counts_from_optimizer(_FakeOptimizer([0, 0, 1, 1, 2, 3, 4, 5], 4))
-    assert counts == {"colors": 3, "swaps": 1, "layers": 4}
+    assert counts == {"colors": 3, "swaps": 2, "layers": 4}
 
 
 def test_result_counts_for_a_single_color():
     from autoforge.webui.helpers.sliders import result_counts_from_optimizer
 
+    # One color on a base that is no filament: that one change is a swap.
     assert result_counts_from_optimizer(_FakeOptimizer([1, 1, 1, 1], 4)) == {
         "colors": 2,
-        "swaps": 0,
+        "swaps": 1,
         "layers": 4,
     }
+    # The same color as the base filament: one color, no swap.
+    fake = _FakeOptimizer([1, 1, 1, 1], 4)
+    fake.base_material = 1
+    assert result_counts_from_optimizer(fake) == {"colors": 1, "swaps": 0, "layers": 4}
 
 
 def test_result_counts_for_an_empty_stack():

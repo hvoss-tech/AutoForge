@@ -36,11 +36,16 @@ export function describeRunLimits(limits: RunLimits): string | null {
   return parts.length ? `at most ${parts.join(' · ')}` : null
 }
 
-/** A note when a color limit can't bite: with N filaments active the result
- * never has more than N colors (the base is one of them). */
-export function colorLimitNote(maxColors: number | null | undefined, activeFilaments: number): string | null {
+/** A note when a color limit can't bite: with N filaments active the print
+ * never has more than N colors when the base is one of them, N + 1 with a
+ * custom base color. */
+export function colorLimitNote(
+  maxColors: number | null | undefined,
+  activeFilaments: number,
+  baseIsFilament = true,
+): string | null {
   if (!isLimited(maxColors) || activeFilaments <= 0) return null
-  if (maxColors >= activeFilaments + 1) {
+  if (maxColors >= activeFilaments + (baseIsFilament ? 0 : 1)) {
     return `You have ${activeFilaments} filament${activeFilaments === 1 ? '' : 's'} active, so this limit has no effect.`
   }
   return null

@@ -4,6 +4,7 @@ import { useAppStore } from '../store/appStore'
 import { NumberInput } from './ui/number-input'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
 import { buildPrintPlan } from '../lib/printPlan'
+import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { describePruningChange, liveCounts, resultCounts, suggestPruningLimits } from '../lib/pruning'
 
 const Current: React.FC<{ label: string; value: number; testId: string; from?: number }> = ({ label, value, testId, from }) => (
@@ -74,9 +75,15 @@ export const PruningModal: React.FC = () => {
   const settings = useAppStore((s) => s.settings)
 
   const pruningBaseline = useAppStore((s) => s.pruningBaseline)
-  const plan = useMemo(() => buildPrintPlan(colorSliders, [], settings), [colorSliders, settings])
-  // Max colors counts the base/background color too (the pruner subtracts it).
-  const fromSliders = resultCounts(plan)
+  // Max colors counts the base filament too, once, and max swaps the change
+  // from the base to the first band (see resultCounts / buildPrintPlan).
+  const resolvedBase = useAppStore((s) => s.resolvedBase)
+  const baseUuid = effectiveBaseFilamentUuid(resolvedBase)
+  const plan = useMemo(
+    () => buildPrintPlan(colorSliders, [], { ...settings, base_filament_uuid: baseUuid }),
+    [colorSliders, settings, baseUuid],
+  )
+  const fromSliders = resultCounts(plan, baseUuid)
   const running = !!pruningJob && ['pending', 'running', 'paused'].includes(pruningJob.status)
   // While pruning runs the sliders still hold the *pre-pruning* stack (the
   // backend only pushes the new one at the end), so the job's own live

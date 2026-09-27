@@ -30,6 +30,7 @@ import { sparklinePath } from '../lib/lossHistory'
 import { hasUnsavedChanges } from '../lib/project'
 import { buildPrintPlan } from '../lib/printPlan'
 import { describePruningChange, resultCounts } from '../lib/pruning'
+import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { onUiCommand, sendUiCommand, type UiCommand } from '../lib/uiEvents'
 import { useFlash } from '../hooks/usePersistentState'
 
@@ -325,6 +326,7 @@ const ResultStatus: React.FC = () => {
   const pruningJob = useAppStore((s) => s.pruningJob)
   const pruningBaseline = useAppStore((s) => s.pruningBaseline)
   const colorSliders = useAppStore((s) => s.colorSliders)
+  const baseUuid = effectiveBaseFilamentUuid(useAppStore((s) => s.resolvedBase))
 
   const reasons = useMemo(
     () => (currentJob ? staleReasons(runInputsByJob[currentJob.job_id], settings as unknown as Record<string, unknown>, activeFilaments.map((f) => f.uuid)) : []),
@@ -332,14 +334,14 @@ const ResultStatus: React.FC = () => {
   )
   const pruneSummary = useMemo(() => {
     if (!pruningBaseline) return null
-    return describePruningChange(pruningBaseline, resultCounts(buildPrintPlan(colorSliders, [], settings)))
-  }, [pruningBaseline, colorSliders, settings])
+    return describePruningChange(pruningBaseline, resultCounts(buildPrintPlan(colorSliders, [], { ...settings, base_filament_uuid: baseUuid }), baseUuid))
+  }, [pruningBaseline, colorSliders, settings, baseUuid])
 
   // What the result on screen has now (edits and pruning included), next to
   // the limits its run was started with.
   const counts = useMemo(
-    () => (colorSliders.length ? resultCounts(buildPrintPlan(colorSliders, [], settings)) : null),
-    [colorSliders, settings],
+    () => (colorSliders.length ? resultCounts(buildPrintPlan(colorSliders, [], { ...settings, base_filament_uuid: baseUuid }), baseUuid) : null),
+    [colorSliders, settings, baseUuid],
   )
   const runLimits = (currentJob ? runInputsByJob[currentJob.job_id]?.settings : undefined) as RunLimits | undefined
   const limitsText = runLimits ? describeRunLimits(runLimits) : null

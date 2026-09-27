@@ -56,13 +56,13 @@ export function baseIsAuto(
   return resolvedBase ? resolvedBase.auto : !!settings.auto_background_color
 }
 
-/** `settings` with the base color the print really uses, for anything that
- * reads `background_color` out of settings (the print plan, the exported
- * swap instructions). */
+/** `settings` with the base the print really uses, for anything that reads
+ * it out of settings (the print plan, the exported swap instructions): its
+ * color, and its filament (`base_filament_uuid`, '' for a custom color). */
 export function withEffectiveBaseColor<T extends Pick<BaseSettings, 'background_color'>>(
   settings: T,
-  resolvedBase: Pick<ResolvedBaseInfo, 'color'> | null | undefined,
-): T {
+  resolvedBase: Pick<ResolvedBaseInfo, 'color' | 'filament_uuid'> | null | undefined,
+): T & { base_filament_uuid: string } {
   const color = effectiveBaseColor(settings, resolvedBase)
-  return color === settings.background_color ? settings : { ...settings, background_color: color }
+  return { ...settings, background_color: color, base_filament_uuid: resolvedBase?.filament_uuid ?? '' }
 }

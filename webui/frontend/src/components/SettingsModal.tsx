@@ -31,7 +31,7 @@ const BASIC_FIELDS: Field[] = [
   { key: 'layer_height', label: 'Layer height', unit: 'mm', help: 'Should match the layer height you print with.', type: 'number', step: 0.01, min: 0.01 },
   { key: 'background_height', label: 'Base height', unit: 'mm', help: 'Solid base printed in the background color before any color layer.', type: 'number', step: 0.01, min: 0 },
   { key: 'stl_output_size', label: 'Size', unit: 'mm', help: 'Length of the longest side of the print.', type: 'number', step: 1, min: 10, integer: true },
-  { key: 'auto_background_color', label: 'Pick base color automatically', help: 'Let the optimizer choose the base color from your filaments. Turn off to set it yourself.', type: 'boolean' },
+  { key: 'auto_background_color', label: 'Pick base color automatically', help: 'The optimizer chooses the base filament from your filaments, together with the layer colors (the base keeps its height). Turn off to set it yourself.', type: 'boolean' },
   { key: 'auto_initial_prune', label: 'Clean up automatically after running', help: "Runs one pruning pass right after optimization finishes, at the result's own color/swap/layer counts (nothing is forced out) — it only merges what doesn't cost accuracy, so the result is print-ready without opening the Pruning dialog by hand.", type: 'boolean' },
   { key: 'background_color', label: 'Base color', help: 'The filament the solid base is printed in.', type: 'color' },
   {
@@ -128,7 +128,7 @@ export const SettingsModal: React.FC = () => {
               <span className="text-gray-500 truncate">picked for this picture</span>
             </>
           ) : (
-            <span className="text-gray-400">Picked when you run — the filament closest to the picture's main color</span>
+            <span className="text-gray-400">Chosen by the optimizer when you run, starting from the filament closest to the picture's main color</span>
           )}
           <button
             // Start from what auto-selection picked, so switching to manual

@@ -1,7 +1,8 @@
 """Colour / swap limits held by the optimizer itself (--constrained_opt).
 
 ``project_assignment`` maps per-layer material scores [L, M] to the best
-discrete layer stack that uses at most ``max_colors`` distinct materials and
+discrete layer stack that uses at most ``max_colors`` distinct materials
+besides the base filament (``free``: layers may reuse it at no cost) and
 at most ``max_swaps`` material changes between consecutive layers, where
 "best" means the highest summed per-layer score. With log-probabilities as
 scores that is the most likely feasible stack; with Gumbel-perturbed
@@ -18,8 +19,17 @@ import torch
 MAX_SUBSETS = 5000
 
 
-def _viterbi_swaps(score: torch.Tensor, max_swaps: int) -> torch.Tensor:
+def _mat(base: Optional[int]) -> Optional[int]:
+    """The base's filament index (None when there is no base filament)."""
+    return base if base is not None and base >= 0 else None
+
+
+def _viterbi_swaps(score: torch.Tensor, max_swaps: int, base: Optional[int] = None) -> torch.Tensor:
     """argmax over stacks with <= max_swaps changes of sum_l score[b, l, dg[l]].
+
+    With ``base`` (the base's filament, -1 for a base color that is no
+    filament) the change from the base to the first layer counts too: the
+    base is the stack's band 0.
 
     score: [B, L, M] (use a large negative score for forbidden materials).
     Returns [B, L] int64 on score's device.
@@ -38,7 +48,15 @@ def _viterbi_swaps(score: torch.Tensor, max_swaps: int) -> torch.Tensor:
     S = max_swaps + 1
     neg = -1e300
     dp = np.full((B, S, M), neg)
-    dp[:, 0] = sc[:, 0]
+    if base is None:
+        dp[:, 0] = sc[:, 0]
+    else:
+        # Staying in the base filament is free, anything else is a swap.
+        if 0 <= base < M:
+            dp[:, 0, base] = sc[:, 0, base]
+        if S > 1:
+            other = np.arange(M) != base
+            dp[:, 1, other] = sc[:, 0, other]
     back_stay = np.empty((max(L - 1, 0), B, S, M), dtype=bool)
     back_from = np.empty((max(L - 1, 0), B, S, M), dtype=np.int64)
     ar = np.arange(M)
@@ -76,34 +94,47 @@ def _viterbi_swaps(score: torch.Tensor, max_swaps: int) -> torch.Tensor:
     return torch.from_numpy(out).to(dev)
 
 
-def top_palettes(score: torch.Tensor, max_colors: int, k: int) -> torch.Tensor:
+def _palette_candidates(M: int, max_colors: int, free: Optional[int], device) -> Optional[torch.Tensor]:
+    """All palettes as [N, M] bool: ``max_colors`` materials besides
+    ``free`` (the base filament, always in the palette at no cost), or None
+    when there are too many to enumerate."""
+    others = [m for m in range(M) if m != free]
+    k = min(max_colors, len(others))
+    n_sub = 1
+    for i in range(k):
+        n_sub = n_sub * (len(others) - i) // (i + 1)
+    if n_sub > MAX_SUBSETS:
+        return None
+    subs = torch.tensor(list(combinations(others, k)), device=device, dtype=torch.long).view(-1, k)
+    masks = torch.zeros((subs.shape[0], M), dtype=torch.bool, device=device)
+    masks.scatter_(1, subs, True)
+    if free is not None:
+        masks[:, free] = True
+    return masks
+
+
+def top_palettes(score: torch.Tensor, max_colors: int, k: int, free: Optional[int] = None) -> torch.Tensor:
     """The k best palettes for scores [L, M] by sum_l max_{m in palette}
     score[l, m], as [k', M] bool (k' <= k; exhaustive search only)."""
     L, M = score.shape
-    subs = list(combinations(range(M), max_colors))
-    if len(subs) > MAX_SUBSETS:
-        return _palette_masks(score.unsqueeze(0), max_colors)
-    subs = torch.tensor(subs, device=score.device)
-    masks = torch.zeros((subs.shape[0], M), dtype=torch.bool, device=score.device)
-    masks.scatter_(1, subs, True)
+    free = _mat(free)
+    masks = _palette_candidates(M, max_colors, free, score.device)
+    if masks is None:
+        return _palette_masks(score.unsqueeze(0), max_colors, free)
     neg = torch.tensor(torch.finfo(score.dtype).min / 4, device=score.device)
     vals = torch.where(masks.unsqueeze(1), score.unsqueeze(0), neg).amax(-1).sum(-1)
     return masks[vals.topk(min(k, vals.shape[0])).indices]
 
 
-def _palette_masks(score: torch.Tensor, max_colors: int) -> torch.Tensor:
-    """Best palette (<= max_colors materials) per batch item, as [B, M] bool,
+def _palette_masks(score: torch.Tensor, max_colors: int, free: Optional[int] = None) -> torch.Tensor:
+    """Best palette per batch item, as [B, M] bool: at most ``max_colors``
+    materials besides ``free`` (the base filament, which is always in it),
     judged by sum_l max_{m in palette} score[b, l, m]."""
     B, L, M = score.shape
     dev = score.device
-    n_sub = 1
-    for i in range(max_colors):
-        n_sub = n_sub * (M - i) // (i + 1)
-    if n_sub <= MAX_SUBSETS:
-        subs = torch.tensor(list(combinations(range(M), max_colors)), device=dev)
-        masks = torch.zeros((subs.shape[0], M), dtype=torch.bool, device=dev)
-        masks.scatter_(1, subs, True)  # [N, M]
-        neg = torch.finfo(score.dtype).min / 4
+    neg = torch.finfo(score.dtype).min / 4
+    masks = _palette_candidates(M, max_colors, free, dev)
+    if masks is not None:
         # [B, N, L]: best in-palette score per layer
         vals = torch.where(
             masks.view(1, -1, 1, M), score.unsqueeze(1), torch.tensor(neg, device=dev)
@@ -112,15 +143,16 @@ def _palette_masks(score: torch.Tensor, max_colors: int) -> torch.Tensor:
         return masks[best]
     # Greedy: drop the material whose removal costs least, until small enough.
     mask = torch.ones((B, M), dtype=torch.bool, device=dev)
-    neg = torch.finfo(score.dtype).min / 4
-    for _ in range(M - max_colors):
+    n_other = M - (1 if free is not None else 0)
+    for _ in range(max(0, n_other - max_colors)):
         costs = []
         for m in range(M):
             trial = mask.clone()
             trial[:, m] = False
             v = torch.where(trial.unsqueeze(1), score, torch.tensor(neg, device=dev))
             c = v.amax(-1).sum(-1)
-            c = torch.where(mask[:, m], c, torch.full_like(c, neg))
+            keep = mask[:, m] & (m != free)
+            c = torch.where(keep, c, torch.full_like(c, neg))
             costs.append(c)
         drop = torch.stack(costs, 1).argmax(1)
         mask[torch.arange(B, device=dev), drop] = False
@@ -128,38 +160,55 @@ def _palette_masks(score: torch.Tensor, max_colors: int) -> torch.Tensor:
 
 
 def project_assignment(
-    score: torch.Tensor, max_colors: Optional[int], max_swaps: Optional[int]
+    score: torch.Tensor,
+    max_colors: Optional[int],
+    max_swaps: Optional[int],
+    free: Optional[int] = None,
 ) -> torch.Tensor:
-    """Best feasible stack for scores [L, M] or [B, L, M] -> [L] / [B, L]."""
+    """Best feasible stack for scores [L, M] or [B, L, M] -> [L] / [B, L].
+
+    ``free`` is the base: its filament index (a layer in it adds no colour
+    to the print, and a first layer in it is no swap), -1 for a base colour
+    that is no filament (a colour of its own, and the first layer is always
+    a swap), or None to leave the base out entirely. ``max_colors`` limits
+    the materials besides the base filament."""
     squeeze = score.dim() == 2
     if squeeze:
         score = score.unsqueeze(0)
     score = score.float()
     M = score.shape[-1]
-    if max_colors is not None and max_colors < M:
-        mask = _palette_masks(score, max_colors)
+    mat = _mat(free)
+    if max_colors is not None and max_colors < M - (1 if mat is not None else 0):
+        mask = _palette_masks(score, max_colors, mat)
         score = torch.where(
             mask.unsqueeze(1), score, torch.tensor(-1e9, device=score.device)
         )
-    if max_swaps is not None and max_swaps < score.shape[1] - 1:
-        out = _viterbi_swaps(score, max_swaps)
+    if max_swaps is not None and max_swaps < score.shape[1] - (1 if free is None else 0):
+        out = _viterbi_swaps(score, max_swaps, free)
     else:
         out = score.argmax(-1)
     return out[0] if squeeze else out
 
 
-def feasible(dg: torch.Tensor, max_colors: Optional[int], max_swaps: Optional[int]) -> bool:
-    c, s = count_colors_swaps(dg)
+def feasible(
+    dg: torch.Tensor, max_colors: Optional[int], max_swaps: Optional[int], free: Optional[int] = None
+) -> bool:
+    c, s = count_colors_swaps(dg, free)
     return (max_colors is None or c <= max_colors) and (max_swaps is None or s <= max_swaps)
 
 
 def neighbour_stacks(
-    dg: torch.Tensor, n_mat: int, max_colors: Optional[int], max_swaps: Optional[int]
+    dg: torch.Tensor,
+    n_mat: int,
+    max_colors: Optional[int],
+    max_swaps: Optional[int],
+    free: Optional[int] = None,
 ) -> list:
     """Feasible single-move neighbours of the stack ``dg`` [L]: recolour a
     band, shift a band boundary by 1-2 layers, recolour one layer, replace one
     palette material everywhere by any other material."""
     L = dg.shape[0]
+    mat = _mat(free)
     cur = dg.tolist()
     seen = {tuple(cur)}
     out = []
@@ -169,8 +218,10 @@ def neighbour_stacks(
         if t in seen:
             return
         seen.add(t)
-        colors = len(set(cand))
+        colors = len(set(cand) - {mat})
         swaps = sum(1 for a, b in zip(cand[:-1], cand[1:]) if a != b)
+        if free is not None and cand[0] != free:
+            swaps += 1  # from the base to the first layer
         if (max_colors is None or colors <= max_colors) and (
             max_swaps is None or swaps <= max_swaps
         ):
@@ -192,17 +243,37 @@ def neighbour_stacks(
                 add(cur[: b0 - d + 1] + [c1] * d + cur[b0 + 1:])
             if a1 + d - 1 <= b1:  # lower band grows upward
                 add(cur[:a1] + [c0] * d + cur[a1 + d:])
-    palette = sorted(set(cur))
+    # The base filament is always available to a layer, at no colour cost.
+    palette = sorted(set(cur) | ({mat} if mat is not None else set()))
     for l in range(L):
         for m in palette if max_colors is not None else range(n_mat):
             if m != cur[l]:
                 add(cur[:l] + [m] + cur[l + 1:])
-    for p in palette:
+    for p in sorted(set(cur)):
         for m in range(n_mat):
-            if m != p:  # replace (m outside the palette) or merge (m inside)
+            if m != p:  # replace (m outside the palette) or merge (m inside, the base included)
                 add([m if v == p else v for v in cur])
     return [torch.tensor(c, dtype=dg.dtype, device=dg.device) for c in out]
 
 
-def count_colors_swaps(dg: torch.Tensor) -> tuple[int, int]:
-    return int(torch.unique(dg).numel()), int((dg[1:] != dg[:-1]).sum().item())
+def count_colors_swaps(dg: torch.Tensor, free: Optional[int] = None) -> tuple[int, int]:
+    """(materials in the stack besides the base filament, swaps) - ``free``
+    as in ``project_assignment``. With a base the print's colours are the
+    first number plus one, and the swaps include the change from the base to
+    the first layer."""
+    mats = set(torch.unique(dg).tolist())
+    mats.discard(_mat(free))
+    swaps = int((dg[1:] != dg[:-1]).sum().item())
+    if free is not None and int(dg[0]) != free:
+        swaps += 1
+    return len(mats), swaps
+
+
+def base_material_index(background: torch.Tensor, material_colors: torch.Tensor) -> Optional[int]:
+    """Index of the filament the base is printed in, or None when the base
+    color is not one of the filaments (a custom color: it then takes a
+    color slot of its own). Matched by color, which covers the automatically
+    picked base as well as a filament chosen by hand."""
+    d = (material_colors.float() - background.float().view(1, -1)).abs().amax(dim=1)
+    i = int(torch.argmin(d))
+    return i if float(d[i]) < 0.5 / 255 else None

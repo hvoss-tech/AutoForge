@@ -33,6 +33,9 @@ export const RunLimitsEditor: React.FC<{ compact?: boolean }> = ({ compact = fal
   const settings = useAppStore((s) => s.settings)
   const setSettings = useAppStore((s) => s.setSettings)
   const activeCount = useAppStore((s) => s.activeFilaments.length)
+  // An automatic base is always one of the filaments; a hand-picked one
+  // only when it is a filament rather than a custom color.
+  const baseIsFilament = useAppStore((s) => s.settings.auto_background_color || !!s.resolvedBase?.filament_uuid)
 
   const update = (key: RunLimitKey, value: number | null) => {
     setSettings({ ...useAppStore.getState().settings, [key]: normalizeLimit(key, value) })
@@ -43,7 +46,7 @@ export const RunLimitsEditor: React.FC<{ compact?: boolean }> = ({ compact = fal
       {ROWS.map((row) => {
         const value = settings[row.key]
         const limited = isLimited(value)
-        const note = row.key === 'max_colors' ? colorLimitNote(value, activeCount) : null
+        const note = row.key === 'max_colors' ? colorLimitNote(value, activeCount, baseIsFilament) : null
         return (
           <div key={row.key} className="flex flex-col gap-1" data-testid={`run-limit-${row.key}`} data-limited={limited}>
             <div className="flex flex-wrap items-center gap-2">

@@ -49,14 +49,16 @@ def test_a_scope_only_affects_the_thread_that_opened_it():
             OH._replay_captured(_fn, "other", [x])
         seen["cache"] = len(OH._graph_thread_state().cache)
 
+    depth0 = OH._graph_thread_state().depth
+    cache0 = len(OH._graph_thread_state().cache)
     with OH.composite_graph_scope():
         t = threading.Thread(target=other_thread)
         t.start()
         t.join()
-        assert OH._graph_thread_state().depth == 1
-        assert len(OH._graph_thread_state().cache) == 0  # untouched by the other thread
+        assert OH._graph_thread_state().depth == depth0 + 1
+        assert len(OH._graph_thread_state().cache) == cache0  # untouched by the other thread
     assert seen == {"depth": 0, "cache": 0}  # it ran eagerly
-    assert OH._graph_thread_state().depth == 0
+    assert OH._graph_thread_state().depth == depth0
 
 
 def test_concurrent_scopes_in_two_threads_do_not_corrupt_each_other():

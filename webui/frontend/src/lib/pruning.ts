@@ -24,10 +24,17 @@ export function suggestPruningLimits(current: PruningCounts): PruningCounts {
   }
 }
 
-/** The counts the pruner limits. Max colors includes the base color (the
- * pruner subtracts it), so it's one more than the layer bands use. */
-export function resultCounts(plan: { colors: number; swaps: number; topLayer: number }): PruningCounts {
-  return { colors: plan.colors + 1, swaps: plan.swaps, layers: plan.topLayer }
+/** The counts the pruner limits. Max colors is the print's filaments, the
+ * base included: the layer bands' filaments plus the base filament, counted
+ * once when a band reuses it. A base that is no filament (a custom color, or
+ * not known yet) is one color more. */
+export function resultCounts(
+  plan: { colors: number; colorKeys?: string[]; swaps: number; topLayer: number },
+  baseFilamentUuid = '',
+): PruningCounts {
+  const colors =
+    baseFilamentUuid && plan.colorKeys ? new Set([...plan.colorKeys, baseFilamentUuid]).size : plan.colors + 1
+  return { colors, swaps: plan.swaps, layers: plan.topLayer }
 }
 
 /** The counts to show while pruning runs.

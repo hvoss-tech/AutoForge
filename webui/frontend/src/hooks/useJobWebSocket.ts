@@ -9,6 +9,14 @@ const BASE_RECONNECT_DELAY = 500 // ms
 // bar frozen with no error for the rest of a long run — a laptop sleep or a
 // ~20s network blip should not silently stop updates.
 const POLL_FALLBACK_INTERVAL = 2000 // ms
+// Until the socket delivers its first status, the job is followed by polling
+// as well: a socket can take many seconds to connect (the browser holds a
+// new WebSocket back while another handshake to the same host is still
+// pending), and the page sat on "Preparing the optimization…" meanwhile.
+const EARLY_POLL_INTERVAL = 1000 // ms
+// A handshake still pending after this long is abandoned and retried, so a
+// stuck one can't hold up this socket (and the others behind it).
+const CONNECT_TIMEOUT = 3000 // ms
 
 export function useJobWebSocket(jobId: string | null) {
   const wsRef = useRef<WebSocket | null>(null)
@@ -30,7 +38,7 @@ export function useJobWebSocket(jobId: string | null) {
   }, [])
 
   const startPolling = useCallback(
-    (polledJobId: string) => {
+    (polledJobId: string, interval: number = POLL_FALLBACK_INTERVAL) => {
       stopPolling()
       pollTimerRef.current = setInterval(async () => {
         try {
@@ -58,7 +66,7 @@ export function useJobWebSocket(jobId: string | null) {
           // progress bar that silently stops moving looked like a slow run.
           if (mountedRef.current) setServerConnection('lost')
         }
-      }, POLL_FALLBACK_INTERVAL)
+      }, interval)
     },
     [setCurrentJob, setServerConnection, stopPolling]
   )
@@ -80,6 +88,12 @@ export function useJobWebSocket(jobId: string | null) {
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws/optimize/${currentJobId}`)
     wsRef.current = ws
     let intentionalClose = false
+    let gotMessage = false
+    // Follow the job by polling until the socket's first status arrives.
+    if (!pollTimerRef.current) startPolling(currentJobId, EARLY_POLL_INTERVAL)
+    const connectTimer = setTimeout(() => {
+      if (ws.readyState === WebSocket.CONNECTING) ws.close()
+    }, CONNECT_TIMEOUT)
     // onerror and onclose both fire for a failed connection (a browser
     // always closes after erroring); routing both to the same handler used
     // to consume the reconnect-attempt budget twice per actual failure and
@@ -88,12 +102,16 @@ export function useJobWebSocket(jobId: string | null) {
     let closeHandled = false
 
     ws.onopen = () => {
-      stopPolling()
+      clearTimeout(connectTimer)
     }
 
     ws.onmessage = (event) => {
       try {
         const data: JobStatus = JSON.parse(event.data)
+        if (!gotMessage) {
+          gotMessage = true
+          stopPolling()
+        }
         // A backend restart mid-run sends this instead of a real status;
         // storing it verbatim put a value outside the JobStatus union into
         // currentJob (and from there into undo snapshots) with nothing in
@@ -145,6 +163,7 @@ export function useJobWebSocket(jobId: string | null) {
     const handleClose = () => {
       if (closeHandled) return
       closeHandled = true
+      clearTimeout(connectTimer)
       wsRef.current = null
       if (!mountedRef.current) return
       if (intentionalClose) return

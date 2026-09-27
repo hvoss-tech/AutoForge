@@ -63,6 +63,13 @@ export const Preview3DPanel: React.FC = () => {
       if (disposed) return
       const ws = new WebSocket(wsUrl)
       wsRef.current = ws
+      // A handshake still pending after 3s is abandoned (onclose reconnects):
+      // a stuck one also holds back every other socket to this host.
+      const connectTimer = setTimeout(() => {
+        if (ws.readyState === WebSocket.CONNECTING) ws.close()
+      }, 3000)
+      ws.addEventListener('open', () => clearTimeout(connectTimer))
+      ws.addEventListener('close', () => clearTimeout(connectTimer))
 
       ws.onopen = () => {
         ws.send('connected')
@@ -99,6 +106,14 @@ export const Preview3DPanel: React.FC = () => {
                 ? { min: data.min_layer, max: data.max_layer }
                 : undefined
               applySliders(data.sliders, range)
+            }
+            // The optimizer chooses the base filament too; while it runs the
+            // base row, swatches and plan follow the base of the preview.
+            if (data.base) {
+              const currentBase = useAppStore.getState().resolvedBase
+              if (JSON.stringify(currentBase) !== JSON.stringify(data.base)) {
+                useAppStore.getState().setResolvedBase(data.base)
+              }
             }
           }
         } catch {

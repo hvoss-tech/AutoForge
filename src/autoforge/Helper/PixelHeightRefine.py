@@ -302,9 +302,9 @@ def refine_layer_materials(
                         continue
                     c = best_dg.clone()
                     c[layer] = m
-                    if int(torch.unique(c).numel()) > max_colors:
+                    if _layer_colors(c, getattr(optimizer, "base_material", None)) > max_colors:
                         continue
-                    if len(find_color_bands(c)) - 1 > max_swaps:
+                    if _stack_swaps(c, getattr(optimizer, "base_material", None)) > max_swaps:
                         continue
                     cands.append(c)
                 if not cands:
@@ -397,9 +397,9 @@ def refine_stack_palette(
                         continue
                     c = best_dg.clone()
                     c[layer] = m
-                    if max_colors < 10**9 and int(torch.unique(c).numel()) > max_colors:
+                    if max_colors < 10**9 and _layer_colors(c, getattr(optimizer, "base_material", None)) > max_colors:
                         continue
-                    if max_swaps < 10**9 and len(find_color_bands(c)) - 1 > max_swaps:
+                    if max_swaps < 10**9 and _stack_swaps(c, getattr(optimizer, "base_material", None)) > max_swaps:
                         continue
                     cands.append(c)
                 if not cands:
@@ -603,14 +603,33 @@ class PaletteProxy:
         return torch.cat(out)
 
 
-def _within_limits(c: torch.Tensor, max_colors: int, max_swaps: int) -> torch.Tensor:
-    """[B] bool: stacks c [B,L] within the colour / swap limits."""
+def _layer_colors(dg: torch.Tensor, base) -> int:
+    """Filaments of stack ``dg`` besides the base filament."""
+    mats = set(torch.unique(dg).tolist())
+    mats.discard(base)
+    return len(mats)
+
+
+def _stack_swaps(dg: torch.Tensor, base) -> int:
+    """Filament changes from the base up (the base is band 0)."""
+    first = int(dg[0]) != (base if base is not None else -1)
+    return int((dg[1:] != dg[:-1]).sum()) + int(first)
+
+
+def _within_limits(c: torch.Tensor, max_colors: int, max_swaps: int, base=None) -> torch.Tensor:
+    """[B] bool: stacks c [B,L] within the colour / swap limits (colours
+    besides the ``base`` filament, which layers may reuse at no cost)."""
     ok = torch.ones(c.shape[0], dtype=torch.bool, device=c.device)
     if max_swaps < 10**9:
-        ok &= (c[:, 1:] != c[:, :-1]).sum(1) <= max_swaps
+        # The base is band 0: a first layer in another filament is a swap
+        # (always, for a base colour that is no filament).
+        first = c[:, 0] != (base if base is not None else -1)
+        ok &= (c[:, 1:] != c[:, :-1]).sum(1) + first.long() <= max_swaps
     if max_colors < 10**9:
         onehot = torch.zeros(c.shape[0], int(c.max()) + 1, dtype=torch.bool, device=c.device)
         onehot.scatter_(1, c, True)
+        if base is not None and base < onehot.shape[1]:
+            onehot[:, base] = False
         ok &= onehot.sum(1) <= max_colors
     return ok
 
@@ -636,6 +655,7 @@ def search_stack(
     """
     if init_dg is None:
         init_dg, _ = optimizer.get_discretized_solution(best=True)
+    base = getattr(optimizer, "base_material", None)
     dg = init_dg
     if proxy is None:
         proxy = PaletteProxy(optimizer)
@@ -656,7 +676,7 @@ def search_stack(
             for layer in range(L - 1, -1, -1):
                 c = cur.repeat(M, 1)
                 c[:, layer] = torch.arange(M, device=dev)
-                ok = _within_limits(c, max_colors, max_swaps)
+                ok = _within_limits(c, max_colors, max_swaps, base)
                 losses = torch.where(ok, proxy(c), torch.full((M,), float("inf"), device=dev))
                 i = torch.argmin(losses)
                 li = losses[i].double()
@@ -676,7 +696,7 @@ def search_stack(
             # segment fill adds a colour, an insert adds swaps); such a start
             # scores inf, so only stacks within the limits can ever win.
             cl = torch.where(
-                _within_limits(c, max_colors, max_swaps),
+                _within_limits(c, max_colors, max_swaps, base),
                 proxy(c),
                 torch.full((B,), float("inf"), device=dev),
             )
@@ -687,7 +707,7 @@ def search_stack(
                 for layer in range(hi - 1, lo - 1, -1):
                     v = c.repeat_interleave(M, 0)
                     v[:, layer] = ar.repeat(B)
-                    ok = _within_limits(v, max_colors, max_swaps)
+                    ok = _within_limits(v, max_colors, max_swaps, base)
                     lv = torch.where(ok, proxy(v), torch.full((v.shape[0],), float("inf"), device=dev))
                     lv, j = lv.view(B, M).min(dim=1)
                     better = lv < cl - 1e-6
@@ -728,7 +748,7 @@ def search_stack(
                     break
     if verbose:
         print(f"Stack search: proxy loss {start:.4f} -> {cd:.4f} (descent) -> {best:.4f}")
-    if not bool(_within_limits(cur[None], max_colors, max_swaps)[0]):
+    if not bool(_within_limits(cur[None], max_colors, max_swaps, base)[0]):
         # Never hand back a stack beyond the limits (the start itself may
         # be one, when the limits are tighter than the solution).
         return init_dg

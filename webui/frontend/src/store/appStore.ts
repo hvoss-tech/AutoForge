@@ -16,6 +16,7 @@ import { inheritRunInputs, readStoredRunInputs, storeRunInputs, type RunInputs }
 import { appendLossPoint, type LossPoint } from '../lib/lossHistory'
 import { suggestPruningLimits, resultCounts, type PruningCounts } from '../lib/pruning'
 import { buildPrintPlan } from '../lib/printPlan'
+import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { projectFileName, projectFingerprint, projectNameFromFile } from '../lib/project'
 
 // Module-level undo stack — NOT in Zustand store to avoid infinite loops via subscribe
@@ -835,7 +836,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       // poll loop) rather than through this action; the job_id check is
       // cheap extra insurance against that assumption changing later.
       if (get().settings.auto_initial_prune && !job.job_id.startsWith('prune-')) {
-        const current = resultCounts(buildPrintPlan(get().colorSliders, [], get().settings))
+        const baseUuid = effectiveBaseFilamentUuid(get().resolvedBase)
+        const current = resultCounts(
+          buildPrintPlan(get().colorSliders, [], { ...get().settings, base_filament_uuid: baseUuid }),
+          baseUuid,
+        )
         const limits = suggestPruningLimits(current)
         set({ pruningBaseline: current })
         get().startPruning({

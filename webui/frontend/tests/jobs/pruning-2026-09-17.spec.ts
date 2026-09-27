@@ -247,8 +247,9 @@ test('turning both polish passes off skips their phases entirely', async ({ requ
   }
   expect([...phases]).not.toContain('Searching color seeds')
   // The bar's phase slices adapt, so it doesn't sit at 0% waiting for a
-  // phase that never runs.
-  expect([...phases]).toContain('Reducing colors')
+  // phase that never runs. (Which reduction phase gets sampled depends on
+  // timing: one already within its limit is over in a few milliseconds.)
+  expect([...phases].some((p) => p.startsWith('Reducing'))).toBeTruthy()
 })
 
 test('auto-repeat keeps pruning until a pass stops improving', async ({ page, request, baseURL }) => {

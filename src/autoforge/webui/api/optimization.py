@@ -19,6 +19,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _live_base(optimizer, filament_dicts, settings) -> dict | None:
+    """The base as the optimizer has it right now (see derive_base_from_result
+    for the finished result)."""
+    try:
+        rgb = [int(round(float(c) * 255)) for c in optimizer.background.detach().cpu().tolist()]
+        idx = getattr(optimizer, "base_material", None)
+        uuid = str(filament_dicts[idx].get("uuid", "")) if idx is not None and idx < len(filament_dicts) else ""
+        lh = float(settings.layer_height) or 0.04
+        return {
+            "color": "#" + "".join(f"{c:02X}" for c in rgb),
+            "height_mm": round(float(settings.background_height), 4),
+            "layers": int(round(float(settings.background_height) / lh)),
+            "filament_uuid": uuid,
+            "auto": bool(settings.auto_background_color),
+        }
+    except Exception:
+        return None
+
+
 def _derive_sliders(optimizer, filament_dicts):
     """Best-effort slider derivation; returns None when not possible."""
     try:
@@ -219,6 +238,7 @@ async def start_optimization(settings: OptimizationSettings):
                             loss=loss_val,
                             min_layer=slider_data["min_layer"] if slider_data else None,
                             max_layer=slider_data["max_layer"] if slider_data else None,
+                            base=_live_base(opt, filament_dicts, settings),
                         )
                 except Exception:
                     import traceback
