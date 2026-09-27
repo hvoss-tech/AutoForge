@@ -1,4 +1,5 @@
 import argparse
+import math
 import gc
 import random
 import os
@@ -535,19 +536,31 @@ class FilamentOptimizer:
         """Two-step move out of a local optimum at the limit: one of the
         cheapest moves that frees a swap or a colour, then the best feasible
         single move from there. Returns (loss, stack) if the pair improves."""
-        from autoforge.Helper.ConstraintHelper import count_colors_swaps, neighbour_stacks
-        from autoforge.Helper.PruningHelper import _eval_candidates_batch
+        from autoforge.Helper.ConstraintHelper import neighbour_stacks
+        from autoforge.Helper.PruningHelper import _eval_candidates_batch, candidate_losses
 
-        c0, s0 = count_colors_swaps(dg, self.base_code)
+        # Colours/swaps of every candidate in one pass on the CPU (a per-
+        # candidate count synced with the GPU thousands of times).
+        mat = self.base_material
+        base = self.base_code
+
+        def counts(row):
+            colors = len(set(row) - {mat})
+            swaps = sum(1 for a, b in zip(row[:-1], row[1:]) if a != b) + (1 if row[0] != base else 0)
+            return colors, swaps
+
+        c0, s0 = counts(dg.tolist())
+        rows = torch.stack(cands).cpu().tolist() if cands else []
         freeing = []
-        for cand in cands:
-            c, s_ = count_colors_swaps(cand, self.base_code)
+        for cand, row in zip(cands, rows):
+            c, s_ = counts(row)
             if c < c0 or s_ < s0:
                 freeing.append(cand)
         if not freeing:
             return None
-        scored = [(_eval_candidates_batch(self, [f], eff_thick=shared)[0], i) for i, f in enumerate(freeing)]
-        scored.sort()
+        losses = candidate_losses(self, freeing, shared, batch_size=64)
+        order_free = torch.argsort(losses)[:n_free].tolist()  # one host sync
+        scored = [(None, i) for i in order_free]
         n_mat = self.material_colors.shape[0]
         for _, i in scored[:n_free]:
             second = neighbour_stacks(freeing[i], n_mat, self.limit_colors, self.limit_swaps, self.base_code)
@@ -559,16 +572,30 @@ class FilamentOptimizer:
                     return loss, best
         return None
 
+    # The limit search scores thousands of candidate stacks; on a large print
+    # that is seconds per check at the full solver resolution (500x280 at
+    # 200mm), so above this many pixels it scores a downsampled copy and
+    # re-checks what it found at full resolution.
+    SEARCH_MAX_PIXELS = 24576
+
     @composite_graph_scope()
     @torch.no_grad()
     def constrained_local_search(
-        self, max_rounds: int = 1000, compound: bool = False, should_stop=None
+        self,
+        max_rounds: int = 1000,
+        compound: bool = False,
+        should_stop=None,
+        progress=None,
+        max_candidates: Optional[int] = None,
     ) -> bool:
         """Best-improvement descent over feasible single-move neighbours of
         the best stack, scored by the real discrete loss with the best
-        heights. Never leaves the feasible set. Returns True if improved."""
+        heights. Never leaves the feasible set. Returns True if improved.
+
+        ``progress`` (optional) is called with a 0-1 fraction as it goes."""
         from autoforge.Helper.ConstraintHelper import neighbour_stacks
         from autoforge.Helper.PruningHelper import (
+            _eff_thick_from_logits,
             _eval_candidates_batch,
             _make_shared_eff_thick,
             disc_to_logits,
@@ -578,11 +605,68 @@ class FilamentOptimizer:
             return False
         n_mat = self.material_colors.shape[0]
         dg, _ = self.get_discretized_solution(best=True)
-        shared = _make_shared_eff_thick(self)
+        start_dg = dg
+        eff_logits = self._apply_height_offset(
+            self.best_params["pixel_height_logits"], self.best_params["height_offsets"]
+        )
+        H, W = eff_logits.shape
+        scale = min(1.0, math.sqrt(self.SEARCH_MAX_PIXELS / float(H * W)))
+        saved = (self.target, self.focus_map, self.alpha)
+        if scale < 1.0:
+            size = (max(8, round(H * scale)), max(8, round(W * scale)))
+            eff_small = F.interpolate(eff_logits[None, None], size=size, mode="nearest")[0, 0]
+            self.target = (
+                F.interpolate(saved[0].permute(2, 0, 1)[None].float(), size=size, mode="area")[0]
+                .permute(1, 2, 0)
+                .contiguous()
+            )
+            if saved[1] is not None:
+                self.focus_map = F.interpolate(saved[1][None, None].float(), size=size, mode="bilinear")[0, 0]
+            shared = _eff_thick_from_logits(eff_small, self.max_layers, self.h, self.vis_tau)
+            # compute_loss resizes the alpha mask itself.
+        else:
+            shared = _make_shared_eff_thick(self)
+        try:
+            improved, dg, cur_loss = self._search_rounds(
+                dg, shared, max_rounds, compound, should_stop, progress, max_candidates
+            )
+        finally:
+            self.target, self.focus_map, self.alpha = saved
+        if improved and scale < 1.0:
+            # Found on the downsampled copy: keep it only if it wins at the
+            # full solver resolution too.
+            full = _make_shared_eff_thick(self)
+            new_loss, _ = _eval_candidates_batch(self, [dg], eff_thick=full)
+            old_loss, _ = _eval_candidates_batch(self, [start_dg], eff_thick=full)
+            del full
+            improved = new_loss < old_loss - 1e-6
+            cur_loss = new_loss
+        if progress is not None:
+            progress(1.0)
+        if improved:
+            self.best_params["global_logits"] = disc_to_logits(dg, n_mat, big_pos=1e5)
+            self.best_discrete_loss = min(self.best_discrete_loss, cur_loss)
+            if self.constrained:
+                self._proj_target.zero_()
+                self._proj_target.scatter_(1, dg.view(-1, 1), 1.0)
+                self._proj_from_search = True
+        return improved
+
+    def _search_rounds(self, dg, shared, max_rounds, compound, should_stop, progress, max_candidates=None):
+        """The rounds of ``constrained_local_search`` against the scoring
+        target currently set (full or downsampled). Returns
+        (improved, stack, loss)."""
+        from autoforge.Helper.ConstraintHelper import neighbour_stacks
+        from autoforge.Helper.PruningHelper import _eval_candidates_batch
+
+        n_mat = self.material_colors.shape[0]
         cur_loss, _ = _eval_candidates_batch(self, [dg], eff_thick=shared)
         improved = False
         rng = np.random.default_rng(self.num_steps_done)
-        for _ in range(max_rounds):
+        for round_i in range(max_rounds):
+            if progress is not None:
+                # The number of rounds isn't known up front: approach 1.
+                progress(round_i / (round_i + 8.0))
             if should_stop is not None and should_stop():
                 break
             cands = neighbour_stacks(dg, n_mat, self.limit_colors, self.limit_swaps, self.base_code)
@@ -593,8 +677,10 @@ class FilamentOptimizer:
             # First improvement over shuffled chunks: most rounds stop after
             # the first chunk instead of scoring the whole neighbourhood.
             order = rng.permutation(len(cands))
+            if max_candidates is not None:
+                order = order[:max_candidates]
             step_ok = False
-            for lo in range(0, len(cands), 256):
+            for lo in range(0, len(order), 256):
                 chunk = [cands[i] for i in order[lo:lo + 256]]
                 loss, best = _eval_candidates_batch(self, chunk, eff_thick=shared, batch_size=64)
                 if loss < cur_loss - 1e-6:
@@ -608,14 +694,7 @@ class FilamentOptimizer:
                     improved = step_ok = True
             if not step_ok:
                 break
-        if improved:
-            self.best_params["global_logits"] = disc_to_logits(dg, n_mat, big_pos=1e5)
-            self.best_discrete_loss = min(self.best_discrete_loss, cur_loss)
-            if self.constrained:
-                self._proj_target.zero_()
-                self._proj_target.scatter_(1, dg.view(-1, 1), 1.0)
-                self._proj_from_search = True
-        return improved
+        return improved, dg, cur_loss
 
     def _apply_height_offset(
         self,
@@ -854,6 +933,46 @@ class FilamentOptimizer:
             self._base_onehot.zero_()
             self._base_onehot[index] = 1.0
 
+    @torch.no_grad()
+    def search_background(self, progress=None) -> bool:
+        """Try every filament as the base under the best solution and keep
+        the best one (by the real discrete loss). Training alone rarely
+        leaves the starting pick - the layers adapt to whatever base they
+        are trained on - so this is where the base is really chosen. With
+        colour/swap limits only bases the stack still keeps them under are
+        tried (the base changes both counts). Returns True if it changed."""
+        from autoforge.Helper.ConstraintHelper import feasible
+        from autoforge.Helper.PruningHelper import _make_shared_eff_thick, candidate_losses
+
+        if self.bg_logits is None or self.best_params is None or "background_index" not in self.best_params:
+            return False
+        dg, _ = self.get_discretized_solution(best=True)
+        shared = _make_shared_eff_thick(self)
+        start = int(self.best_params["background_index"])
+        n_mat = self.material_colors.shape[0]
+        losses = {}
+        for m in range(n_mat):
+            if progress is not None:
+                progress(m / n_mat)
+            if self.constrained and not feasible(dg, self.limit_colors, self.limit_swaps, m):
+                continue
+            self._use_background(m)
+            losses[m] = candidate_losses(self, [dg], shared)[0]
+        del shared
+        vals = {m: float(v) for m, v in losses.items()}  # one sync per base, 14 at most
+        best = min(vals, key=vals.get) if vals else start
+        if start in vals and vals[best] >= vals[start] - 1e-6:
+            best = start
+        self._use_background(best)
+        if progress is not None:
+            progress(1.0)
+        if best != start:
+            self.best_params["background_index"] = torch.tensor(best)
+            self.best_discrete_loss = min(self.best_discrete_loss, vals[best])
+            print(f"Base search: filament {start} -> {best} (loss {vals.get(start, float('nan')):.4f} -> {vals[best]:.4f})")
+            return True
+        return False
+
     def finalize_background(self, args, material_names=None) -> None:
         """After training with --optimize_background: the best solution's
         base filament becomes the base everywhere (export, counts, limits,
@@ -1028,8 +1147,14 @@ class FilamentOptimizer:
                 getattr(self.args, "constrained_opt", False)
                 and self.num_steps_done >= self.args.constraint_full * self.args.iterations
             ):
+                # On a large print a search step costs real time; during
+                # training it looks at one chunk of the neighbourhood per
+                # round there, so a check doesn't stall the run (the final
+                # search after training looks at all of it).
+                large = self.H * self.W > self.SEARCH_MAX_PIXELS
                 self.constrained_local_search(
-                    max_rounds=int(getattr(self.args, "constraint_search_rounds", 3))
+                    max_rounds=int(getattr(self.args, "constraint_search_rounds", 3)),
+                    max_candidates=256 if large else None,
                 )
                 if getattr(self.args, "constraint_pin", True):
                     self._pin_to_best()
@@ -1500,7 +1625,7 @@ class FilamentOptimizer:
         # fine-tune before calling this; the webui turns it on, which is what
         # export_results used to do unconditionally.
         if pre_fine_tune_height and fine_tune_height:
-            self._current_prune_phase = "Fine-tuning height"
+            self._current_prune_phase = "Polishing heights"
             self.polish_height_offsets(
                 num_steps=fine_tune_steps,
                 progress_callback=self._prune_phase_progress,
@@ -1616,7 +1741,8 @@ class FilamentOptimizer:
                 num_steps=fine_tune_steps,
                 progress_callback=self._prune_phase_progress,
             )
-            _prune_callback(self, 95)
+            self._prune_phase_progress(100.0)
+            self._draw_prune_preview()
 
         if _wait_if_paused():
             return False
@@ -1637,7 +1763,6 @@ class FilamentOptimizer:
 
             self._refine_anchor_z = None  # re-captured by the first refine below
 
-            self._current_prune_phase = "Fine-tuning height"
             # With per-pixel heights the best layer stack is a different one
             # than training found for cluster heights: search it under the
             # free-height palette proxy, then re-solve the heights for it.
@@ -1650,21 +1775,33 @@ class FilamentOptimizer:
 
                 from autoforge.Helper.ConstraintHelper import feasible
 
+                self._current_prune_phase = "Searching layer stacks"
                 new_stack = search_stack(
                     self,
                     max_colors_allowed,
                     max_swaps_allowed,
                     rounds=int(getattr(self.args, "stack_search_rounds", 60)),
                     patience=int(getattr(self.args, "stack_search_patience", 15)),
+                    progress=lambda f: self._prune_phase_progress(100.0 * f),
                 )
+                self._prune_phase_progress(100.0)
+                self._current_prune_phase = "Refining pixel heights"
                 # Belt and braces: a stack beyond the limits is never taken,
                 # however much better it looks.
                 if feasible(new_stack, max_colors_allowed, max_swaps_allowed, self.base_code):
-                    kept_new_stack = apply_stack(self, new_stack, refine_sweeps, refine_radius)
+                    kept_new_stack = apply_stack(
+                        self, new_stack, refine_sweeps, refine_radius,
+                        progress=lambda f: self._prune_phase_progress(50.0 * f),
+                    )
+            self._current_prune_phase = "Refining pixel heights"
             if not kept_new_stack:
-                refine_pixel_heights(self, sweeps=refine_sweeps, radius=refine_radius)
+                refine_pixel_heights(
+                    self, sweeps=refine_sweeps, radius=refine_radius,
+                    progress=lambda f: self._prune_phase_progress(50.0 + 50.0 * f),
+                )
+            self._prune_phase_progress(100.0)
             self._refine_left_spikes = True
-            _prune_callback(self, 97)
+            self._draw_prune_preview()
 
         if _wait_if_paused():
             return False
@@ -1685,18 +1822,23 @@ class FilamentOptimizer:
             # The unconstrained pixel refine above builds new towers and
             # counts on this cleanup, so that also licenses the trade - on a
             # repeat prune (webui auto-repeat) refusing it left them in.
+            self._prune_phase_progress(0.0)
             self.post_remove_spikes(
                 allow_regression=self._prune_runs <= 1
                 or getattr(self, "_refine_left_spikes", False)
             )
             self._refine_left_spikes = False
+            self._prune_phase_progress(25.0)
             if pixel_refine:
                 # On a spike-free map a single raised pixel is always a
                 # spike, so single-pixel moves alone get stuck; 2x2 blocks
                 # can be raised without becoming one.
-                refine_pixel_heights(self, sweeps=refine_sweeps, spike_aware=True, radius=refine_radius)
-                refine_pixel_heights(self, sweeps=refine_sweeps, spike_aware=True, block=2, radius=refine_radius)
-                refine_pixel_heights(self, sweeps=refine_sweeps, spike_aware=True, radius=refine_radius)
+                for i, block in enumerate((1, 2, 1)):
+                    refine_pixel_heights(
+                        self, sweeps=refine_sweeps, spike_aware=True, block=block, radius=refine_radius,
+                        progress=lambda f, i=i: self._prune_phase_progress(25.0 + 25.0 * (i + f)),
+                    )
+            self._prune_phase_progress(100.0)
         self._current_prune_phase = None
         # Calculate and Print current loss
         dg, dh = self.get_discretized_solution(best=True)
@@ -2082,13 +2224,19 @@ class FilamentOptimizer:
         self.best_params["height_offsets"] = orig_offsets
         return False
 
+    CHECK_SCOPE_MAX_PIXELS = 65536
+
     def _ensure_check_scope(self) -> None:
         """Keep one composite graph-replay scope open for the rest of a
         constrained run (closed by ``end_check_scope``): the snapshot
         candidates and the limit search composite the same shapes at every
         check, so their graphs are captured once instead of once per check."""
+        # Captured graphs keep their working memory: fine for a small image
+        # (and the limit search's downsampled one), hundreds of MB at a large
+        # print's full solver size (650MB at 500x280), where the composites
+        # are GPU-bound anyway - so only small composites are captured.
         if getattr(self, "_check_scope", None) is None:
-            cm = composite_graph_scope()
+            cm = composite_graph_scope(max_numel=self.max_layers * self.CHECK_SCOPE_MAX_PIXELS)
             cm.__enter__()
             self._check_scope = cm
 

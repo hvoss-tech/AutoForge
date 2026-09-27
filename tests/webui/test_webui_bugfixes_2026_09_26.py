@@ -132,7 +132,7 @@ def test_cancelled_prune_restores_the_result_and_hands_it_back(client, prune_set
 
     svc, job_id, optimizer, broadcasts = prune_setup
 
-    def cancelled_export(result, cancel_event=None, pause_event=None, apply_spike_removal=True):
+    def cancelled_export(result, cancel_event=None, pause_event=None, apply_spike_removal=True, **_kwargs):
         _half_prune(result["optimizer"])
         return {"pruning_completed": False}
 
@@ -151,7 +151,7 @@ def test_failed_prune_restores_the_result_and_hands_it_back(client, prune_setup,
 
     svc, job_id, optimizer, _broadcasts = prune_setup
 
-    def failing_export(result, cancel_event=None, pause_event=None, apply_spike_removal=True):
+    def failing_export(result, cancel_event=None, pause_event=None, apply_spike_removal=True, **_kwargs):
         _half_prune(result["optimizer"])
         raise RuntimeError("CUDA out of memory")
 
@@ -168,7 +168,7 @@ def test_completed_prune_still_keeps_its_result(client, prune_setup, monkeypatch
 
     svc, job_id, optimizer, _broadcasts = prune_setup
 
-    def completed_export(result, cancel_event=None, pause_event=None, apply_spike_removal=True):
+    def completed_export(result, cancel_event=None, pause_event=None, apply_spike_removal=True, **_kwargs):
         _half_prune(result["optimizer"])
         return {"pruning_completed": True}
 

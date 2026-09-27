@@ -426,6 +426,7 @@ def run_init_threads(
     material_colors=None,
     focus_map: Optional[np.ndarray] = None,
     focus_boost: float = 0.5,
+    progress=None,
 ):
     background_tuple = (np.asarray(background_tuple) * 255).tolist()
     if random_seed is None:
@@ -441,6 +442,8 @@ def run_init_threads(
     centroids1, labels1 = _compute_overclustering(pixels, overcluster_k=500, random_state=random_seed)
     print(f"  → {centroids1.shape[0]} over‑cluster centroids computed.")
     del pixels
+    if progress is not None:
+        progress(0.3)
 
     def _run_one(seed_offset: int) -> tuple:
         return init_height_map(
@@ -459,9 +462,18 @@ def run_init_threads(
         # spawn overhead) when there's actually more than one task to
         # spread across it.
         tasks = [delayed(_run_one)(i) for i in range(num_runs)]
-        results = Parallel(n_jobs=num_threads, verbose=10)(tasks)
+        # In order as they finish, so progress can be reported (same results).
+        results = []
+        for r in Parallel(n_jobs=num_threads, verbose=10, return_as="generator")(tasks):
+            results.append(r)
+            if progress is not None:
+                progress(0.3 + 0.7 * len(results) / num_runs)
     else:
-        results = [_run_one(i) for i in range(num_runs)]
+        results = []
+        for i in range(num_runs):
+            results.append(_run_one(i))
+            if progress is not None:
+                progress(0.3 + 0.7 * len(results) / num_runs)
 
     metrics = [(r[2] / r[3]) / (r[4] + 1e-6) for r in results]
     mean_metric = np.mean(metrics)

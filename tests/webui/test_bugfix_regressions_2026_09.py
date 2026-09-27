@@ -405,7 +405,7 @@ def test_optimization_reports_phases(client, monkeypatch):
         return {"cancelled": False}
 
     monkeypatch.setattr(opt_api, "_run_pipeline", fake_pipeline)
-    monkeypatch.setattr("autoforge.webui.helpers.pipeline_runner.export_results", lambda result: None)
+    monkeypatch.setattr("autoforge.webui.helpers.pipeline_runner.export_results", lambda result, **_kwargs: None)
 
     import os
     from autoforge.webui.config import config

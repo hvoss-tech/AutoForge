@@ -49,6 +49,7 @@ test('after a run every base display shows the base the optimizer chose', async 
   // Print plan.
   await byTestId(page, 'tab-print-plan').click()
   expect(await bg(byTestId(page, 'plan-base-swatch'))).toBe(rgb(base.color))
+  await expect(byTestId(page, 'plan-base-label')).toHaveText(`E2E Brand - ${chosen!.name}`)
   await byTestId(page, 'tab-color-layers').click()
 
   // Settings: the automatic base shows what was chosen for this picture.

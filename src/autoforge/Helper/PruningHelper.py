@@ -323,6 +323,46 @@ def _material_select_batched_seeds(
     return cols, tds
 
 
+def candidate_losses(
+    optimizer: FilamentOptimizer,
+    dg_candidates: list,
+    eff_thick: torch.Tensor,
+    batch_size: int = 0,
+) -> torch.Tensor:
+    """[N] discrete losses of the candidate stacks against the shared
+    ``eff_thick``, kept on the device (no host sync)."""
+    num_materials = optimizer.material_colors.shape[0]
+    L = dg_candidates[0].shape[0]
+    n_cands = len(dg_candidates)
+    # --pruning_batch_size: how many candidates share one material-selection
+    # pass ([B, L, M] logits). Selection is independent per candidate, so
+    # the result does not depend on it.
+    step = batch_size if batch_size > 0 else n_cands
+    losses = []
+    for lo in range(0, n_cands, step):
+        chunk = dg_candidates[lo:lo + step]
+        # Build batched global_logits [B, L, M] with one scatter_ instead of
+        # a Python loop building B separate [L, M] tensors.
+        dg_batch = torch.stack(chunk, dim=0)  # [B, L]
+        gl_batch = dg_batch.new_full(
+            (len(chunk), L, num_materials), fill_value=-1e5, dtype=torch.float32
+        )
+        gl_batch.scatter_(
+            dim=2, index=dg_batch.contiguous().to(torch.long).unsqueeze(-1), value=1e5
+        )
+        # Material selection — batched (shared prefix)
+        cols, tds = _material_select_batched(
+            gl_batch, optimizer.material_colors, optimizer.material_TDs,
+            rng_seed=optimizer.best_seed, tau=optimizer.vis_tau,
+        )
+        del gl_batch
+        # Composite + loss per candidate — iterative, no [B, L, H, W]
+        for b in range(len(chunk)):
+            with _gpu_lock, torch.no_grad():
+                losses.append(_candidate_loss(optimizer, eff_thick, cols[b], tds[b]))
+    return torch.stack(losses)
+
+
 def _eval_candidates_batch(
     optimizer: FilamentOptimizer,
     dg_candidates: list[torch.Tensor],
@@ -348,41 +388,8 @@ def _eval_candidates_batch(
     if eff_thick is None:
         eff_thick = _make_shared_eff_thick(optimizer)
 
-    num_materials = optimizer.material_colors.shape[0]
-    L = dg_candidates[0].shape[0]
-    # --pruning_batch_size: how many candidates share one material-selection
-    # pass ([B, L, M] logits). It used to be read only as an on/off switch,
-    # every candidate of a chunk went into one batch whatever the value.
-    # Selection is independent per candidate, so the result does not depend
-    # on it.
-    step = batch_size if batch_size > 0 else n_cands
-
-    losses = []
-    for lo in range(0, n_cands, step):
-        chunk = dg_candidates[lo:lo + step]
-        # Build batched global_logits [B, L, M] with one scatter_ instead of
-        # a Python loop building B separate [L, M] tensors.
-        dg_batch = torch.stack(chunk, dim=0)  # [B, L]
-        gl_batch = dg_batch.new_full(
-            (len(chunk), L, num_materials), fill_value=-1e5, dtype=torch.float32
-        )
-        gl_batch.scatter_(
-            dim=2, index=dg_batch.contiguous().to(torch.long).unsqueeze(-1), value=1e5
-        )
-
-        # Material selection — batched (shared prefix)
-        cols, tds = _material_select_batched(
-            gl_batch, optimizer.material_colors, optimizer.material_TDs,
-            rng_seed=optimizer.best_seed, tau=optimizer.vis_tau,
-        )
-        del gl_batch
-
-        # Composite + loss per candidate — iterative, no [B, L, H, W]
-        for b in range(len(chunk)):
-            with _gpu_lock, torch.no_grad():
-                losses.append(_candidate_loss(optimizer, eff_thick, cols[b], tds[b]))
-
-    best_loss_t, best_idx_t = torch.min(torch.stack(losses), dim=0)
+    losses = candidate_losses(optimizer, dg_candidates, eff_thick, batch_size)
+    best_loss_t, best_idx_t = torch.min(losses, dim=0)
     best_idx = int(best_idx_t.item())
     return best_loss_t.item(), dg_candidates[best_idx]
 

@@ -775,6 +775,7 @@ def _initialize_heightmap(
     bg_rgb: Tuple[float, float, float],
     material_colors_np: np.ndarray,
     random_seed: int,
+    progress=None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """Initialize the height map logits & labels using selected method.
 
@@ -822,6 +823,7 @@ def _initialize_heightmap(
                 material_colors=material_colors_np,
                 focus_map=None,
                 num_runs=args.num_init_rounds,
+                progress=progress,
             )
         )
     return pixel_height_logits_init, global_logits_init, pixel_height_labels
@@ -1386,6 +1388,7 @@ def start(args) -> float:
     with torch.no_grad():
         for _ in range(60):
             optimizer._maybe_update_best_discrete()
+        optimizer.search_background()
         if args.constrained_opt:
             optimizer.constrained_local_search(compound=True)
         optimizer.end_check_scope()

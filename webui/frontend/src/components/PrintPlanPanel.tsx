@@ -26,7 +26,12 @@ export const PrintPlanPanel: React.FC = () => {
   const settings = useMemo(() => withEffectiveBaseColor(rawSettings, resolvedBase), [rawSettings, resolvedBase])
   const known = useMemo(() => [...activeFilaments, ...filaments], [activeFilaments, filaments])
   const plan = useMemo(() => buildPrintPlan(colorSliders, known, settings), [colorSliders, known, settings])
-  const text = useMemo(() => printPlanText(plan, settings), [plan, settings])
+  // The base's filament (with auto-selection: the one the optimizer chose).
+  const baseFilament = useMemo(
+    () => known.find((f) => f.uuid === settings.base_filament_uuid) ?? null,
+    [known, settings.base_filament_uuid],
+  )
+  const text = useMemo(() => printPlanText(plan, settings, baseFilament), [plan, settings, baseFilament])
 
   if (plan.bands.length === 0) {
     return (
@@ -92,7 +97,9 @@ export const PrintPlanPanel: React.FC = () => {
               <td className="px-3 py-1.5">
                 <span className="inline-flex items-center gap-1.5">
                   <span className="w-3 h-3 rounded-full border border-gray-600" style={{ backgroundColor: settings.background_color }} data-testid="plan-base-swatch" />
-                  Base / background color
+                  <span data-testid="plan-base-label">
+                    {baseFilament ? [baseFilament.brand, baseFilament.name].filter(Boolean).join(' - ') : 'Base / background color'}
+                  </span>
                 </span>
               </td>
             </tr>

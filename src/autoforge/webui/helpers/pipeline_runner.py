@@ -156,6 +156,7 @@ def build_pipeline_state(
     output_dir: str,
     settings: dict,
     device: Optional[torch.device] = None,
+    init_progress: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     """Everything ``run_pipeline()`` does up to (and including) building the
     ``FilamentOptimizer`` — material/image loading, background selection,
@@ -286,6 +287,7 @@ def build_pipeline_state(
             bg_rgb,
             material_colors_np,
             random_seed,
+            progress=init_progress,
         )
     )
 
@@ -371,9 +373,13 @@ def run_pipeline(
     progress_callback: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
+    phase_callback: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     """Build the pipeline state (see ``build_pipeline_state()``) and run the
     full gradient-descent training loop.
+
+    ``phase_callback(phase, fraction)`` (optional) reports the steps around
+    training: the height estimate before it and the final limit search after.
 
     Parameters mirror ``build_pipeline_state()`` plus:
 
@@ -390,8 +396,11 @@ def run_pipeline(
     dict
         Same shape as ``build_pipeline_state()``, plus ``cancelled``.
     """
+    report = phase_callback or (lambda phase, fraction: None)
+    report("Estimating heights", 0.0)
     state = build_pipeline_state(
-        input_image_path, active_filaments, output_dir, settings, device=device
+        input_image_path, active_filaments, output_dir, settings, device=device,
+        init_progress=lambda f: report("Estimating heights", f),
     )
     optimizer = state["optimizer"]
     args = state["args"]
@@ -409,12 +418,18 @@ def run_pipeline(
     )
 
     cancelled = cancel_event is not None and cancel_event.is_set()
+    if not cancelled and optimizer.bg_logits is not None:
+        report("Choosing the base filament", 0.0)
+        with torch.no_grad():
+            optimizer.search_background(progress=lambda f: report("Choosing the base filament", f))
     if not cancelled and getattr(args, "constrained_opt", False):
         # Same finish as the CLI: a last search over stacks within the
         # limits, scored on the real loss (never leaves them).
+        report("Refining within the limits", 0.0)
         optimizer.constrained_local_search(
             compound=True,
             should_stop=(lambda: cancel_event.is_set()) if cancel_event is not None else None,
+            progress=lambda f: report("Refining within the limits", f),
         )
         cancelled = cancel_event is not None and cancel_event.is_set()
     optimizer.end_check_scope()
@@ -556,6 +571,7 @@ def export_results(
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
     apply_spike_removal: bool = True,
+    export_progress: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     """Generate STL, preview PNG, swap instructions, project file and
     colored PLY mesh from the state dict produced by ``run_pipeline()``.
@@ -665,6 +681,8 @@ def export_results(
             )
 
             # ---- Final loss ----
+            if export_progress is not None:
+                export_progress(0.0)
             from autoforge.Helper.PruningHelper import get_initial_loss
 
             final_loss = get_initial_loss(
@@ -674,6 +692,8 @@ def export_results(
                 f.write(f"{final_loss}")
 
             # ---- Preview PNG ----
+            if export_progress is not None:
+                export_progress(0.1)
             comp_disc = optimizer.get_best_discretized_image()
             args.max_layers = optimizer.max_layers
 
@@ -683,6 +703,8 @@ def export_results(
             cv2.imwrite(preview_path, comp_disc_np)
 
             # ---- STL ----
+            if export_progress is not None:
+                export_progress(0.2)
             height_map_mm = (
                 disc_height_image.cpu().numpy().astype(np.float32)
             ) * args.layer_height
@@ -714,6 +736,8 @@ def export_results(
                 )
 
             # ---- Colored PLY mesh ----
+            if export_progress is not None:
+                export_progress(0.45)
             color_image_np = cv2.cvtColor(comp_disc_np, cv2.COLOR_BGR2RGB)
             if color_image_np.shape[0] != height_map_mm.shape[0] or color_image_np.shape[1] != height_map_mm.shape[1]:
                 from PIL import Image
@@ -741,6 +765,8 @@ def export_results(
             colored_mesh.export(ply_path, encoding='binary')
 
             # ---- Swap instructions (traditional mode only) ----
+            if export_progress is not None:
+                export_progress(0.8)
             swap_path = None
             if not args.flatforge:
                 from autoforge.Helper.OutputHelper import generate_swap_instructions
@@ -764,6 +790,8 @@ def export_results(
                         f.write(line + "\n")
 
             # ---- Project file (traditional mode only) ----
+            if export_progress is not None:
+                export_progress(0.9)
             # generate_project_file() reads its material data from a CSV on
             # disk (args.csv_file) rather than from the active_filaments list
             # directly. run_pipeline() blanks args.csv_file/json_file up
@@ -813,6 +841,8 @@ def export_results(
                 )
 
             print("All done. Outputs in:", args.output_folder)
+            if export_progress is not None:
+                export_progress(1.0)
 
             return {
                 "preview_png": preview_path,

@@ -206,12 +206,11 @@ test('the polish passes report their own phases in order, before any reduction',
 
   // Both searches feed the greedy reduction phases a better starting point,
   // so no polish phase may appear after a reduction phase has started.
-  const POLISH = ['Searching color seeds', 'Fine-tuning height']
+  const POLISH = ['Searching color seeds', 'Polishing heights']
   const firstReduction = phases.findIndex((p) => p.startsWith('Reducing'))
   expect(firstReduction, `no reduction phase seen in ${JSON.stringify(phases)}`).toBeGreaterThanOrEqual(0)
-  // "Fine-tuning height" runs again *after* the reductions by design (the
-  // offsets that suited 45 layers rarely suit 20), so only the first
-  // occurrence of each is checked against the reductions.
+  // (The height fine-tune that runs again *after* the reductions, for the
+  // reduced stack, reports as "Fine-tuning height".)
   for (const phase of POLISH) {
     const at = phases.indexOf(phase)
     if (at >= 0) expect(at, `${phase} ran after reducing started`).toBeLessThan(firstReduction)

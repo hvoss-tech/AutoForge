@@ -118,8 +118,11 @@ def refine_pixel_heights(
     radius: int = -1,
     spike_aware: bool = False,
     block: int = 1,
+    progress=None,
 ) -> bool:
     """Coordinate descent over per-pixel heights (see module docstring).
+
+    ``progress`` (optional) is called with the fraction 0-1 of the sweeps done.
 
     ``block`` > 1 moves ``block x block`` squares of pixels to one common
     height instead of single pixels (classes then repeat every block+2
@@ -211,10 +214,15 @@ def refine_pixel_heights(
         pal = srgb_to_lab(_stack_palette(optimizer, dg.to(torch.long), (layer < kk).float() * optimizer.h))
         pz = torch.cdist(target_lab.reshape(-1, 3), pal).argmin(dim=1).view(H, W)
 
+    total_steps = max(1, sweeps * len(classes))
+    done_steps = 0
     with torch.no_grad():
         for _ in range(sweeps):
             changed = 0
             for anchor, member, ay, ax in classes:
+                if progress is not None:
+                    progress(done_steps / total_steps)
+                done_steps += 1
                 best_err = window_err(z)
                 best_z = z.clone()
                 cand_maps = (
@@ -415,7 +423,7 @@ def refine_stack_palette(
     return best_dg
 
 
-def apply_stack(optimizer, dg: torch.Tensor, refine_sweeps: int = 2, radius: int = -1) -> bool:
+def apply_stack(optimizer, dg: torch.Tensor, refine_sweeps: int = 2, radius: int = -1, progress=None) -> bool:
     """Swap in stack ``dg``, re-solve the heights per pixel, and keep the
     result only if the real loss beats the current solution."""
     from autoforge.Helper.PruningHelper import disc_to_logits
@@ -425,7 +433,7 @@ def apply_stack(optimizer, dg: torch.Tensor, refine_sweeps: int = 2, radius: int
     optimizer.best_params["global_logits"] = disc_to_logits(
         dg, optimizer.material_colors.shape[0], big_pos=1e5
     )
-    refine_pixel_heights(optimizer, sweeps=refine_sweeps, radius=radius)
+    refine_pixel_heights(optimizer, sweeps=refine_sweeps, radius=radius, progress=progress)
     after = optimizer.solution_loss()
     if after is None or before is None or after >= before:
         optimizer.restore_solution_snapshot(snap)
@@ -645,6 +653,7 @@ def search_stack(
     init_dg: torch.Tensor = None,
     proxy: "PaletteProxy" = None,
     verbose: bool = True,
+    progress=None,
 ) -> torch.Tensor:
     """Greedy stack search under the palette proxy with a large neighbourhood.
 
@@ -671,7 +680,11 @@ def search_stack(
         best_t = proxy(cur[None])[0].double()
         start = float(best_t)
         # Coordinate descent: all materials for one layer per batch.
-        for _ in range(12):
+        # Progress: the descent is the first fifth, the rounds the rest (an
+        # early stop jumps to the end).
+        for sweep_i in range(12):
+            if progress is not None:
+                progress(0.2 * sweep_i / 12)
             improved = torch.zeros((), dtype=torch.bool, device=dev)
             for layer in range(L - 1, -1, -1):
                 c = cur.repeat(M, 1)
@@ -720,6 +733,8 @@ def search_stack(
 
         stall = 0
         for _r in range(rounds):
+            if progress is not None:
+                progress(0.2 + 0.8 * _r / max(rounds, 1))
             cands = []
             a = int(torch.randint(0, L, (1,), generator=g))
             lo, hi = max(0, a - 6), min(L, a + 7)

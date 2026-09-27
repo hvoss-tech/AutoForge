@@ -192,27 +192,43 @@ async def start_pruning(settings: PruningSettings):
             # the progress doesn't stall at 0% for a phase that never runs.
             # They report a plain 0-100 fraction of their own work
             # (_prune_phase_progress), unlike the older phases below.
-            DIRECT_PERCENT_PHASES = {"Searching color seeds", "Fine-tuning height"}
+            DIRECT_PERCENT_PHASES = {
+                "Searching color seeds",
+                "Polishing heights",
+                "Fine-tuning height",
+                "Searching layer stacks",
+                "Refining pixel heights",
+                "Removing spikes",
+                "Saving the result",
+            }
+            pixel_refine = getattr(args, "pixel_height_refine", True)
             phases = [
                 *(["Searching color seeds"] if settings.seed_search else []),
-                *(["Fine-tuning height"] if settings.fine_tune_height else []),
+                *(["Polishing heights"] if settings.fine_tune_height else []),
                 "Reducing colors",
                 "Reducing swaps",
                 "Reducing layers",
                 "Optimising swap positions",
-                # prune()'s own unconditional closing polish — a second
-                # height fine-tune (reported under the same "Fine-tuning
-                # height" name; the `.index()` lookup below finds its
-                # *first* occurrence, which is fine — its progress is
-                # cosmetic this late) followed by spike cleanup, gated on
-                # `args.spike_removal` exactly as Optimizer.prune() gates it.
-                # Without an entry here, "Removing spikes" was an unknown
-                # phase name and fell into the *first* bucket instead of the
-                # last, so the bar visibly jumped backward right as pruning
-                # was finishing.
+                # prune()'s closing steps, in its order: the height fine-tune
+                # for the reduced stack (with the polish setting), the stack
+                # search and per-pixel height refinement, then spike cleanup
+                # gated on `args.spike_removal` exactly as Optimizer.prune()
+                # gates it. An unknown phase name goes into the *last* bucket
+                # (see below), never back to 0%.
+                *(["Fine-tuning height"] if settings.fine_tune_height else []),
+                *(["Searching layer stacks"] if pixel_refine and getattr(args, "stack_search", True) else []),
+                *(["Refining pixel heights"] if pixel_refine else []),
                 *(["Removing spikes"] if getattr(args, "spike_removal", True) else []),
+                # Writing the pruned result's files (export_results).
+                "Saving the result",
             ]
-            phase_slice = 100.0 / len(phases)
+            # Slices weighted by how long each step usually takes, so the bar
+            # moves at a roughly even pace.
+            WEIGHTS = {"Searching layer stacks": 2.0, "Refining pixel heights": 2.0, "Removing spikes": 2.0}
+            weights = [WEIGHTS.get(p, 1.0) for p in phases]
+            total_weight = sum(weights)
+            slice_start = [100.0 * sum(weights[:i]) / total_weight for i in range(len(phases))]
+            slice_width = [100.0 * w / total_weight for w in weights]
             _last = 0.0
             _phase_min_seen: dict[str, float] = {}
             # Re-deriving the discrete solution means a full discretize pass
@@ -261,7 +277,8 @@ async def start_pruning(settings: PruningSettings):
                 # named phases run in a fixed, append-only order, so bucket
                 # it at the end rather than jumping the bar back to 0%.
                 phase_idx = phases.index(phase_name) if phase_name in phases else len(phases) - 1
-                bucket_start = phase_idx * phase_slice
+                bucket_start = slice_start[phase_idx]
+                phase_slice = slice_width[phase_idx]
 
                 if phase_name in DIRECT_PERCENT_PHASES:
                     # Reported as a plain 0-100 fraction of this phase's work.
@@ -399,6 +416,7 @@ async def start_pruning(settings: PruningSettings):
                     cancel_event=cancel_event,
                     pause_event=pause_event,
                     apply_spike_removal=apply_spikes,
+                    export_progress=lambda f: _prune_progress(optimizer, 100.0 * f, phase="Saving the result"),
                 )
                 # Cancelled between phases. The frontend stays on the result
                 # pruning started from, so the solution is rolled back to it

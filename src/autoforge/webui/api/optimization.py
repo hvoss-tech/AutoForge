@@ -185,6 +185,29 @@ async def start_optimization(settings: OptimizationSettings):
             cancel_event = svc.cancel_event(job.job_id)
             pause_event = svc.pause_event(job.job_id)
 
+            # The whole run on one bar, each step in its own slice so the bar
+            # keeps moving: the height estimate, training, the final search
+            # within the colour/swap limits (only with limits) and the export.
+            limited = settings.max_colors is not None or settings.max_swaps is not None
+            train_end = 88.0 if limited else 95.0
+            slices = {
+                "Estimating heights": (0.0, 5.0),
+                "Optimizing": (5.0, train_end - 1.0),
+                "Choosing the base filament": (train_end - 1.0, train_end),
+                "Refining within the limits": (train_end, 95.0),
+                "Exporting results": (95.0, 100.0),
+            }
+
+            def _overall(phase, fraction):
+                lo, hi = slices[phase]
+                return lo + (hi - lo) * min(1.0, max(0.0, float(fraction)))
+
+            def _phase_callback(phase, fraction):
+                try:
+                    svc.update_status(job.job_id, "running", phase=phase, progress=_overall(phase, fraction))
+                except Exception:
+                    pass
+
             def _progress_callback(opt, step):
                 """Lightweight progress update — always succeeds regardless of image generation."""
                 try:
@@ -196,7 +219,7 @@ async def start_optimization(settings: OptimizationSettings):
                     ) if opt.best_discrete_loss is not None else None
                     svc.update_status(
                         job.job_id, "running",
-                        progress=min(100.0, (step / total) * 100),
+                        progress=_overall("Optimizing", step / total),
                         iteration=step,
                         loss=loss_val,
                         total_iterations=settings.iterations,
@@ -224,7 +247,7 @@ async def start_optimization(settings: OptimizationSettings):
                         b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
                         svc.update_status(
                             job.job_id, "running",
-                            progress=min(100.0, (step / max(settings.iterations, 1)) * 100),
+                            progress=_overall("Optimizing", step / max(settings.iterations, 1)),
                             iteration=step, loss=loss_val,
                             preview_image=b64,
                             total_iterations=settings.iterations,
@@ -253,6 +276,7 @@ async def start_optimization(settings: OptimizationSettings):
                 progress_callback=_progress_callback,
                 cancel_event=cancel_event,
                 pause_event=pause_event,
+                phase_callback=_phase_callback,
             )
 
             run_device = result.get("device")
@@ -270,10 +294,10 @@ async def start_optimization(settings: OptimizationSettings):
             logger.info("Optimization completed: job_id=%s", job.job_id)
 
             # Generate output files (STL, colored PLY, preview PNG, swap instructions)
-            svc.update_status(job.job_id, "running", phase="Exporting results")
+            _phase_callback("Exporting results", 0.0)
             try:
                 from ..helpers.pipeline_runner import export_results
-                export_results(result)
+                export_results(result, export_progress=lambda f: _phase_callback("Exporting results", f))
                 logger.info("Output files written to %s", output_dir)
             except Exception as exc:
                 # A run whose export failed (e.g. OOM building the full-res

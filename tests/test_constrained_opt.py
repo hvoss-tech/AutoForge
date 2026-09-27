@@ -552,3 +552,45 @@ def test_swap_instructions_skip_a_first_band_in_the_base_filament():
     assert "At layer #4 (0.36mm) swap to Blue" in with_base
     other_base = "\n".join(generate_swap_instructions(dg, height, 0.04, 6, 0.24, names, "Red", 0))
     assert "At layer #2 (0.28mm) swap to White" in other_base
+
+
+# --------------------------------------------------------------------------
+# Progress: every step of a run and of pruning reports it
+
+
+def test_webui_run_and_prune_report_progress_for_every_step(tmp_path, _cli_inputs):
+    import copy
+
+    from autoforge.webui.helpers.pipeline_runner import export_results, run_pipeline
+
+    img_path, csv = _cli_inputs
+    colors = ["#000000", "#ffffff", "#ff0000", "#00aa00", "#0000ff", "#ffff00"]
+    fil = [{"color": c, "td": 2.0, "name": f"T - {c}", "brand": "T", "short_name": c, "owned": False,
+            "uuid": f"u{i}", "filament_type": "PLA"} for i, c in enumerate(colors)]
+    seen = []
+    state = run_pipeline(str(img_path), fil, str(tmp_path / "w"), dict(
+        iterations=60, stl_output_size=20, num_init_rounds=2, discrete_check=10, visualize=False,
+        cuda_graph=False, random_seed=1, max_colors=3, max_swaps=4),
+        phase_callback=lambda phase, f: seen.append((phase, f)))
+    for phase in ("Estimating heights", "Refining within the limits"):
+        fr = [f for p, f in seen if p == phase]
+        assert fr and fr == sorted(fr) and fr[-1] == pytest.approx(1.0), (phase, fr)
+    exported = []
+    export_results(state, export_progress=exported.append)
+    assert exported == sorted(exported) and exported[-1] == 1.0
+
+    # Pruning: its closing steps report 0-100 as they go, not only at the end.
+    prune = dict(state)
+    args = copy.copy(state["args"])
+    args.perform_pruning = True
+    args.pruning_max_colors, args.pruning_max_swaps, args.pruning_max_layer = 3, 4, 12
+    args.output_folder = str(tmp_path / "p")
+    (tmp_path / "p").mkdir()
+    prune["args"] = args
+    reports = []
+    opt = state["optimizer"]
+    opt.preview_callback = lambda _o, pct, phase=None, loss=None: reports.append((phase, float(pct)))
+    export_results(prune)
+    for phase in ("Searching layer stacks", "Refining pixel heights", "Removing spikes"):
+        pcts = [p for ph, p in reports if ph == phase]
+        assert len(pcts) >= 3 and pcts[-1] == 100.0, (phase, pcts)

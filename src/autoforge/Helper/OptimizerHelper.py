@@ -1061,19 +1061,29 @@ def _graph_thread_state():
         st.depth = 0
         st.cache = OrderedDict()
         st.pool = None
+        st.max_numel = None
     return st
 
 
 @contextmanager
-def composite_graph_scope():
+def composite_graph_scope(max_numel: Optional[int] = None):
     """Enable CUDA graph replay of repeated composites for the enclosed block
     in the current thread (also usable as a decorator). Captured graphs and
-    their memory are released when the thread's outermost scope exits."""
+    their memory are released when the thread's outermost scope exits.
+
+    ``max_numel``: only capture calls whose first tensor is at most this
+    large (bigger ones run eagerly) - for a long-lived scope, whose graphs
+    would otherwise keep a large composite's working memory. An inner scope
+    without it keeps the outer one's cap."""
     st = _graph_thread_state()
     st.depth += 1
+    prev_cap = st.max_numel
+    if max_numel is not None:
+        st.max_numel = max_numel
     try:
         yield
     finally:
+        st.max_numel = prev_cap
         st.depth -= 1
         if st.depth == 0:
             st.cache.clear()
@@ -1089,7 +1099,11 @@ def _replay_captured(fn, key: str, tensors: list, *rest):
     st = _graph_thread_state()
     if not tensors[0].is_cuda or torch.cuda.is_current_stream_capturing():
         return fn(*tensors, *rest)
-    if st.depth == 0 or (torch.is_grad_enabled() and any(t.requires_grad for t in tensors)):
+    if (
+        st.depth == 0
+        or (st.max_numel is not None and tensors[0].numel() > st.max_numel)
+        or (torch.is_grad_enabled() and any(t.requires_grad for t in tensors))
+    ):
         with _capture_lock:
             return fn(*tensors, *rest)
     full_key = (

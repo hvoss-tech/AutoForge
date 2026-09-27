@@ -706,7 +706,7 @@ def test_auto_repeat_pruning_applies_spike_removal_only_on_the_final_pass(client
 
     calls: list[bool] = []
 
-    def fake_export_results(result, cancel_event=None, pause_event=None, apply_spike_removal=True):
+    def fake_export_results(result, cancel_event=None, pause_event=None, apply_spike_removal=True, **_kwargs):
         calls.append(apply_spike_removal)
         return {"pruning_completed": True}
 
@@ -753,7 +753,7 @@ def test_single_pass_pruning_still_applies_spike_removal(client, monkeypatch):
 
     calls: list[bool] = []
 
-    def fake_export_results(result, cancel_event=None, pause_event=None, apply_spike_removal=True):
+    def fake_export_results(result, cancel_event=None, pause_event=None, apply_spike_removal=True, **_kwargs):
         calls.append(apply_spike_removal)
         return {"pruning_completed": True}
 
@@ -814,7 +814,7 @@ def test_successful_prune_clones_into_its_own_job_and_directory(client, monkeypa
 
     captured_output_dirs = []
 
-    def fake_export_results(result, cancel_event=None, pause_event=None, apply_spike_removal=True):
+    def fake_export_results(result, cancel_event=None, pause_event=None, apply_spike_removal=True, **_kwargs):
         captured_output_dirs.append(result["args"].output_folder)
         return {"pruning_completed": True}
 

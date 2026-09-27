@@ -116,8 +116,10 @@ export const FileMenu: React.FC = () => {
     // The instructions name the base color to start with, so they have to use
     // the one the pipeline resolved rather than the stale setting.
     const planSettings = withEffectiveBaseColor(settings, resolvedBase)
-    const plan = buildPrintPlan(colorSliders, [...activeFilaments, ...filaments], planSettings)
-    downloadBlob(new Blob([printPlanText(plan, planSettings)], { type: 'text/plain' }), 'swap_instructions.txt')
+    const known = [...activeFilaments, ...filaments]
+    const plan = buildPrintPlan(colorSliders, known, planSettings)
+    const baseFilament = known.find((f) => f.uuid === planSettings.base_filament_uuid) ?? null
+    downloadBlob(new Blob([printPlanText(plan, planSettings, baseFilament)], { type: 'text/plain' }), 'swap_instructions.txt')
   }
 
   const handleImage = () => {

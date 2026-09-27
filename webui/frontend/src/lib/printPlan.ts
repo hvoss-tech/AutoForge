@@ -119,14 +119,18 @@ const filamentLabel = (f: Filament | null) => (f ? [f.brand, f.name].filter(Bool
 
 /** Same wording as the optimizer's swap_instructions.txt, but for the
  * slider stack as currently edited. */
-export function printPlanText(plan: PrintPlan, settings: PlanSettings): string {
+/** ``baseFilament``: the filament the base is printed in, when it is one. */
+export function printPlanText(plan: PrintPlan, settings: PlanSettings, baseFilament: Filament | null = null): string {
   const lh = settings.layer_height || 0.04
   const base = settings.background_height || 0
   if (plan.bands.length === 0) return 'No layers printed.'
+  const start = baseFilament
+    ? filamentLabel(baseFilament)
+    : `your background color${settings.background_color ? ` (${settings.background_color})` : ''}`
   const lines = [
-    `Print at 100% infill with a layer height of ${lh.toFixed(2)}mm with a base layer of ${base.toFixed(2)}mm`,
+    `Print at 100% infill with a layer height of ${lh.toFixed(2)}mm with a base layer of ${base.toFixed(2)}mm${baseFilament ? ` using background filament ${filamentLabel(baseFilament)}.` : ''}`,
     '',
-    `Start with your background color${settings.background_color ? ` (${settings.background_color})` : ''}, with a layer height of ${base.toFixed(2)}mm for the first layer.`,
+    `Start with ${start}, with a layer height of ${base.toFixed(2)}mm for the first layer.`,
     ...plan.swapsList.map((s) => `At layer #${s.layerNumber} (${s.heightMm.toFixed(2)}mm) swap to ${filamentLabel(s.filament)}`),
     `For the rest, use ${filamentLabel(plan.bands[plan.bands.length - 1].filament)}`,
   ]
