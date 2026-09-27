@@ -91,6 +91,7 @@ _DEFAULTS = {
     "pruning_max_colors": 100,
     "pruning_max_swaps": 100,
     "pruning_max_layer": 75,
+    "pruning_batch_size": 8,
     "random_seed": 0,
     "device": None,
     "mps": False,
@@ -609,6 +610,10 @@ def export_results(
                     fine_tune_steps=int(getattr(args, "prune_fine_tune_steps", 50)),
                     fast_pruning=args.fast_pruning,
                     fast_pruning_percent=args.fast_pruning_percent,
+                    # Same batched candidate scoring as the CLI (default 8);
+                    # without it pruning fell back to scoring candidates
+                    # one by one from joblib worker threads.
+                    pruning_batch_size=int(getattr(args, "pruning_batch_size", 8)),
                     cancel_event=cancel_event,
                     pause_event=pause_event,
                     apply_spike_removal=apply_spike_removal,

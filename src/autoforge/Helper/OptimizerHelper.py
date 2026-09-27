@@ -1,4 +1,5 @@
 import os
+import threading
 from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Final, Optional
@@ -1078,7 +1079,7 @@ def _replay_captured(fn, key: str, tensors: list, *rest):
     )
     entry = _graph_cache.get(full_key)
     if entry is None:
-        entry = {"calls": 0, "graph": None}
+        entry = {"calls": 0, "graph": None, "threads": set()}
         _graph_cache[full_key] = entry
         while len(_graph_cache) > _GRAPH_CACHE_SIZE:
             _graph_cache.popitem(last=False)
@@ -1087,7 +1088,15 @@ def _replay_captured(fn, key: str, tensors: list, *rest):
 
     if entry["graph"] is None:
         entry["calls"] += 1
-        if entry["calls"] <= _GRAPH_WARM_CALLS:
+        # Capture only in a thread that has already run this call eagerly.
+        # cuBLAS (and other libraries) create their per-thread handles
+        # lazily on first use, and creating one during capture fails
+        # (CUBLAS_STATUS_NOT_INITIALIZED, which also invalidates the
+        # capture). Pruning scores candidates from joblib worker threads, so
+        # the warm-up calls can all have happened on other threads.
+        tid = threading.get_ident()
+        if entry["calls"] <= _GRAPH_WARM_CALLS or tid not in entry["threads"]:
+            entry["threads"].add(tid)
             return fn(*tensors, *rest)
         if _graph_pool is None:
             _graph_pool = torch.cuda.graph_pool_handle()

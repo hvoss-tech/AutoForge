@@ -248,6 +248,55 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--pixel_height_refine",
+        default=True,
+        help="After pruning, refine every pixel's height individually by exact coordinate descent on the discrete loss (spike-aware after spike removal)",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--stack_search",
+        default=True,
+        help="With --pixel_height_refine: search the layer materials under a free-per-pixel-height palette proxy and keep the new stack if it lowers the real loss",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--stack_search_rounds",
+        type=int,
+        default=60,
+        help="Maximum number of perturb-and-descend rounds for --stack_search",
+    )
+    parser.add_argument(
+        "--pixel_height_smoothness",
+        type=float,
+        default=2.0,
+        help="Pixel height refine: cost per layer of height difference to each neighbour, traded against colour error (keeps the height map printable; 0 = colour only)",
+    )
+    parser.add_argument(
+        "--pixel_height_anchor",
+        type=float,
+        default=0.0,
+        help="Pixel height refine: quadratic pull toward the height map pruning started from (0 = off)",
+    )
+    parser.add_argument(
+        "--pixel_height_refine_radius",
+        type=int,
+        default=3,
+        help="Candidate heights for --pixel_height_refine: -1 tries every height; r > 0 tries current +-r plus each pixel's free-height palette optimum (much faster)",
+    )
+    parser.add_argument(
+        "--stack_search_patience",
+        type=int,
+        default=15,
+        help="Stop the --stack_search after this many rounds without improvement",
+    )
+    parser.add_argument(
+        "--pixel_height_refine_sweeps",
+        type=int,
+        default=2,
+        help="Number of sweeps over the image for --pixel_height_refine",
+    )
+
+    parser.add_argument(
         "--pruning_max_colors",
         type=int,
         default=100,

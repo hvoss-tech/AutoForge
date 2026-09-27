@@ -34,7 +34,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 # config before that line ever runs.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+if os.environ.get("AF_DETERMINISTIC") == "1":
+    # Benchmark-only: make repeated runs bit-reproducible so small loss
+    # differences between code versions are measurable.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
+
+if os.environ.get("AF_DETERMINISTIC") == "1":
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 from autoforge.Helper.DeviceUtils import synchronize
 # `autoforge.auto_forge` (and its transitive imports, e.g. Optimizer.py) is

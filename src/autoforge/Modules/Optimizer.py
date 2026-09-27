@@ -1287,6 +1287,53 @@ class FilamentOptimizer:
         if _wait_if_paused():
             return False
 
+        # Per-pixel height descent (see PixelHeightRefine). Training can
+        # only move whole height clusters, so this is where individual
+        # pixels get the height that actually matches their colour - it
+        # roughly halves the loss. It runs before spike removal, which then
+        # cleans up the towers it may have built, and once more afterwards
+        # with moves that would create a new spike ruled out, to win back
+        # most of what the cleanup cost without undoing it.
+        pixel_refine = getattr(self.args, "pixel_height_refine", True)
+        refine_sweeps = int(getattr(self.args, "pixel_height_refine_sweeps", 2))
+        refine_radius = int(getattr(self.args, "pixel_height_refine_radius", 3))
+        do_spikes = apply_spike_removal and getattr(self.args, "spike_removal", False)
+        if pixel_refine:
+            from autoforge.Helper.PixelHeightRefine import refine_pixel_heights
+
+            self._refine_anchor_z = None  # re-captured by the first refine below
+
+            self._current_prune_phase = "Fine-tuning height"
+            # With per-pixel heights the best layer stack is a different one
+            # than training found for cluster heights: search it under the
+            # free-height palette proxy, then re-solve the heights for it.
+            # The search only looks at the target, not at the current
+            # heights, so the current stack's own height refine is only
+            # needed if the new stack loses - it runs as the fallback.
+            kept_new_stack = False
+            if getattr(self.args, "stack_search", True):
+                from autoforge.Helper.PixelHeightRefine import apply_stack, search_stack
+
+                kept_new_stack = apply_stack(
+                    self,
+                    search_stack(
+                        self,
+                        max_colors_allowed,
+                        max_swaps_allowed,
+                        rounds=int(getattr(self.args, "stack_search_rounds", 60)),
+                        patience=int(getattr(self.args, "stack_search_patience", 15)),
+                    ),
+                    refine_sweeps,
+                    refine_radius,
+                )
+            if not kept_new_stack:
+                refine_pixel_heights(self, sweeps=refine_sweeps, radius=refine_radius)
+            self._refine_left_spikes = True
+            _prune_callback(self, 97)
+
+        if _wait_if_paused():
+            return False
+
         # `apply_spike_removal=False` lets a caller that repeats prune() in a
         # loop (webui auto-repeat pruning) skip this on every intermediate
         # pass and run it only once the loop has actually converged:
@@ -1294,13 +1341,27 @@ class FilamentOptimizer:
         # color/swap/layer counts down again next pass, wasted the work and
         # (via allow_regression on the very first pass) paid its accuracy
         # cost on results that were about to be superseded anyway.
-        if apply_spike_removal and getattr(self.args, "spike_removal", False):
+        if do_spikes:
             self._current_prune_phase = "Removing spikes"
             # Only the first prune of this result may trade accuracy for
             # printability; see post_remove_spikes. Without this, pruning the
             # same result again re-applied that trade every time, which is
             # what made repeated pruning visibly worse instead of better.
-            self.post_remove_spikes(allow_regression=self._prune_runs <= 1)
+            # The unconstrained pixel refine above builds new towers and
+            # counts on this cleanup, so that also licenses the trade - on a
+            # repeat prune (webui auto-repeat) refusing it left them in.
+            self.post_remove_spikes(
+                allow_regression=self._prune_runs <= 1
+                or getattr(self, "_refine_left_spikes", False)
+            )
+            self._refine_left_spikes = False
+            if pixel_refine:
+                # On a spike-free map a single raised pixel is always a
+                # spike, so single-pixel moves alone get stuck; 2x2 blocks
+                # can be raised without becoming one.
+                refine_pixel_heights(self, sweeps=refine_sweeps, spike_aware=True, radius=refine_radius)
+                refine_pixel_heights(self, sweeps=refine_sweeps, spike_aware=True, block=2, radius=refine_radius)
+                refine_pixel_heights(self, sweeps=refine_sweeps, spike_aware=True, radius=refine_radius)
         self._current_prune_phase = None
         # Calculate and Print current loss
         dg, dh = self.get_discretized_solution(best=True)
