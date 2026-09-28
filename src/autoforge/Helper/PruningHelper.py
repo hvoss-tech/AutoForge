@@ -33,6 +33,18 @@ _gpu_lock = threading.Lock()
 LAYER_CHUNK = 25
 
 
+def _heights_from_logits(
+    eff_logits: torch.Tensor, max_layers: int, h: float, vis_tau: float
+) -> torch.Tensor:
+    """[H,W] int64 whole-layer heights of effective height logits, exactly as
+    composite_image_disc discretizes them."""
+    pixel_height = (float(max_layers) * h) * torch.sigmoid(eff_logits)  # [H,W]
+    z_cont = pixel_height / h
+    z_disc = adaptive_round(z_cont, vis_tau, 1.0, 0.0, 0.1)
+    z_disc = torch.clamp(z_disc, 0.0, float(max_layers))
+    return torch.round(z_disc).to(torch.int64)
+
+
 def _eff_thick_from_logits(
     eff_logits: torch.Tensor, max_layers: int, h: float, vis_tau: float
 ) -> torch.Tensor:
@@ -44,12 +56,7 @@ def _eff_thick_from_logits(
     composite_image_disc's per-layer material-selection loop.
     """
     device = eff_logits.device
-
-    pixel_height = (float(max_layers) * h) * torch.sigmoid(eff_logits)  # [H,W]
-    z_cont = pixel_height / h
-    z_disc = adaptive_round(z_cont, vis_tau, 1.0, 0.0, 0.1)
-    z_disc = torch.clamp(z_disc, 0.0, float(max_layers))
-    z_int = torch.round(z_disc).to(torch.int64)  # [H,W]
+    z_int = _heights_from_logits(eff_logits, max_layers, h, vis_tau)  # [H,W]
 
     # Filled a chunk at a time: the one-shot version had p_print, the blurred
     # copy and the result all live at once (3 x [L,H,W]), and only the result
@@ -68,6 +75,10 @@ def _eff_thick_from_logits(
         torch.clamp(p_bleed, 0.0, 1.0, out=eff[start:stop])
         eff[start:stop] *= h
         del p_bleed
+    # The whole-layer heights this thickness was built from: candidates
+    # scored against exactly this tensor can use the fused kernel instead
+    # (see _candidate_loss). Slices and edits are new tensors without it.
+    eff._af_z = z_int
     return eff
 
 
@@ -109,7 +120,17 @@ def _candidate_loss(optimizer, eff_thick, cols, tds) -> torch.Tensor:
     Without a focus map or alpha mask the loss is a plain Lab MSE, so it is
     replayed from the same captured graph as the composite (one launch per
     candidate instead of the graph plus ~15 eager loss kernels) - the same
-    ops as compute_loss, so the same result."""
+    ops as compute_loss, so the same result.
+
+    For a thickness built from whole-layer heights (``_eff_thick_from_logits``)
+    the fused kernel scores the candidate straight from those heights, with
+    the same loss (weighted Lab MSE) in fp32."""
+    z = getattr(eff_thick, "_af_z", None)
+    if z is not None:
+        from autoforge.Helper import FusedComposite as fc
+
+        if fc.fused_available(eff_thick):
+            return fc.heights_loss(optimizer, z, cols, tds)
     if optimizer.focus_map is None and optimizer.alpha is None:
         target_lab = getattr(optimizer.target, "_af_lab_cache", None)
         if target_lab is None or target_lab.dtype != torch.float32:
@@ -157,9 +178,16 @@ def _compose_candidate_impl(
     Returns [H, W, 3]
     """
     run_start = material_run_starts(material_colors, material_TDs)
-    reach, slow_reach, cov_w = layer_coverage_params(
-        material_colors, material_TDs, run_start, background, h
-    )
+    from autoforge.Helper import FusedComposite as fc
+
+    if fc.fused_available(material_colors):
+        reach, slow_reach, cov_w = fc.coverage_params(
+            material_colors, material_TDs, run_start, background, h
+        )
+    else:
+        reach, slow_reach, cov_w = layer_coverage_params(
+            material_colors, material_TDs, run_start, background, h
+        )
     return _compose_chunks(
         eff_thick, material_colors, run_start, reach, slow_reach, cov_w,
         background, h, LAYER_CHUNK,
@@ -983,8 +1011,18 @@ def prune_redundant_layers(
         optimizer, optimizer.best_params["pixel_height_logits"].shape
     )
 
-    # Baseline loss with current best parameters
-    best_loss = get_initial_loss(current_max_layers, optimizer)
+    # Baseline loss with current best parameters (the candidates' measure).
+    from autoforge.Helper import FusedComposite as fc
+
+    use_fused = fc.fused_available(optimizer.material_colors)
+    if use_fused:
+        with torch.no_grad():
+            best_loss = float(_fused_logits_loss(
+                optimizer, optimizer.best_params["pixel_height_logits"] + shared_height_offset,
+                optimizer.best_params["global_logits"], current_max_layers,
+            ))
+    else:
+        best_loss = get_initial_loss(current_max_layers, optimizer)
 
     print(
         f"PRUNING: Layer - initial loss={best_loss:.4f}, initial layer={current_max_layers:d}"
@@ -1013,6 +1051,10 @@ def prune_redundant_layers(
             current_height=current_pixel_height,
         )
         eff_logits = cand_params["pixel_height_logits"] + shared_height_offset
+        if use_fused:
+            with _gpu_lock, torch.no_grad():
+                cand_loss = float(_fused_logits_loss(optimizer, eff_logits, cand_params["global_logits"], cand_max_layers))
+            return cand_loss, cand_params, cand_max_layers
         with _gpu_lock, torch.no_grad():
             # The height map genuinely differs per removed-layer candidate,
             # so the [L,H,W] effective-thickness prefix can't be shared here
@@ -1187,6 +1229,20 @@ def prune_redundant_layers(
 
     tbar.close()
     return optimizer.best_params, best_loss, current_max_layers
+
+
+def _fused_logits_loss(optimizer, eff_logits, global_logits, n_layers):
+    """0-dim loss of composite_image_disc(eff_logits, global_logits, ...)
+    through the fused kernel: the same discretized heights and the same
+    seeded per-layer material selection."""
+    from autoforge.Helper import FusedComposite as fc
+
+    z = _heights_from_logits(eff_logits, n_layers, optimizer.h, optimizer.vis_tau)
+    seed = optimizer.best_seed if optimizer.best_seed is not None and optimizer.best_seed >= 0 else 0
+    sel = batched_layer_material_indices(global_logits, optimizer.vis_tau, seed)
+    return fc.heights_loss(
+        optimizer, z, optimizer.material_colors[sel], optimizer.material_TDs[sel].clamp(1e-8, 1e8)
+    )
 
 
 def get_initial_loss(current_max_layers, optimizer):
@@ -1588,6 +1644,23 @@ def _compute_loss_for_heightmap(
     discretization) when compositing the image; otherwise the optimizer's current
     best height logits are used.
     """
+    from autoforge.Helper import FusedComposite as fc
+
+    if custom_height_logits is None and fc.fused_available(optimizer.material_colors):
+        # The same composite and loss through the fused kernel (fp32): the
+        # stack is exactly disc_global and the heights are the discretized
+        # best heights. The final reported loss (get_initial_loss) stays on
+        # composite_image_disc.
+        with _gpu_lock, torch.no_grad():
+            bp = optimizer.best_params
+            z = _heights_from_logits(
+                optimizer._apply_height_offset(bp["pixel_height_logits"], bp["height_offsets"]),
+                optimizer.max_layers, optimizer.h, optimizer.vis_tau,
+            )
+            d = disc_global.to(torch.long)
+            return float(fc.heights_loss(
+                optimizer, z, optimizer.material_colors[d], optimizer.material_TDs[d].clamp(1e-8, 1e8)
+            ))
     logits_for_disc = disc_to_logits(
         disc_global, optimizer.material_colors.shape[0], big_pos=1e5
     )

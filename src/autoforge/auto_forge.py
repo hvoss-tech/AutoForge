@@ -62,6 +62,15 @@ from autoforge.Helper.OutputHelper import (
 )
 from autoforge.Modules.Optimizer import FilamentOptimizer
 
+# TorchScript's tensor-expression fuser compiles a fused kernel the first
+# time each scripted function sees a new input signature. The big [L,H,W]
+# composites are Triton kernels now (see FusedComposite), so what is left
+# for it is small per-layer chains, where the first-call compiles (seconds
+# each, dozens of signatures across training and pruning) cost far more than
+# the fused kernels ever save. AF_TEXPR_FUSER=1 turns it back on.
+if os.environ.get("AF_TEXPR_FUSER", "0") != "1":
+    torch._C._jit_set_texpr_fuser_enabled(False)
+
 # check if we can use torch.set_float32_matmul_precision('high')
 if torch.__version__ >= "2.0.0":
     try:
@@ -1197,7 +1206,13 @@ def _post_optimize_and_export(
                 # the best achievable height first (rather than only
                 # fine-tuning once at the very end) lets every later phase
                 # benefit, not just the final output.
-                optimizer.fine_tune_height_offsets(num_steps=200)
+                # With assigned heights (the default) every pixel already has
+                # its best height for the stack at the output resolution and
+                # the cluster offsets are zero: the offset fine-tune and the
+                # seed search (a different seed reads out a different stack,
+                # judged at heights assigned for this one) cannot win there.
+                if not assigned:
+                    optimizer.fine_tune_height_offsets(num_steps=200)
 
                 # Adjust pruning_max_colors to account for background and clear filament
                 # pruning_max_colors = total filaments needed
@@ -1218,7 +1233,8 @@ def _post_optimize_and_export(
                     max_swaps_allowed=args.pruning_max_swaps,
                     min_layers_allowed=args.min_layers,
                     max_layers_allowed=args.pruning_max_layer,
-                    search_seed=True,
+                    search_seed=not assigned,
+                    fine_tune_height=not assigned,
                     fast_pruning=args.fast_pruning,
                     fast_pruning_percent=args.fast_pruning_percent,
                     pruning_batch_size=args.pruning_batch_size,

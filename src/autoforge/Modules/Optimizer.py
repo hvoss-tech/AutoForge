@@ -2543,9 +2543,8 @@ class FilamentOptimizer:
                 # heights of the most likely stack.
                 from autoforge.Helper.HeightAssign import heights_to_logits
 
-                effective_logits = heights_to_logits(
-                    self.assigned_heights(disc_global, effective_logits), self.max_layers
-                )
+                z_assigned = self.assigned_heights(disc_global, effective_logits)
+                effective_logits = heights_to_logits(z_assigned, self.max_layers)
 
             for disc_global in candidates:
                 # Build discrete global logits from disc_global to avoid
@@ -2555,19 +2554,30 @@ class FilamentOptimizer:
                 )
 
                 # Composite using the already-discretized global assignment
-                comp_disc = composite_image_disc(
-                    effective_logits,
-                    disc_global_logits,
-                    tau_g,
-                    tau_g,
-                    self.h,
-                    self.max_layers,
-                    self.material_colors,
-                    self.material_TDs,
-                    self.background,
-                    rng_seed=seed,
-                    compute_dtype=self.composite_compute_dtype,
-                )
+                # (whole-layer heights under a fixed stack: the fused kernel).
+                from autoforge.Helper import FusedComposite as fc
+
+                if own_heights and fc.fused_available(self.material_colors):
+                    comp_disc = fc.composite_heights(
+                        z_assigned,
+                        fc.stack_params(disc_global, self.material_colors, self.material_TDs, self.background, self.h),
+                        fc.background_tensor(self.background),
+                        self.h,
+                    )
+                else:
+                    comp_disc = composite_image_disc(
+                        effective_logits,
+                        disc_global_logits,
+                        tau_g,
+                        tau_g,
+                        self.h,
+                        self.max_layers,
+                        self.material_colors,
+                        self.material_TDs,
+                        self.background,
+                        rng_seed=seed,
+                        compute_dtype=self.composite_compute_dtype,
+                    )
 
                 current_disc_loss = compute_loss(
                     comp=comp_disc,

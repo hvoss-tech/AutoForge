@@ -743,6 +743,9 @@ def _composite_cont_post(
     return comp * 255.0
 
 
+_USE_FUSED_CONT: bool = os.environ.get("AUTOFORGE_FUSED_CONT", "1") != "0"
+
+
 def composite_image_cont(
     pixel_height_logits: torch.Tensor,  # [H,W]
     global_logits: torch.Tensor,  # [L,M]
@@ -769,6 +772,22 @@ def composite_image_cont(
         compute_dtype,
         gumbel_exp,
     )
+    if (
+        _USE_FUSED_CONT
+        and continuous_z.is_cuda
+        and not ABLATION_BEER_LAMBERT_OPACITY
+    ):
+        # One fused kernel from the print mask on (see FusedComposite): the
+        # same model walked per pixel in registers, fp32 throughout.
+        from autoforge.Helper import FusedComposite as fc
+
+        if fc._HAS_TRITON:
+            reach, slow_reach, cov_w, run_start = fc.cont_coverage_params(
+                p_mat, colors_f32, tds_f32, background, h
+            )
+            return fc.composite_cont_fused(
+                continuous_z, colors_f32, reach, slow_reach, cov_w, run_start, background, h, tau_height
+            )
     if continuous_z.requires_grad:
         eff_thick = torch.utils.checkpoint.checkpoint(
             _print_mask_segment, continuous_z, tau_height, h, max_layers, compute_dtype,

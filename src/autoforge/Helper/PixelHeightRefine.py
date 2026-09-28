@@ -38,6 +38,50 @@ def _heights_to_eff_logits(z: torch.Tensor, max_layers: int) -> torch.Tensor:
     return torch.log(normalized) - torch.log1p(-normalized)
 
 
+def _heights_compositor(optimizer, dg, disc_logits, L):
+    """``f(z) -> [H,W,3]`` discrete composite of integer heights ``z`` under
+    the fixed stack ``dg``: the fused kernel on CUDA (see FusedComposite),
+    else the real composite."""
+    from autoforge.Helper import FusedComposite as fc
+
+    if fc.fused_available(optimizer.material_colors):
+        params = fc.stack_params(dg, optimizer.material_colors, optimizer.material_TDs, optimizer.background, optimizer.h)
+        bg = fc.background_tensor(optimizer.background)
+        return lambda z: fc.composite_heights(z, params, bg, optimizer.h)
+
+    def f(z):
+        return composite_image_disc(
+            _heights_to_eff_logits(z, L), disc_logits, optimizer.vis_tau, optimizer.vis_tau,
+            optimizer.h, L, optimizer.material_colors, optimizer.material_TDs, optimizer.background,
+            rng_seed=optimizer.best_seed, compute_dtype=optimizer.composite_compute_dtype,
+        )
+
+    return f
+
+
+def _heights_error_fn(optimizer, dg, disc_logits, L, target_lab, weights, smooth):
+    """``f(z) -> [H,W]`` per-pixel weighted Lab squared error of heights
+    ``z`` under the fixed stack plus ``smooth`` times the height variation;
+    one fused kernel on CUDA."""
+    from autoforge.Helper import FusedComposite as fc
+
+    if fc.fused_available(optimizer.material_colors):
+        params = fc.stack_params(dg, optimizer.material_colors, optimizer.material_TDs, optimizer.background, optimizer.h)
+        bg = fc.background_tensor(optimizer.background)
+        tl32 = target_lab.to(torch.float32).contiguous()
+        w32 = weights.to(torch.float32).contiguous()
+        return lambda z: fc.heights_error(z, params, bg, optimizer.h, tl32, w32, smooth)
+    composite_z = _heights_compositor(optimizer, dg, disc_logits, L)
+
+    def f(zmap):
+        e = (srgb_to_lab(composite_z(zmap)) - target_lab).pow(2).sum(-1) * weights
+        if smooth > 0:
+            e = e + smooth * _height_variation(zmap)
+        return e
+
+    return f
+
+
 def _pixel_weights(optimizer, shape):
     """Per-pixel loss weights matching compute_loss (focus map / alpha)."""
     w = torch.ones(shape, device=optimizer.device, dtype=torch.float32)
@@ -78,6 +122,10 @@ def _height_variation(z: torch.Tensor) -> torch.Tensor:
 
 def _median3(z: torch.Tensor) -> torch.Tensor:
     """3x3 median of an integer height map (replicate border)."""
+    from autoforge.Helper import FusedComposite as fc
+
+    if fc.fused_available(z):
+        return fc.median3(z)
     H, W = z.shape
     pad = F.pad(z.float()[None, None], (1, 1, 1, 1), mode="replicate")
     return F.unfold(pad, 3)[0].median(dim=0)[0].view(H, W).to(z.dtype)
@@ -85,6 +133,10 @@ def _median3(z: torch.Tensor) -> torch.Tensor:
 
 def spike_mask(z: torch.Tensor, threshold: float, max_outliers: int = 2) -> torch.Tensor:
     """Pixels the first pass of ``remove_height_spikes`` would flag."""
+    from autoforge.Helper import FusedComposite as fc
+
+    if fc.fused_available(z):
+        return fc.spike_mask(z, threshold, max_outliers)
     H, W = z.shape
     pad = F.pad(z.float().view(1, 1, H, W), (1, 1, 1, 1), mode="replicate")
     wins = F.unfold(pad, kernel_size=3)[0]  # [9, H*W]
@@ -167,25 +219,12 @@ def refine_pixel_heights(
     z_anchor_f = z_anchor.to(torch.float32)
     spike_thr = float(getattr(optimizer.args, "spike_threshold_layers", 1))
 
+    pixel_err = _heights_error_fn(optimizer, dg, disc_logits, L, target_lab, weights, smooth)
+
     def window_err(zmap):
         """Error summed over the influence region of the block anchored at
         each pixel (rows/cols -1 .. block)."""
-        comp = composite_image_disc(
-            _heights_to_eff_logits(zmap, L),
-            disc_logits,
-            optimizer.vis_tau,
-            optimizer.vis_tau,
-            optimizer.h,
-            L,
-            optimizer.material_colors,
-            optimizer.material_TDs,
-            optimizer.background,
-            rng_seed=optimizer.best_seed,
-            compute_dtype=optimizer.composite_compute_dtype,
-        )
-        e = (srgb_to_lab(comp) - target_lab).pow(2).sum(-1) * weights
-        if smooth > 0:
-            e = e + smooth * _height_variation(zmap)
+        e = pixel_err(zmap)
         if anchor_w > 0:
             e = e + anchor_w * (zmap.to(torch.float32) - z_anchor_f).pow(2)
         e = F.pad(e[None, None], (1, block, 1, block))
@@ -443,6 +482,21 @@ def apply_stack(optimizer, dg: torch.Tensor, refine_sweeps: int = 2, radius: int
     optimizer.best_params["global_logits"] = disc_to_logits(
         dg, optimizer.material_colors.shape[0], big_pos=1e5
     )
+    # Start from this stack's own assigned heights (the smoothed per-pixel
+    # optimum), not the previous stack's: the refine only moves heights
+    # locally and, from another stack's map, regularly got stuck above the
+    # current loss and rejected every searched stack.
+    if hasattr(optimizer, "assigned_heights"):
+        with torch.no_grad():
+            bp = optimizer.best_params
+            eff = optimizer._apply_height_offset(bp["pixel_height_logits"], bp["height_offsets"])
+            z = optimizer.assigned_heights(dg.to(torch.long), eff)
+            new_logits = optimizer._remove_height_offset(
+                pixel_logits=_heights_to_eff_logits(z, int(optimizer.max_layers)),
+                height_offsets=bp["height_offsets"],
+            )
+        bp["pixel_height_logits"] = new_logits
+        optimizer.pixel_height_logits = new_logits
     refine_pixel_heights(optimizer, sweeps=refine_sweeps, radius=radius, progress=progress)
     after = optimizer.solution_loss()
     if after is None or before is None or after >= before:
@@ -560,19 +614,35 @@ class PaletteProxy:
             if nb <= max_points:
                 break
             size *= 1.25
-        wsum = torch.zeros(nb, device=tl.device).index_add_(0, inv, w)
-        cent = torch.zeros(nb, 3, device=tl.device).index_add_(0, inv, tl * w[:, None])
-        self.tl = cent / wsum.clamp(min=1e-12)[:, None]
-        self.w = wsum / wsum.sum().clamp(min=1e-8)
+        # Bin sums on the CPU (float64 bincount): index_add_ on the GPU sums
+        # with float atomics, so the centroids - and every proxy decision
+        # after them - changed from run to run.
+        import numpy as np
+
+        inv_np = inv.cpu().numpy()
+        w_np = w.double().cpu().numpy()
+        tlw = (tl.double() * w.double()[:, None]).cpu().numpy()
+        wsum64 = np.bincount(inv_np, weights=w_np, minlength=nb)
+        cent64 = np.stack([np.bincount(inv_np, weights=tlw[:, c], minlength=nb) for c in range(3)], 1)
+        wsum = torch.from_numpy(wsum64).to(tl.device)
+        self.tl = (torch.from_numpy(cent64).to(tl.device) / wsum.clamp(min=1e-12)[:, None]).float()
+        self.w = (wsum / wsum.sum().clamp(min=1e-8)).float()
         self.t2 = (self.tl * self.tl).sum(-1)
+        self._tl32 = self.tl.to(torch.float32).contiguous()
+        self._w32 = self.w.to(torch.float32).contiguous()
         self._graphs = {}
         self._pool = torch.cuda.graph_pool_handle() if self.tl.is_cuda else None
 
     def palette_lab(self, dg: torch.Tensor) -> torch.Tensor:
         o = self.opt
-        pal = batched_stack_palette(
-            o.material_colors[dg], o.material_TDs[dg], o.background, o.h
-        )
+        from autoforge.Helper import FusedComposite as fc
+
+        if fc.fused_available(dg):
+            pal = fc.stack_palettes(o.material_colors[dg], o.material_TDs[dg], o.background, o.h)
+        else:
+            pal = batched_stack_palette(
+                o.material_colors[dg], o.material_TDs[dg], o.background, o.h
+            )
         return srgb_to_lab(pal * 255.0)
 
     def __call__(self, dg: torch.Tensor) -> torch.Tensor:
@@ -607,6 +677,10 @@ class PaletteProxy:
         # The palette is a chain of small launch-bound ops: one call for the
         # whole batch. Only the [b, points, heights] distances are chunked.
         pal = self.palette_lab(dg)  # [B,n,3]
+        from autoforge.Helper import FusedComposite as fc
+
+        if fc.fused_available(pal):
+            return fc.proxy_losses(pal, self._tl32, self._w32)
         p2 = (pal * pal).sum(-1)  # [B,n]
         out = []
         for lo in range(0, dg.shape[0], self.chunk):
@@ -634,9 +708,11 @@ def _stack_swaps(dg: torch.Tensor, base) -> int:
     return int((dg[1:] != dg[:-1]).sum()) + int(first)
 
 
-def _within_limits(c: torch.Tensor, max_colors: int, max_swaps: int, base=None) -> torch.Tensor:
+def _within_limits(c: torch.Tensor, max_colors: int, max_swaps: int, base=None, num_materials: int = None) -> torch.Tensor:
     """[B] bool: stacks c [B,L] within the colour / swap limits (colours
-    besides the ``base`` filament, which layers may reuse at no cost)."""
+    besides the ``base`` filament, which layers may reuse at no cost).
+    ``num_materials`` (an upper bound on the material indices) avoids a host
+    sync for the colour count."""
     ok = torch.ones(c.shape[0], dtype=torch.bool, device=c.device)
     if max_swaps < 10**9:
         # The base is band 0: a first layer in another filament is a swap
@@ -644,7 +720,8 @@ def _within_limits(c: torch.Tensor, max_colors: int, max_swaps: int, base=None) 
         first = c[:, 0] != (base if base is not None else -1)
         ok &= (c[:, 1:] != c[:, :-1]).sum(1) + first.long() <= max_swaps
     if max_colors < 10**9:
-        onehot = torch.zeros(c.shape[0], int(c.max()) + 1, dtype=torch.bool, device=c.device)
+        width = int(num_materials) if num_materials is not None else int(c.max()) + 1
+        onehot = torch.zeros(c.shape[0], width, dtype=torch.bool, device=c.device)
         onehot.scatter_(1, c, True)
         if base is not None and base < onehot.shape[1]:
             onehot[:, base] = False
@@ -700,7 +777,7 @@ def search_stack(
             for layer in range(L - 1, -1, -1):
                 c = cur.repeat(M, 1)
                 c[:, layer] = torch.arange(M, device=dev)
-                ok = _within_limits(c, max_colors, max_swaps, base)
+                ok = _within_limits(c, max_colors, max_swaps, base, M)
                 losses = torch.where(ok, proxy(c), torch.full((M,), float("inf"), device=dev))
                 i = torch.argmin(losses)
                 li = losses[i].double()
@@ -720,7 +797,7 @@ def search_stack(
             # segment fill adds a colour, an insert adds swaps); such a start
             # scores inf, so only stacks within the limits can ever win.
             cl = torch.where(
-                _within_limits(c, max_colors, max_swaps, base),
+                _within_limits(c, max_colors, max_swaps, base, M),
                 proxy(c),
                 torch.full((B,), float("inf"), device=dev),
             )
@@ -731,7 +808,7 @@ def search_stack(
                 for layer in range(hi - 1, lo - 1, -1):
                     v = c.repeat_interleave(M, 0)
                     v[:, layer] = ar.repeat(B)
-                    ok = _within_limits(v, max_colors, max_swaps, base)
+                    ok = _within_limits(v, max_colors, max_swaps, base, M)
                     lv = torch.where(ok, proxy(v), torch.full((v.shape[0],), float("inf"), device=dev))
                     lv, j = lv.view(B, M).min(dim=1)
                     better = lv < cl - 1e-6
@@ -813,7 +890,7 @@ def palette_search_stack(
                 for layer in range(L - 1, -1, -1):
                     c = cur.repeat(M, 1)
                     c[:, layer] = ar
-                    ok = _within_limits(c, max_colors, max_swaps, base)
+                    ok = _within_limits(c, max_colors, max_swaps, base, M)
                     losses = torch.where(ok, proxy(c), torch.full((M,), inf, device=dev))
                     i = torch.argmin(losses)
                     li = losses[i].double()
@@ -834,7 +911,7 @@ def palette_search_stack(
                 if m != a
             ]
             c = torch.stack(cands)
-            ok = _within_limits(c, max_colors, max_swaps, base)
+            ok = _within_limits(c, max_colors, max_swaps, base, M)
             losses = torch.where(ok, proxy(c), torch.full((c.shape[0],), inf, device=dev))
             i = torch.argmin(losses)
             if not float(losses[i]) < float(best_t) - 1e-6:
@@ -909,16 +986,7 @@ def refine_plateaus(optimizer, min_size: int = 2, shifts=(-3, -2, -1, 1, 2, 3), 
     pal = srgb_to_lab(_stack_palette(optimizer, dg.to(torch.long), (layer < kk).float() * optimizer.h))
     dist = torch.cdist(target_lab.reshape(-1, 3), pal).pow(2) * weights.reshape(-1, 1)  # [HW,L+1]
 
-    def err_map(zmap):
-        comp = composite_image_disc(
-            _heights_to_eff_logits(zmap, L), disc_logits, optimizer.vis_tau, optimizer.vis_tau,
-            optimizer.h, L, optimizer.material_colors, optimizer.material_TDs, optimizer.background,
-            rng_seed=optimizer.best_seed, compute_dtype=optimizer.composite_compute_dtype,
-        )
-        e = (srgb_to_lab(comp) - target_lab).pow(2).sum(-1) * weights
-        if smooth > 0:
-            e = e + smooth * _height_variation(zmap)
-        return e
+    err_map = _heights_error_fn(optimizer, dg, disc_logits, L, target_lab, weights, smooth)
 
     # Plateaus: connected components of equal height (4-connectivity).
     zc = z.cpu().numpy()

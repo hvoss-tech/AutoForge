@@ -40,6 +40,12 @@ def stack_colors(
     """[L+1, 3] colour (0-255) of a uniform region printed 0..L layers high
     with the discrete stack ``dg``, through the real discrete composite."""
     L = int(max_layers)
+    from autoforge.Helper import FusedComposite as fc
+
+    if fc.fused_available(dg):
+        # A uniform region's colour is exactly the flat-stack palette.
+        d = dg.long()
+        return fc.stack_palettes(material_colors[d][None], material_TDs[d][None], background, h)[0] * 255.0
     ks = torch.arange(L + 1, device=dg.device, dtype=torch.float32)
     # One 3x3 block per height; the centre pixel sees only its own height.
     img = heights_to_logits(ks, L).view(-1, 1, 1).expand(L + 1, 3, 3).reshape((L + 1) * 3, 3)
@@ -106,6 +112,17 @@ def assign_heights(
     w_sum = float(nw.sum())
     # The four classes' error slices, taken once.
     classes = [(a, b, err[a::2, b::2].contiguous()) for a in range(2) for b in range(2)]
+    from autoforge.Helper import FusedComposite as fc
+
+    if fc.fused_available(z) and z.is_contiguous():
+        # One kernel per class update (same cost, evaluated per height).
+        for _ in range(sweeps):
+            before = z.clone()
+            for a, b, err_c in classes:
+                fc.icm_class_update(err_c, z, a, b, s)
+            if torch.equal(before, z):
+                break
+        return z
     for _ in range(sweeps):
         before = z.clone()
         for a, b, err_c in classes:
