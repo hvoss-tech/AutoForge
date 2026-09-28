@@ -208,20 +208,94 @@ After running, the following files will be created in your specified output fold
 
 ## Docker
 
-The repository includes a Docker setup that builds and starts the web UI on http://localhost:8000. Your projects, uploads and filament library are kept in the `autoforge-data` volume.
+The repository includes a Docker setup that builds the web UI, starts it automatically and serves it on http://localhost:8000. There is one compose file per kind of hardware; the first build takes a while, since it downloads PyTorch.
 
-| Hardware | Command | Requires |
+| Hardware | Compose file | Image |
 | --- | --- | --- |
-| NVIDIA GPU | `docker compose up -d --build` | [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
-| AMD GPU | `docker compose -f docker-compose.rocm.yml up -d --build` | amdgpu kernel driver (Linux, x86_64) |
-| CPU only / macOS | `docker compose -f docker-compose.cpu.yml up -d --build` | nothing |
+| NVIDIA GPU (Linux, Windows) | `docker-compose.yml` | `autoforge-webui:latest` |
+| AMD GPU (Linux, x86_64) | `docker-compose.rocm.yml` | `autoforge-webui:rocm` |
+| CPU only, and macOS (Intel and Apple Silicon) | `docker-compose.cpu.yml` | `autoforge-webui:cpu` |
 
-Docker containers on macOS can't use Apple Metal, so on a Mac use the native install (`./install.sh`) to run on the GPU.
+Docker Compose 2.24 or newer is required. To check which device the running web UI uses, open http://localhost:8000/api/system/device: it lists `cuda:0` (NVIDIA and AMD alike) when the GPU is visible inside the container, or only `cpu` when it is not.
 
-Set `WEBUI_PORT` to change the port and `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` to disable telemetry, e.g. `WEBUI_PORT=9000 docker compose up -d`. The command-line tool is available in the same image:
+### NVIDIA
+
+1. Install the NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), then restart Docker. On Windows, Docker Desktop with the WSL 2 backend already includes GPU support; only the NVIDIA driver is needed.
+2. Start AutoForge:
+   ```bash
+   docker compose up -d --build
+   ```
+
+Older cards (GTX 10xx and other pre-Turing GPUs) need the CUDA 12.6 build of PyTorch, since the default build no longer has kernels for them:
 ```bash
-docker run --rm --gpus all -v "$PWD:/work" -w /work autoforge-webui:latest autoforge --input_image input.jpg --csv_file materials.csv
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 docker compose up -d --build
 ```
+
+### AMD
+
+1. Linux only. The host needs the `amdgpu` kernel driver (included in current kernels); `/dev/kfd` must exist. The ROCm runtime itself ships inside the image, so ROCm does not need to be installed on the host.
+2. Start AutoForge:
+   ```bash
+   docker compose -f docker-compose.rocm.yml up -d --build
+   ```
+
+Consumer Radeon cards that ROCm doesn't officially list often need a GFX version override. Uncomment the `environment` block in `docker-compose.rocm.yml` and set `HSA_OVERRIDE_GFX_VERSION` to `10.3.0` for RDNA2 (RX 6000) or `11.0.0` for RDNA3 (RX 7000), then run the command again. If optimization fails with a Triton compilation error, add `AUTOFORGE_TRITON: "off"` to the same block to use the plain PyTorch code path.
+
+AMD GPUs aren't supported by Docker on Windows or macOS; use the CPU image there.
+
+### Apple Silicon (MPS)
+
+Docker containers on macOS run in a Linux VM with no access to Apple Metal, so the GPU cannot be used from Docker on a Mac. You have two options:
+- **Use the GPU:** install AutoForge natively with `./install.sh` and start it with `./run_webui.sh`. The macOS build of PyTorch includes MPS, and AutoForge picks it automatically.
+- **Use Docker (CPU only):**
+  ```bash
+  docker compose -f docker-compose.cpu.yml up -d --build
+  ```
+  This builds a native arm64 image. In Docker Desktop, raise the memory limit (Settings → Resources) if large images fail with out-of-memory errors.
+
+### CPU only
+
+Works on any machine with Docker, but optimization is much slower than on a GPU:
+```bash
+docker compose -f docker-compose.cpu.yml up -d --build
+```
+
+### Everyday use
+
+The commands below use the NVIDIA compose file; add `-f docker-compose.rocm.yml` or `-f docker-compose.cpu.yml` for the other images.
+
+| Task | Command |
+| --- | --- |
+| Show the logs | `docker compose logs -f` |
+| Stop | `docker compose down` |
+| Update to a newer version | `git pull && docker compose up -d --build` |
+| Use another port | `WEBUI_PORT=9000 docker compose up -d` |
+| Disable telemetry | `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false docker compose up -d` |
+
+All the images start a container named `autoforge`, so stop the running one with its own compose file before switching to another.
+
+Your projects, uploaded images, filament library and downloaded models are kept in the `autoforge-data` Docker volume, which survives restarts, updates and switching between the images. `docker compose down -v` deletes it along with the container.
+
+To use your HueForge filament library, uncomment the HueForge lines in `docker-compose.yml` (the `AUTOFORGE_WEBUI_HUEFORGE_LIBRARY` variable and the volume mount) and point the mount at the folder containing `personal_library.json`.
+
+### Command-line tool
+
+The `autoforge` CLI is included in every image. Mount the folder with your image and filament CSV into the container and run it from there; results are written into that folder:
+```bash
+# NVIDIA
+docker run --rm --gpus all -v "$PWD:/work" -w /work autoforge-webui:latest \
+    autoforge --input_image input.jpg --csv_file materials.csv --output_folder output
+
+# AMD
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+    -v "$PWD:/work" -w /work autoforge-webui:rocm \
+    autoforge --input_image input.jpg --csv_file materials.csv --output_folder output
+
+# CPU / macOS
+docker run --rm -v "$PWD:/work" -w /work autoforge-webui:cpu \
+    autoforge --input_image input.jpg --csv_file materials.csv --output_folder output
+```
+The container runs as root, so on Linux the output files belong to root; `sudo chown -R "$USER" output` makes them yours again.
 
 ## You can now run Autoforge for free in your browser thanks to [Huggingface space support](https://huggingface.co/spaces/hvoss-techfak/Autoforge).
 This includes the option to run it locally if you have a powerful pc and don't want to limit yourself to the Huggingface computing limits. \
