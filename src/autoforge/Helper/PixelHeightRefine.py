@@ -590,6 +590,13 @@ def batched_stack_palette(
     )
 
 
+def _decision_dtype(device: torch.device) -> torch.dtype:
+    """dtype of the on-device accept/reject bookkeeping in the stack searches:
+    float64 (as the Python-float comparison it replaced), except on MPS, which
+    has no float64 - there fp32, exact for the fp32 losses it compares."""
+    return torch.float32 if device.type == "mps" else torch.float64
+
+
 class PaletteProxy:
     """Batched ``palette_loss_fn``: scores many stacks at once.
 
@@ -619,14 +626,16 @@ class PaletteProxy:
         # after them - changed from run to run.
         import numpy as np
 
+        # All float64 work stays on the host: MPS has no float64 at all.
         inv_np = inv.cpu().numpy()
-        w_np = w.double().cpu().numpy()
-        tlw = (tl.double() * w.double()[:, None]).cpu().numpy()
+        w_np = w.cpu().double().numpy()
+        tlw = tl.cpu().double().numpy() * w_np[:, None]
         wsum64 = np.bincount(inv_np, weights=w_np, minlength=nb)
         cent64 = np.stack([np.bincount(inv_np, weights=tlw[:, c], minlength=nb) for c in range(3)], 1)
-        wsum = torch.from_numpy(wsum64).to(tl.device)
-        self.tl = (torch.from_numpy(cent64).to(tl.device) / wsum.clamp(min=1e-12)[:, None]).float()
-        self.w = (wsum / wsum.sum().clamp(min=1e-8)).float()
+        tl64 = cent64 / np.maximum(wsum64, 1e-12)[:, None]
+        w64 = wsum64 / max(wsum64.sum(), 1e-8)
+        self.tl = torch.from_numpy(tl64.astype(np.float32)).to(tl.device)
+        self.w = torch.from_numpy(w64.astype(np.float32)).to(tl.device)
         self.t2 = (self.tl * self.tl).sum(-1)
         self._tl32 = self.tl.to(torch.float32).contiguous()
         self._w32 = self.w.to(torch.float32).contiguous()
@@ -760,12 +769,13 @@ def search_stack(
     cur = dg.clone().to(torch.long)
     L = int(cur.shape[0])
     dev = cur.device
+    acc = _decision_dtype(dev)
     g = torch.Generator(device="cpu").manual_seed(seed)
     with torch.no_grad():
         # The accept/reject decisions stay on the GPU (float64, as the
         # Python-float comparison they replace), with one host sync per
         # sweep instead of one per layer.
-        best_t = proxy(cur[None])[0].double()
+        best_t = proxy(cur[None])[0].to(acc)
         start = float(best_t)
         # Coordinate descent: all materials for one layer per batch.
         # Progress: the descent is the first fifth, the rounds the rest (an
@@ -780,7 +790,7 @@ def search_stack(
                 ok = _within_limits(c, max_colors, max_swaps, base, M)
                 losses = torch.where(ok, proxy(c), torch.full((M,), float("inf"), device=dev))
                 i = torch.argmin(losses)
-                li = losses[i].double()
+                li = losses[i].to(acc)
                 take = li < best_t - 1e-6
                 best_t = torch.where(take, li, best_t)
                 cur = torch.where(take, c[i], cur)
@@ -879,10 +889,11 @@ def palette_search_stack(
     cur = dg.clone().to(torch.long)
     L = int(cur.shape[0])
     dev = cur.device
+    acc = _decision_dtype(dev)
     inf = float("inf")
     ar = torch.arange(M, device=dev)
     with torch.no_grad():
-        best_t = proxy(cur[None])[0].double()
+        best_t = proxy(cur[None])[0].to(acc)
 
         def descend(cur, best_t):
             for _ in range(sweeps):
@@ -893,7 +904,7 @@ def palette_search_stack(
                     ok = _within_limits(c, max_colors, max_swaps, base, M)
                     losses = torch.where(ok, proxy(c), torch.full((M,), inf, device=dev))
                     i = torch.argmin(losses)
-                    li = losses[i].double()
+                    li = losses[i].to(acc)
                     take = li < best_t - 1e-6
                     best_t = torch.where(take, li, best_t)
                     cur = torch.where(take, c[i], cur)
@@ -916,7 +927,7 @@ def palette_search_stack(
             i = torch.argmin(losses)
             if not float(losses[i]) < float(best_t) - 1e-6:
                 break
-            cur, best_t = descend(c[i], losses[i].double())
+            cur, best_t = descend(c[i], losses[i].to(acc))
     print(f"Palette search: proxy loss {start:.4f} -> {float(best_t):.4f}")
     return cur
 

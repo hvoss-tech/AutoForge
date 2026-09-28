@@ -118,6 +118,7 @@ def main() -> int:
     if shutil.which("uv"):
         print("Reinstalling Python dependencies...")
         run(["uv", "sync"])
+        reinstall_custom_torch()
     else:
         print("WARNING: 'uv' not found — skipping dependency reinstall. Run install.sh/install.bat afterwards.")
 
@@ -129,6 +130,29 @@ def main() -> int:
 
     print("Update complete. Restart AutoForge to use the new version.")
     return 0
+
+
+def reinstall_custom_torch() -> None:
+    """Put back the PyTorch build install.sh chose (ROCm, or CUDA 12.6 for
+    pre-Turing GPUs), which the `uv sync` above just replaced with the default."""
+    venv = ROOT / ".venv"
+    marker = venv / ".autoforge-torch-index"
+    legacy = venv / ".autoforge-torch-cu126"
+    if marker.is_file():
+        index = marker.read_text().strip()
+    elif legacy.is_file():
+        index = "https://download.pytorch.org/whl/cu126"
+    else:
+        return
+    if not index:
+        return
+    print(f"Reinstalling PyTorch from {index} ...")
+    run([
+        "uv", "pip", "install",
+        "--reinstall-package", "torch", "--reinstall-package", "torchvision",
+        "torch>=2.9.1", "torchvision>=0.21.0",
+        "--index-url", index,
+    ])
 
 
 if __name__ == "__main__":

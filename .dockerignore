@@ -1,8 +1,20 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.env
-.git
-.gitignore
-Dockerfile
+# Only the files the image needs are sent to the build context; everything
+# else in the working tree (outputs, checkpoints, archives, node_modules, ...)
+# is excluded.
+*
+!pyproject.toml
+!README.md
+!src/
+!webui/frontend/
+webui/frontend/node_modules/
+webui/frontend/dist/
+webui/frontend/playwright-report/
+webui/frontend/test-results/
+webui/frontend/tests/
+webui/frontend/*.cjs
+webui/frontend/*.mjs
+webui/frontend/tsconfig.tsbuildinfo
+src/autoforge/webui/checkpoints/
+src/autoforge/webui/uploads/
+**/__pycache__/
+**/*.py[cod]

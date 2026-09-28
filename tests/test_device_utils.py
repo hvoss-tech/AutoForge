@@ -253,13 +253,15 @@ class TestNonCudaRunNeverTouchesCuda:
         H = W = 16
         return FilamentOptimizer(
             args=args,
-            target=torch.rand(H, W, 3) * 255.0,
+            # The caller puts these on the device (as auto_forge does);
+            # FilamentOptimizer doesn't move them.
+            target=(torch.rand(H, W, 3) * 255.0).to(device),
             pixel_height_logits_init=np.zeros((H, W), dtype=np.float32),
             pixel_height_labels=np.zeros((H, W), dtype=np.int32),
             global_logits_init=np.zeros((4, 3), dtype=np.float32),
-            material_colors=torch.rand(3, 3),
-            material_TDs=torch.ones(3),
-            background=torch.zeros(3),
+            material_colors=torch.rand(3, 3).to(device),
+            material_TDs=torch.ones(3).to(device),
+            background=torch.zeros(3).to(device),
             device=device,
             perception_loss_module=None,
         )
@@ -285,3 +287,70 @@ class TestNonCudaRunNeverTouchesCuda:
 
         assert opt._graph is None
         assert torch.isfinite(opt.loss).all()
+
+
+class TestStackSearchWithoutFloat64:
+    """MPS has no float64 at all: any float64 tensor on the device raises
+    there. The stack searches used to keep their bookkeeping in float64 on the
+    device, which crashed the pixel-refine stage on Apple Silicon.
+
+    Off a Mac, MPS's restriction is emulated on CUDA: a dispatch hook fails on
+    any float64 GPU tensor, with the MPS code paths selected (no Triton,
+    fp32 decisions)."""
+
+    @staticmethod
+    def _trained_optimizer(device):
+        torch.manual_seed(0)
+        opt = TestNonCudaRunNeverTouchesCuda._build_optimizer(device)
+        for _ in range(3):
+            opt.step()
+        return opt
+
+    @staticmethod
+    def _run_searches(opt, device):
+        from autoforge.Helper.PixelHeightRefine import palette_search_stack, search_stack
+
+        dg, _ = opt.get_discretized_solution(best=False)
+        dg = search_stack(opt, rounds=3, batch=4, init_dg=dg, verbose=False)
+        dg = palette_search_stack(opt, dg, rounds=1, sweeps=1)
+        assert dg.device.type == device.type
+        return dg
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA-family GPU")
+    def test_no_float64_on_device_with_mps_paths(self, monkeypatch):
+        from torch.utils._python_dispatch import TorchDispatchMode
+        from torch.utils._pytree import tree_flatten
+
+        from autoforge.Helper import FusedComposite as fc
+        from autoforge.Helper import PixelHeightRefine as phr
+
+        monkeypatch.setattr(fc, "_HAS_TRITON", False)
+        monkeypatch.setattr(phr, "_decision_dtype", lambda device: torch.float32)
+        monkeypatch.setenv("AUTOFORGE_GRAPH", "off")
+
+        class NoFloat64OnGpu(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                out = func(*args, **(kwargs or {}))
+                for t in tree_flatten(out)[0]:
+                    if isinstance(t, torch.Tensor) and t.is_cuda and t.dtype == torch.float64:
+                        raise AssertionError(f"float64 tensor on the GPU from {func}")
+                return out
+
+        device = torch.device("cuda")
+        opt = self._trained_optimizer(device)
+        # Only the searches run under the hook: the TorchScript training step
+        # doesn't run under a dispatch mode.
+        with NoFloat64OnGpu():
+            self._run_searches(opt, device)
+
+    @pytest.mark.skipif(not DU.mps_is_available(), reason="Requires Apple Metal")
+    def test_searches_run_on_mps(self):
+        device = torch.device("mps")
+        self._run_searches(self._trained_optimizer(device), device)
+
+    def test_decision_dtype(self):
+        from autoforge.Helper.PixelHeightRefine import _decision_dtype
+
+        assert _decision_dtype(torch.device("mps")) == torch.float32
+        assert _decision_dtype(torch.device("cuda")) == torch.float64
+        assert _decision_dtype(torch.device("cpu")) == torch.float64

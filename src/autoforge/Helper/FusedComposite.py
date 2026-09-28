@@ -10,6 +10,8 @@ intermediates to the autocast dtype), so results agree to rounding, not bit
 for bit - callers verify with the real metric before keeping anything.
 """
 
+import os
+
 import torch
 
 from autoforge.Helper.OptimizerHelper import material_run_starts, run_starts
@@ -20,6 +22,12 @@ try:
 
     _HAS_TRITON = True
 except Exception:  # pragma: no cover - triton missing
+    _HAS_TRITON = False
+
+# AUTOFORGE_TRITON=off takes the plain PyTorch path everywhere, e.g. on a ROCm
+# GPU whose Triton backend can't compile these kernels. Only the kernel
+# definitions stay skipped; `triton` itself may still be imported above.
+if os.environ.get("AUTOFORGE_TRITON", "").strip().lower() in {"off", "0", "false", "no"}:
     _HAS_TRITON = False
 
 

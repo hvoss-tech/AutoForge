@@ -71,8 +71,17 @@ The easiest way to use AutoForge is the web UI, a local app with drag-and-drop i
 
    This checks GitHub for a newer release and, if one exists, pulls it and reinstalls dependencies for you. Add `--check` to only check without applying it (e.g. `./update.sh --check`).
 
-If you have problems running the code on your GPU, please refer to the [Pytorch Homepage](https://pytorch.org/) for help. \
-CUDA, ROCm, and MPS (Apple Metal) are supported, but you need to install the correct version of pytorch for your system — `install.sh`/`install.bat` install whatever `uv sync` resolves by default, so swap in a GPU-specific PyTorch build afterwards if you need one. (`install.sh` handles older NVIDIA GPUs automatically, see below.)
+### GPU support
+
+AutoForge runs on NVIDIA GPUs (CUDA), AMD GPUs (ROCm, Linux), Apple Silicon (MPS / Apple Metal) and, more slowly, on the CPU. The device is picked automatically in that order; override it with `--device` or the `AUTOFORGE_DEVICE` environment variable (e.g. `AUTOFORGE_DEVICE=cpu`).
+
+`install.sh` installs the matching PyTorch build for you:
+- **NVIDIA**: the default CUDA build; older (pre-Turing, e.g. GTX 10xx) cards automatically get the CUDA 12.6 build, the last one with kernels for them.
+- **AMD (Linux)**: detected through `/dev/kfd` and given the ROCm build. Consumer Radeon cards that ROCm doesn't officially list may need e.g. `HSA_OVERRIDE_GFX_VERSION=10.3.0` (RX 6000) or `11.0.0` (RX 7000) set when running.
+- **Apple Silicon**: the default macOS build already includes MPS.
+- Anything else: run `AUTOFORGE_TORCH_INDEX=<PyTorch wheel index> ./install.sh`, e.g. `https://download.pytorch.org/whl/cpu`. `./update.sh` keeps whichever build was installed.
+
+If the fused GPU kernels (Triton) cause trouble on your GPU, `AUTOFORGE_TRITON=off` switches to the plain PyTorch code path. For other GPU problems, see the [PyTorch homepage](https://pytorch.org/).
 
 ## Manual Installation (CLI only)
 
@@ -196,6 +205,23 @@ After running, the following files will be created in your specified output fold
 - **Optional Cap Layer STL**: `Cap_MaterialName_HEXCODE.stl` (if `--cap_layers > 0`)
   
   *Note:* FlatForge generates multiple STL files that align perfectly when loaded together in your slicer, creating a solid rectangular print with each color as a separate object.
+
+## Docker
+
+The repository includes a Docker setup that builds and starts the web UI on http://localhost:8000. Your projects, uploads and filament library are kept in the `autoforge-data` volume.
+
+| Hardware | Command | Requires |
+| --- | --- | --- |
+| NVIDIA GPU | `docker compose up -d --build` | [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
+| AMD GPU | `docker compose -f docker-compose.rocm.yml up -d --build` | amdgpu kernel driver (Linux, x86_64) |
+| CPU only / macOS | `docker compose -f docker-compose.cpu.yml up -d --build` | nothing |
+
+Docker containers on macOS can't use Apple Metal, so on a Mac use the native install (`./install.sh`) to run on the GPU.
+
+Set `WEBUI_PORT` to change the port and `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` to disable telemetry, e.g. `WEBUI_PORT=9000 docker compose up -d`. The command-line tool is available in the same image:
+```bash
+docker run --rm --gpus all -v "$PWD:/work" -w /work autoforge-webui:latest autoforge --input_image input.jpg --csv_file materials.csv
+```
 
 ## You can now run Autoforge for free in your browser thanks to [Huggingface space support](https://huggingface.co/spaces/hvoss-techfak/Autoforge).
 This includes the option to run it locally if you have a powerful pc and don't want to limit yourself to the Huggingface computing limits. \

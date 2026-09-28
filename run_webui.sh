@@ -102,9 +102,10 @@ if [ "${NO_BROWSER:-false}" != "true" ]; then
     ) &
 fi
 
-# install.sh installs a pre-Turing-compatible PyTorch build on old NVIDIA GPUs;
-# `uv run` would sync it back to the default build, so skip syncing in that case.
-if [ -f "$SCRIPT_DIR/.venv/.autoforge-torch-cu126" ]; then
+# install.sh installs a different PyTorch build on AMD (ROCm) and pre-Turing
+# NVIDIA GPUs; `uv run` would sync it back to the default build, so skip
+# syncing in that case. (.autoforge-torch-cu126 is the older installers' marker.)
+if [ -f "$SCRIPT_DIR/.venv/.autoforge-torch-index" ] || [ -f "$SCRIPT_DIR/.venv/.autoforge-torch-cu126" ]; then
     export UV_NO_SYNC=1
 fi
 
