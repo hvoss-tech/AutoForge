@@ -154,7 +154,12 @@ def deterministic_gumbel_noise(seeds: torch.Tensor, n_mat: int) -> torch.Tensor:
     """
     m_idx = torch.arange(n_mat, dtype=torch.float32, device=seeds.device).view(1, n_mat)
     r = torch.sin(m_idx + seeds.to(torch.float32).view(-1, 1)) * 43758.5453123
-    U = r - torch.floor(r)
+    # The clamp matters: once the JIT fuser has compiled this (from the second
+    # call on) r - floor(r) can come out a hair negative in the fused kernel
+    # (r an exact integer), the log is NaN and so is the noise - the argmax
+    # over a NaN row is material 0, whatever its logits say (discrete stacks
+    # silently changed colour in their top layers).
+    U = (r - torch.floor(r)).clamp(min=0.0)
     eps: float = 1e-20
     return -torch.log(-torch.log(U + eps) + eps)
 

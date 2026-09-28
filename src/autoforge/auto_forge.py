@@ -202,6 +202,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--delta_grid",
+        type=int,
+        default=4,
+        help="Downscale factor of the trained smooth per-pixel height field (0 = off)",
+    )
+    parser.add_argument(
         "--early_stopping",
         type=int,
         default=2000,
@@ -314,6 +320,50 @@ def parse_args() -> argparse.Namespace:
         "--optimize_background",
         default=True,
         help="With --auto_background_color: the optimizer chooses the base filament like any layer's, starting from the filament closest to the image's dominant color (the base keeps its --background_height)",
+        action=argparse.BooleanOptionalAction,
+    )
+
+    parser.add_argument(
+        "--spike_refine_blocks",
+        type=str,
+        default="1212121",
+        help="Block sizes of the spike-aware pixel height refine passes after spike removal (digits, e.g. 121)",
+    )
+    parser.add_argument(
+        "--stack_history_candidates",
+        type=int,
+        default=6,
+        help="Besides the best stack of the search, also height-refine this many of its last improvements and keep whichever gives the lowest real loss",
+    )
+    parser.add_argument(
+        "--layer_material_refine_window",
+        type=int,
+        default=2,
+        help="After the spike-aware refine, re-pick each layer's material among those within this many layers of it under the real loss (heights fixed), then refine the heights again; 0 disables",
+    )
+    parser.add_argument(
+        "--plateau_refine",
+        default=True,
+        help="After the spike-aware refine, move whole equal-height plateaus (region moves) under the real loss",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--plateau_refine_target",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Also region moves over connected areas of similar target colour",
+    )
+    parser.add_argument("--plateau_refine_passes", type=int, default=1)
+    parser.add_argument(
+        "--skip_legacy_prune",
+        default=False,
+        help="Skip the greedy colour/swap/layer pruning phases when the solution is already within the limits",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--palette_search",
+        default=False,
+        help="After the stack search, also try global palette moves (replace a material everywhere) and keep the stack if the real loss improves",
         action=argparse.BooleanOptionalAction,
     )
 
@@ -1055,12 +1105,25 @@ def _post_optimize_and_export(
         interval=1, namespace="post_opt", step=(post_opt_step := post_opt_step + 1)
     )
 
-    optimizer.pixel_height_logits = torch.from_numpy(
-        pixel_height_logits_init
-    ).to(device)
-    optimizer.best_params["pixel_height_logits"] = torch.from_numpy(
-        pixel_height_logits_init
-    ).to(device)
+    full_init = torch.from_numpy(pixel_height_logits_init).to(device)
+
+    def _with_delta(learned):
+        # The trained height field lives at solver resolution; carry it to
+        # the output resolution.
+        if optimizer.pixel_delta is None:
+            return full_init.clone()
+        delta = (learned - optimizer.pixel_height_logits).detach()
+        if delta.shape != full_init.shape:
+            delta = torch.nn.functional.interpolate(
+                delta[None, None], size=full_init.shape[-2:], mode="bicubic"
+            )[0, 0]
+        return full_init + delta
+
+    optimizer.best_params["pixel_height_logits"] = _with_delta(
+        optimizer.best_params["pixel_height_logits"]
+    )
+    optimizer.pixel_height_logits = full_init.clone()
+    optimizer.pixel_delta = None
     optimizer.target = output_target
     optimizer.pixel_height_labels = torch.tensor(
         pixel_height_labels, dtype=torch.int32, device=device

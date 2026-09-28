@@ -158,6 +158,15 @@ class FilamentOptimizer:
             torch.zeros(self.cluster_layers, 1, device=device)
         )  # Trainable
 
+        # Optional smooth per-pixel height field (coarse grid, bilinearly
+        # upsampled) trained next to the per-cluster offsets.
+        self.delta_factor = int(getattr(args, "delta_grid", 0))
+        self.pixel_delta = None
+        if self.delta_factor > 0:
+            gh = -(-self.pixel_height_logits.shape[0] // self.delta_factor)
+            gw = -(-self.pixel_height_logits.shape[1] // self.delta_factor)
+            self.pixel_delta = torch.nn.Parameter(torch.zeros(1, 1, gh, gw, device=device))
+
         # Basic hyper-params
         self.material_colors = material_colors
         self.material_TDs = material_TDs
@@ -275,6 +284,7 @@ class FilamentOptimizer:
         # Initialize optimizer
         self.optimizer = CAdamW(
             [self.params["global_logits"], self.height_offsets]
+            + ([self.pixel_delta] if self.pixel_delta is not None else [])
             + ([self.bg_logits] if self.bg_logits is not None else []),
             lr=self.learning_rate,
         )
@@ -722,7 +732,14 @@ class FilamentOptimizer:
                 size=pixel_logits.shape[-2:],
                 mode="bicubic",
             ).squeeze(0).squeeze(0)
+        if self.pixel_delta is not None and height_offsets is self.height_offsets:
+            offsets = offsets + self._delta_up(offsets.shape)
         return pixel_logits + offsets
+
+    def _delta_up(self, shape):
+        return F.interpolate(
+            self.pixel_delta, size=tuple(shape[-2:]), mode="bilinear", align_corners=False
+        )[0, 0]
 
     def _remove_height_offset(
         self,
@@ -1131,6 +1148,7 @@ class FilamentOptimizer:
             self._maybe_capture_graph(tau_height, tau_global)
 
         self.num_steps_done += 1
+        self._ema_update()
 
         if (
             self.preview_callback is not None
@@ -1422,6 +1440,10 @@ class FilamentOptimizer:
             "global_logits": self.params["global_logits"].detach().clone(),
             "height_offsets": self.height_offsets.detach().clone(),
         }
+        if self.pixel_delta is not None:
+            params["pixel_height_logits"] = (
+                self.pixel_height_logits + self._delta_up(self.pixel_height_logits.shape)
+            ).detach()
         if self.bg_logits is not None and self.base_material is not None:
             params["background_index"] = torch.tensor(self.base_material)
         return params
@@ -1572,6 +1594,11 @@ class FilamentOptimizer:
         # repeated (see post_remove_spikes).
         self._prune_runs = getattr(self, "_prune_runs", 0) + 1
 
+        _t_prune = time.time()
+
+        def _tick(label: str) -> None:
+            print(f"[time] {label}: {time.time() - _t_prune:.1f}s since prune start")
+
         def _wait_if_paused() -> bool:
             """Blocks while paused. Returns True if cancelled (while paused
             or otherwise)."""
@@ -1659,8 +1686,20 @@ class FilamentOptimizer:
         if _wait_if_paused():
             return False
 
+        _tick("before colors")
+        # Legacy greedy phases only matter to reach the limits; with the
+        # solution already inside them the stack search below starts from the
+        # unpruned stack instead.
+        _cc, _cs, _cl = _current_counts()
+        _skip_legacy = getattr(self.args, "skip_legacy_prune", False) and (
+            _cc <= max_colors_allowed and _cs <= max_swaps_allowed and _cl <= max_layers_allowed
+        )
+        def _legacy(*a, **k):
+            if not _skip_legacy:
+                _guarded(*a, **k)
+
         self._current_prune_phase = "Reducing colors"
-        _guarded(
+        _legacy(
             "Reducing colors",
             lambda: prune_num_colors(
                 self,
@@ -1679,7 +1718,7 @@ class FilamentOptimizer:
             return False
 
         self._current_prune_phase = "Reducing swaps"
-        _guarded(
+        _legacy(
             "Reducing swaps",
             lambda: prune_num_swaps(
                 self,
@@ -1697,8 +1736,9 @@ class FilamentOptimizer:
         if _wait_if_paused():
             return False
 
+        _tick("before layers")
         self._current_prune_phase = "Reducing layers"
-        _guarded(
+        _legacy(
             "Reducing layers",
             lambda: prune_redundant_layers(
                 self,
@@ -1718,7 +1758,7 @@ class FilamentOptimizer:
         self._current_prune_phase = "Optimising swap positions"
         # Never forced: this phase only moves swap boundaries around, it never
         # removes one, so there is no limit it could be catching up with.
-        _guarded(
+        _legacy(
             "Optimising swap positions",
             lambda: optimise_swap_positions(
                 self,
@@ -1754,6 +1794,7 @@ class FilamentOptimizer:
         # cleans up the towers it may have built, and once more afterwards
         # with moves that would create a new spike ruled out, to win back
         # most of what the cleanup cost without undoing it.
+        _tick("before refine")
         pixel_refine = getattr(self.args, "pixel_height_refine", True)
         refine_sweeps = int(getattr(self.args, "pixel_height_refine_sweeps", 2))
         refine_radius = int(getattr(self.args, "pixel_height_refine_radius", 3))
@@ -1776,6 +1817,7 @@ class FilamentOptimizer:
                 from autoforge.Helper.ConstraintHelper import feasible
 
                 self._current_prune_phase = "Searching layer stacks"
+                _hist = []
                 new_stack = search_stack(
                     self,
                     max_colors_allowed,
@@ -1783,7 +1825,9 @@ class FilamentOptimizer:
                     rounds=int(getattr(self.args, "stack_search_rounds", 60)),
                     patience=int(getattr(self.args, "stack_search_patience", 15)),
                     progress=lambda f: self._prune_phase_progress(100.0 * f),
+                    history=_hist,
                 )
+                _tick("after stack search")
                 self._prune_phase_progress(100.0)
                 self._current_prune_phase = "Refining pixel heights"
                 # Belt and braces: a stack beyond the limits is never taken,
@@ -1793,6 +1837,21 @@ class FilamentOptimizer:
                         self, new_stack, refine_sweeps, refine_radius,
                         progress=lambda f: self._prune_phase_progress(50.0 * f),
                     )
+                for alt in reversed(_hist[-int(getattr(self.args, "stack_history_candidates", 6)) - 1 : -1]):
+                    if feasible(alt, max_colors_allowed, max_swaps_allowed, self.base_code):
+                        kept_new_stack = apply_stack(self, alt, refine_sweeps, refine_radius) or kept_new_stack
+                _tick("after hist")
+                if getattr(self.args, "palette_search", False):
+                    from autoforge.Helper.PixelHeightRefine import palette_search_stack
+
+                    alt = palette_search_stack(self, new_stack, max_colors_allowed, max_swaps_allowed)
+                    if not bool((alt == new_stack).all()) and feasible(
+                        alt, max_colors_allowed, max_swaps_allowed, self.base_code
+                    ):
+                        kept_new_stack = apply_stack(
+                            self, alt, refine_sweeps, refine_radius,
+                            progress=lambda f: self._prune_phase_progress(50.0 * f),
+                        ) or kept_new_stack
             self._current_prune_phase = "Refining pixel heights"
             if not kept_new_stack:
                 refine_pixel_heights(
@@ -1813,6 +1872,7 @@ class FilamentOptimizer:
         # color/swap/layer counts down again next pass, wasted the work and
         # (via allow_regression on the very first pass) paid its accuracy
         # cost on results that were about to be superseded anyway.
+        _tick("after refine")
         if do_spikes:
             self._current_prune_phase = "Removing spikes"
             # Only the first prune of this result may trade accuracy for
@@ -1833,10 +1893,30 @@ class FilamentOptimizer:
                 # On a spike-free map a single raised pixel is always a
                 # spike, so single-pixel moves alone get stuck; 2x2 blocks
                 # can be raised without becoming one.
-                for i, block in enumerate((1, 2, 1)):
+                for i, block in enumerate(tuple(int(c) for c in str(getattr(self.args, "spike_refine_blocks", "1212121")))):
                     refine_pixel_heights(
                         self, sweeps=refine_sweeps, spike_aware=True, block=block, radius=refine_radius,
                         progress=lambda f, i=i: self._prune_phase_progress(25.0 + 25.0 * (i + f)),
+                    )
+                if getattr(self.args, "plateau_refine", True):
+                    from autoforge.Helper.PixelHeightRefine import refine_plateaus
+
+                    for _pl in range(int(getattr(self.args, "plateau_refine_passes", 1))):
+                        kept_pl = refine_plateaus(self, spike_aware=True)
+                        if getattr(self.args, "plateau_refine_target", False):
+                            kept_pl = refine_plateaus(self, spike_aware=True, mode="target") or kept_pl
+                        if not kept_pl:
+                            break
+                        refine_pixel_heights(
+                            self, sweeps=refine_sweeps, spike_aware=True, block=1, radius=refine_radius,
+                        )
+                for _ in range(2 if int(getattr(self.args, "layer_material_refine_window", 2)) > 0 else 0):
+                    from autoforge.Helper.PixelHeightRefine import refine_layer_materials
+
+                    if not refine_layer_materials(self, max_colors_allowed, max_swaps_allowed, sweeps=1, window=int(self.args.layer_material_refine_window)):
+                        break
+                    refine_pixel_heights(
+                        self, sweeps=refine_sweeps, spike_aware=True, block=1, radius=refine_radius,
                     )
             self._prune_phase_progress(100.0)
         self._current_prune_phase = None
@@ -1844,6 +1924,7 @@ class FilamentOptimizer:
         dg, dh = self.get_discretized_solution(best=True)
         if dh is not None:
             current_loss = _compute_loss_for_heightmap(self, dg)
+            _tick("end")
             print(f"Post-prune discrete loss: {current_loss:.4f}")
         return True
 
@@ -2311,7 +2392,40 @@ class FilamentOptimizer:
             self.best_swaps = len(find_color_bands(dg)) - 1
             self.best_step = self.num_steps_done
 
+    EMA_DECAY = 0.995
+
+    def _ema_tensors(self):
+        ts = [self.params["global_logits"], self.height_offsets]
+        if self.pixel_delta is not None:
+            ts += list(self.pixel_delta)
+        return ts
+
+    def _ema_update(self):
+        with torch.no_grad():
+            ts = self._ema_tensors()
+            if getattr(self, "_ema", None) is None:
+                self._ema = [t.detach().clone() for t in ts]
+            else:
+                torch._foreach_mul_(self._ema, self.EMA_DECAY)
+                torch._foreach_add_(self._ema, [t.detach() for t in ts], alpha=1.0 - self.EMA_DECAY)
+
     def _maybe_update_best_discrete(self):
+        self._maybe_update_best_discrete_live()
+        # Also try the running average of the parameters: it smooths out the
+        # step-to-step noise of the Gumbel gradients.
+        if getattr(self, "_ema", None) is None:
+            return
+        with torch.no_grad():
+            live = [t.detach().clone() for t in self._ema_tensors()]
+            for t, e in zip(self._ema_tensors(), self._ema):
+                t.copy_(e)
+            try:
+                self._maybe_update_best_discrete_live()
+            finally:
+                for t, l in zip(self._ema_tensors(), live):
+                    t.copy_(l)
+
+    def _maybe_update_best_discrete_live(self):
         if self.bg_logits is None:
             return self._update_best_discrete()
         self._use_background(int(self.bg_logits.detach().argmax()))

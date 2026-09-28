@@ -275,8 +275,10 @@ def refine_layer_materials(
     max_colors: int = 10**9,
     max_swaps: int = 10**9,
     sweeps: int = 1,
+    window: int = 0,
 ) -> bool:
     """Coordinate descent over the material of each layer, heights fixed.
+    ``window`` > 0 only tries the materials within that many layers of it.
 
     Every layer in turn tries every material; a candidate is only allowed if
     the solution stays within ``max_colors`` distinct materials and
@@ -305,7 +307,11 @@ def refine_layer_materials(
             improved = False
             for layer in range(L - 1, -1, -1):
                 cands = []
-                for m in range(num_materials):
+                if window > 0:
+                    mats = set(best_dg[max(0, layer - window) : layer + window + 1].tolist())
+                else:
+                    mats = range(num_materials)
+                for m in mats:
                     if m == int(best_dg[layer]):
                         continue
                     c = best_dg.clone()
@@ -400,7 +406,11 @@ def refine_stack_palette(
             improved = False
             for layer in range(L - 1, -1, -1):
                 cands = []
-                for m in range(num_materials):
+                if window > 0:
+                    mats = set(best_dg[max(0, layer - window) : layer + window + 1].tolist())
+                else:
+                    mats = range(num_materials)
+                for m in mats:
                     if m == int(best_dg[layer]):
                         continue
                     c = best_dg.clone()
@@ -654,6 +664,7 @@ def search_stack(
     proxy: "PaletteProxy" = None,
     verbose: bool = True,
     progress=None,
+    history: list = None,
 ) -> torch.Tensor:
     """Greedy stack search under the palette proxy with a large neighbourhood.
 
@@ -756,6 +767,8 @@ def search_stack(
             i = int(torch.argmin(cl))
             if float(cl[i]) < best - 1e-6:
                 best, cur = float(cl[i]), c[i].clone()
+                if history is not None:
+                    history.append(cur)
                 stall = 0
             else:
                 stall += 1
@@ -769,3 +782,204 @@ def search_stack(
         return init_dg
     return cur
 
+
+
+def palette_search_stack(
+    optimizer,
+    dg: torch.Tensor,
+    max_colors: int = 10**9,
+    max_swaps: int = 10**9,
+    rounds: int = 4,
+    sweeps: int = 12,
+) -> torch.Tensor:
+    """Global palette moves on stack ``dg`` under the palette proxy: replace
+    one material by another everywhere (a move the layer-wise search cannot
+    make under a tight colour limit, the half-way stack has one colour too
+    many), each followed by a layer-wise descent. Returns the new stack."""
+    base = getattr(optimizer, "base_material", None)
+    proxy = PaletteProxy(optimizer)
+    M = optimizer.material_colors.shape[0]
+    cur = dg.clone().to(torch.long)
+    L = int(cur.shape[0])
+    dev = cur.device
+    inf = float("inf")
+    ar = torch.arange(M, device=dev)
+    with torch.no_grad():
+        best_t = proxy(cur[None])[0].double()
+
+        def descend(cur, best_t):
+            for _ in range(sweeps):
+                improved = torch.zeros((), dtype=torch.bool, device=dev)
+                for layer in range(L - 1, -1, -1):
+                    c = cur.repeat(M, 1)
+                    c[:, layer] = ar
+                    ok = _within_limits(c, max_colors, max_swaps, base)
+                    losses = torch.where(ok, proxy(c), torch.full((M,), inf, device=dev))
+                    i = torch.argmin(losses)
+                    li = losses[i].double()
+                    take = li < best_t - 1e-6
+                    best_t = torch.where(take, li, best_t)
+                    cur = torch.where(take, c[i], cur)
+                    improved |= take
+                if not bool(improved):
+                    break
+            return cur, best_t
+
+        start = float(best_t)
+        for _ in range(rounds):
+            cands = [
+                torch.where(cur == a, torch.full_like(cur, m), cur)
+                for a in torch.unique(cur).tolist()
+                for m in range(M)
+                if m != a
+            ]
+            c = torch.stack(cands)
+            ok = _within_limits(c, max_colors, max_swaps, base)
+            losses = torch.where(ok, proxy(c), torch.full((c.shape[0],), inf, device=dev))
+            i = torch.argmin(losses)
+            if not float(losses[i]) < float(best_t) - 1e-6:
+                break
+            cur, best_t = descend(c[i], losses[i].double())
+    print(f"Palette search: proxy loss {start:.4f} -> {float(best_t):.4f}")
+    return cur
+
+
+def _plateau_classes(labels: "np.ndarray", n: int):
+    """Greedy colouring of the plateaus (labels 1..n) so that plateaus of one
+    colour are >= 3 pixels apart (their 3x3 influence regions never overlap).
+    Returns an int array [n+1] of colour ids."""
+    import numpy as np
+
+    H, W = labels.shape
+    pairs = set()
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            if dy < 0 or (dy == 0 and dx <= 0):
+                continue
+            a = labels[: H - dy, max(0, -dx) : W - max(0, dx)]
+            b = labels[dy:, max(0, dx) : W - max(0, -dx)]
+            m = a != b
+            pairs.update(zip(a[m].tolist(), b[m].tolist()))
+    adj = [[] for _ in range(n + 1)]
+    for a, b in pairs:
+        adj[a].append(b)
+        adj[b].append(a)
+    color = np.full(n + 1, -1, dtype=np.int64)
+    for v in sorted(range(1, n + 1), key=lambda v: -len(adj[v])):
+        used = {color[u] for u in adj[v]}
+        c = 0
+        while c in used:
+            c += 1
+        color[v] = c
+    return color
+
+
+@composite_graph_scope()
+def refine_plateaus(optimizer, min_size: int = 2, shifts=(-3, -2, -1, 1, 2, 3), spike_aware: bool = False, mode: str = "height", cell: float = 6.0) -> bool:
+    """Move whole connected equal-height plateaus at once (region moves).
+
+    Single-pixel coordinate descent cannot shift a plateau: every pixel
+    alone pays the height-jump penalty to its neighbours. A plateau moved as
+    one only changes its boundary, so those moves are judged here. Each
+    plateau tries a shift of its height (``shifts``) and the height whose
+    flat stack colour is nearest its pixels; plateaus of a colour class are
+    >= 3 pixels apart, so every one is judged on its own footprint through
+    the real composite. Kept only if the real loss improved.
+    """
+    import numpy as np
+    from scipy import ndimage
+
+    from autoforge.Helper.PruningHelper import _compute_loss_for_heightmap, disc_to_logits
+
+    dg, z = optimizer.get_discretized_solution(best=True)
+    if z is None:
+        return False
+    pre_loss = _compute_loss_for_heightmap(optimizer, dg)
+    L = int(optimizer.max_layers)
+    disc_logits = disc_to_logits(dg, optimizer.material_colors.shape[0], big_pos=1e5)
+    z = z.to(torch.int64).clone()
+    H, W = z.shape
+    dev = z.device
+    target_lab = srgb_to_lab(optimizer.target)
+    weights = _pixel_weights(optimizer, (H, W))
+    smooth = float(getattr(optimizer.args, "pixel_height_smoothness", 2.0))
+    spike_thr = float(getattr(optimizer.args, "spike_threshold_layers", 1))
+    kk = torch.arange(L + 1, device=dev).view(1, 1, -1)
+    layer = torch.arange(L, device=dev).view(-1, 1, 1)
+    pal = srgb_to_lab(_stack_palette(optimizer, dg.to(torch.long), (layer < kk).float() * optimizer.h))
+    dist = torch.cdist(target_lab.reshape(-1, 3), pal).pow(2) * weights.reshape(-1, 1)  # [HW,L+1]
+
+    def err_map(zmap):
+        comp = composite_image_disc(
+            _heights_to_eff_logits(zmap, L), disc_logits, optimizer.vis_tau, optimizer.vis_tau,
+            optimizer.h, L, optimizer.material_colors, optimizer.material_TDs, optimizer.background,
+            rng_seed=optimizer.best_seed, compute_dtype=optimizer.composite_compute_dtype,
+        )
+        e = (srgb_to_lab(comp) - target_lab).pow(2).sum(-1) * weights
+        if smooth > 0:
+            e = e + smooth * _height_variation(zmap)
+        return e
+
+    # Plateaus: connected components of equal height (4-connectivity).
+    zc = z.cpu().numpy()
+    if mode == "target":
+        # Regions of similar target colour (same Lab grid cell, connected).
+        zc = torch.round(target_lab / cell).to(torch.int64)
+        zc = ((zc[..., 0] * 1009 + zc[..., 1]) * 1009 + zc[..., 2]).cpu().numpy()
+    labels = np.zeros((H, W), dtype=np.int64)
+    n = 0
+    for v in np.unique(zc):
+        lab, k = ndimage.label(zc == v)
+        labels[lab > 0] = lab[lab > 0] + n
+        n += k
+    sizes = np.bincount(labels.ravel(), minlength=n + 1)
+    big = sizes >= min_size
+    big[0] = False
+    if not big.any():
+        return False
+    color = _plateau_classes(np.where(big[labels], labels, 0), n)
+    color = np.where(big, color, -1)
+    lab_t = torch.from_numpy(labels).to(dev)
+    color_t = torch.from_numpy(color).to(dev)
+    # Region optimum height per plateau.
+    cost = torch.zeros(n + 1, L + 1, device=dev).index_add_(0, lab_t.reshape(-1), dist)
+    region_opt = cost.argmin(dim=1)  # [n+1]
+    cnt = torch.zeros(n + 1, device=dev).index_add_(0, lab_t.reshape(-1), torch.ones(H * W, device=dev))
+    region_mean = (torch.zeros(n + 1, device=dev).index_add_(0, lab_t.reshape(-1), z.reshape(-1).float()) / cnt.clamp(min=1)).round().long()
+
+    with torch.no_grad():
+        for c in range(int(color.max()) + 1):
+            in_class = (color_t[lab_t] == c)  # [H,W] pixels of plateaus in this class
+            if not bool(in_class.any()):
+                continue
+            fp_lab = F.max_pool2d(torch.where(in_class, lab_t, torch.zeros_like(lab_t)).float()[None, None], 3, 1, 1)[0, 0].long()
+            base = torch.zeros(n + 1, device=dev).index_add_(0, fp_lab.reshape(-1), err_map(z).reshape(-1))
+            best_err = base.clone()
+            bvm = torch.full_like(z, -1)
+            cands = [(z + s).clamp(0, L) for s in shifts] + [region_opt[lab_t]]
+            if mode == "target":
+                cands.append(region_mean[lab_t])
+            for cv in cands:
+                trial = torch.where(in_class, cv, z)
+                err = torch.zeros(n + 1, device=dev).index_add_(0, fp_lab.reshape(-1), err_map(trial).reshape(-1))
+                better = err < best_err - 1e-9
+                best_err = torch.where(better, err, best_err)
+                bvm = torch.where(better[lab_t] & in_class, cv, bvm)
+            z_new = torch.where(bvm >= 0, bvm, z)
+            if spike_aware:
+                z_new = _drop_new_spikes(z, z_new, spike_thr)
+            z = z_new
+
+    new_logits = optimizer._remove_height_offset(
+        pixel_logits=_heights_to_eff_logits(z, L), height_offsets=optimizer.best_params["height_offsets"]
+    )
+    old_best, old_live = optimizer.best_params["pixel_height_logits"], optimizer.pixel_height_logits
+    optimizer.best_params["pixel_height_logits"] = new_logits
+    optimizer.pixel_height_logits = new_logits
+    post_loss = _compute_loss_for_heightmap(optimizer, dg)
+    kept = post_loss < pre_loss
+    if not kept:
+        optimizer.best_params["pixel_height_logits"] = old_best
+        optimizer.pixel_height_logits = old_live
+    print(f"Plateau refine ({mode}): {n} plateaus, loss {pre_loss:.4f} -> {post_loss:.4f} | {'kept' if kept else 'reverted'}")
+    return kept
