@@ -1988,10 +1988,12 @@ class FilamentOptimizer:
                         refine_pixel_heights(
                             self, sweeps=refine_sweeps, spike_aware=True, block=1, radius=refine_radius,
                         )
-                for _ in range(2 if int(getattr(self.args, "layer_material_refine_window", 2)) > 0 else 0):
+                # getattr: the webui builds its own args without this CLI flag.
+                material_window = int(getattr(self.args, "layer_material_refine_window", 2))
+                for _ in range(2 if material_window > 0 else 0):
                     from autoforge.Helper.PixelHeightRefine import refine_layer_materials
 
-                    if not refine_layer_materials(self, max_colors_allowed, max_swaps_allowed, sweeps=1, window=int(self.args.layer_material_refine_window)):
+                    if not refine_layer_materials(self, max_colors_allowed, max_swaps_allowed, sweeps=1, window=material_window):
                         break
                     refine_pixel_heights(
                         self, sweeps=refine_sweeps, spike_aware=True, block=1, radius=refine_radius,
