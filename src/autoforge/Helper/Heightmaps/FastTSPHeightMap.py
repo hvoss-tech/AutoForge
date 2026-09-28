@@ -383,7 +383,11 @@ def init_height_map(
             material_lab[:, 0] *= lab_weights[0]
             material_lab[:, 1] *= lab_weights[1]
             material_lab[:, 2] *= lab_weights[2]
-            materials = material_colors
+            # Cluster colours are (weighted) Lab, so the filaments have to be
+            # compared in the same space - matching their RGB (0-1) against
+            # Lab (0-100) values picked the brightest filaments for nearly
+            # every layer.
+            materials = material_lab
         else:
             materials = material_colors
 

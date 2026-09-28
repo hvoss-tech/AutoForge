@@ -208,6 +208,19 @@ def parse_args() -> argparse.Namespace:
         help="Downscale factor of the trained smooth per-pixel height field (0 = off)",
     )
     parser.add_argument(
+        "--height_assign",
+        default=True,
+        help="At every discrete check, re-assign every pixel's height exactly for the current layer stack "
+        "(smoothed per-pixel assignment); the gradient steps train the materials in between",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--height_assign_smoothness",
+        type=float,
+        default=2.0,
+        help="--height_assign: cost per layer of height difference to each neighbour, traded against colour error",
+    )
+    parser.add_argument(
         "--early_stopping",
         type=int,
         default=2000,
@@ -1073,6 +1086,17 @@ def _prune_sweep(optimizer: FilamentOptimizer, args) -> None:
         json.dump(results, f)
 
 
+def _discretize_height_only_best(optimizer: FilamentOptimizer) -> torch.Tensor:
+    """Discrete heights [H,W] (layers) of the best solution at the solver
+    resolution."""
+    from autoforge.Modules.Optimizer import _discretize_height_only
+
+    eff = optimizer._apply_height_offset(
+        optimizer.best_params["pixel_height_logits"], optimizer.best_params["height_offsets"]
+    )
+    return _discretize_height_only(eff, optimizer.h, optimizer.max_layers)
+
+
 def _post_optimize_and_export(
     args,
     optimizer: FilamentOptimizer,
@@ -1119,9 +1143,29 @@ def _post_optimize_and_export(
             )[0, 0]
         return full_init + delta
 
-    optimizer.best_params["pixel_height_logits"] = _with_delta(
-        optimizer.best_params["pixel_height_logits"]
-    )
+    assigned = optimizer.height_assign and not optimizer.constrained and optimizer.best_params is not None
+    if assigned:
+        # The trained heights are per-pixel assignments at solver resolution
+        # (the base logits moved during training), so the delta-on-init
+        # transfer below does not apply: start from them, upsampled, and
+        # assign again at the output resolution for the best stack.
+        from autoforge.Helper.HeightAssign import heights_to_logits
+        from autoforge.Helper.OptimizerHelper import batched_layer_material_indices
+
+        with torch.no_grad():
+            z_proc = _discretize_height_only_best(optimizer)
+            best_dg = batched_layer_material_indices(
+                optimizer.best_params["global_logits"],
+                optimizer.vis_tau,
+                optimizer.best_seed if optimizer.best_seed is not None and optimizer.best_seed >= 0 else 0,
+            )
+        z0_full = torch.nn.functional.interpolate(
+            z_proc[None, None].float(), size=full_init.shape[-2:], mode="nearest"
+        )[0, 0]
+    else:
+        optimizer.best_params["pixel_height_logits"] = _with_delta(
+            optimizer.best_params["pixel_height_logits"]
+        )
     optimizer.pixel_height_logits = full_init.clone()
     optimizer.pixel_delta = None
     optimizer.target = output_target
@@ -1130,6 +1174,13 @@ def _post_optimize_and_export(
     )
     if focus_map_proc is not None and focus_map_full is not None:
         optimizer.focus_map = focus_map_full
+    if assigned:
+        with torch.no_grad():
+            z_full = optimizer.assigned_heights(best_dg, heights_to_logits(z0_full, optimizer.max_layers))
+            full_logits = heights_to_logits(z_full, optimizer.max_layers)
+        optimizer.best_params["pixel_height_logits"] = full_logits
+        optimizer.best_params["height_offsets"] = torch.zeros_like(optimizer.best_params["height_offsets"])
+        optimizer.pixel_height_logits = full_logits.clone()
 
     with torch.no_grad():
         with safe_autocast(device):
@@ -1449,6 +1500,9 @@ def start(args) -> float:
     # this loop's 60, and pushed total time past what the extra loss
     # reduction was worth. Kept the simpler, cheaper, already-validated loop.)
     with torch.no_grad():
+        if optimizer.height_assign and not optimizer.constrained:
+            # The last gradient steps moved the heights off the assignment.
+            optimizer.assign_heights_step()
         for _ in range(60):
             optimizer._maybe_update_best_discrete()
         optimizer.search_background()

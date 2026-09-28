@@ -790,7 +790,11 @@ def composite_image_cont(
     # instead of being kept. use_reentrant=True / preserve_rng_state=False:
     # see composite_image_cont_lowmem.
     eff = eff_thick.to(torch.float32)
-    if eff.requires_grad:
+    # The materials alone (heights frozen) still put the [L,H,W] opacity
+    # chain on the tape, through the coverage parameters.
+    if torch.is_grad_enabled() and (
+        eff.requires_grad or reach.requires_grad or slow_reach.requires_grad or cov_w.requires_grad
+    ):
         # Not checkpointed: its backward needs nothing large (cumsum saves
         # nothing, the gather only its indices), so keeping it on the plain
         # tape lets ``eff`` be released as soon as the last segment using it

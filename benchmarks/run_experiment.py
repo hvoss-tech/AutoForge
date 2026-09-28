@@ -90,7 +90,18 @@ def main() -> None:
         poller.start()
 
     t0 = time.perf_counter()
+    from autoforge import auto_forge
     from autoforge.auto_forge import parse_args, start
+
+    # Keep the final height map (layers) for the roughness check.
+    _generate_stl = auto_forge.generate_stl
+    heights = {}
+
+    def _capture_stl(height_map_mm, *a, **k):
+        heights["mm"] = height_map_mm
+        return _generate_stl(height_map_mm, *a, **k)
+
+    auto_forge.generate_stl = _capture_stl
 
     args = parse_args()
     final_loss = start(args)
@@ -120,6 +131,14 @@ def main() -> None:
         "peak_nvidia_smi_gb": peak_nvidia_smi_gb,
         "num_nvidia_smi_samples": len(nvidia_smi_samples),
     }
+    if "mm" in heights:
+        # Printability: share of pixels >= 3 layers off their 3x3 median.
+        import numpy as np
+        from scipy.ndimage import median_filter
+
+        z = np.round(heights["mm"] / args.layer_height)
+        result["roughness"] = float((np.abs(z - median_filter(z, size=3, mode="nearest")) >= 3).mean())
+        np.save(os.path.join(args.output_folder, "final_heights.npy"), z.astype(np.int16))
     print("EXPERIMENT_RESULT " + json.dumps(result))
 
 

@@ -272,6 +272,18 @@ class FilamentOptimizer:
             self._bg_gumbel_exp = torch.empty_like(init)
         self._setup_constraints(args)
 
+        # --height_assign: at every discrete check the per-pixel heights are
+        # re-assigned exactly for the current stack (see HeightAssign).
+        self.height_assign = bool(getattr(args, "height_assign", False))
+        self.height_assign_smooth = float(getattr(args, "height_assign_smoothness", 2.0))
+        if self.height_assign and not self.constrained:
+            # The heights move by assignment only: gradient steps on the
+            # offsets / smooth field between assignments only pull them off
+            # the assigned optimum (and their backward is most of a step).
+            self.height_offsets.requires_grad_(False)
+            if self.pixel_delta is not None:
+                self.pixel_delta.requires_grad_(False)
+
         # Tau schedule
         self.num_steps_done = 0
         self.warmup_steps = min(
@@ -736,6 +748,69 @@ class FilamentOptimizer:
             offsets = offsets + self._delta_up(offsets.shape)
         return pixel_logits + offsets
 
+    def _assign_weights(self, shape):
+        """Per-pixel loss weights (focus map / alpha) as compute_loss applies
+        them, and the mask of pixels that must stay unprinted (alpha)."""
+        w = None
+        keep_empty = None
+        if self.focus_map is not None:
+            fm = self.focus_map.squeeze(-1) if self.focus_map.dim() == 3 else self.focus_map
+            if fm.shape == shape:
+                w = 0.1 + 0.9 * fm.clamp(min=0.0)
+        if self.alpha is not None:
+            a = self.alpha.squeeze(-1) if self.alpha.dim() == 3 else self.alpha
+            if a.shape != shape:
+                a = F.interpolate(a[None, None].float(), size=shape, mode="nearest")[0, 0]
+            keep_empty = a < 128
+            w = (w if w is not None else torch.ones(shape, device=self.device)) * (~keep_empty).float()
+        return w, keep_empty
+
+    @torch.no_grad()
+    def assigned_heights(self, dg: torch.Tensor, eff_logits: torch.Tensor, background=None) -> torch.Tensor:
+        """Heights [H,W] (layers) for the stack ``dg`` by the smoothed
+        per-pixel assignment against ``self.target``, starting from the
+        discrete heights of ``eff_logits``."""
+        from autoforge.Helper.HeightAssign import assign_heights, stack_colors
+
+        L = int(self.max_layers)
+        bg = self.background if background is None else background
+        colors = stack_colors(dg, L, self.h, self.material_colors, self.material_TDs, bg)
+        z0 = _discretize_height_only(eff_logits, self.h, L)
+        w, keep_empty = self._assign_weights(tuple(z0.shape))
+        target_lab = getattr(self.target, "_af_lab_cache", None)
+        if target_lab is not None and target_lab.dtype != torch.float32:
+            target_lab = None
+        # z0=None: the descent starts from the colour-only optimum rather than
+        # from the current map - it only finds local optima, and from the
+        # current (or, at output resolution, the upsampled) map it keeps its
+        # blocks.
+        z = assign_heights(
+            colors, self.target, None, smooth=self.height_assign_smooth, weights=w,
+            target_lab=target_lab,
+        )
+        if keep_empty is not None:
+            z = torch.where(keep_empty, z0.to(z.dtype), z)
+        return z
+
+    @torch.no_grad()
+    def assign_heights_step(self) -> None:
+        """E-step of the training: move every pixel's height to its best
+        (smoothed) height under the current most likely stack. Only the
+        frozen base logits change, in place (the captured training graph
+        reads them), so the effective heights become exactly the assigned
+        ones while the trained offsets and the smooth field stay as they
+        are and keep training from there."""
+        from autoforge.Helper.HeightAssign import heights_to_logits
+
+        dg = self.params["global_logits"].detach().argmax(dim=1)
+        bg = None
+        if self.bg_logits is not None:
+            bg = self.material_colors[int(self.bg_logits.detach().argmax())]
+        eff = self._apply_height_offset()
+        z = self.assigned_heights(dg, eff, background=bg)
+        new_eff = heights_to_logits(z, self.max_layers)
+        self.pixel_height_logits.copy_(new_eff - (eff - self.pixel_height_logits))
+
     def _delta_up(self, shape):
         return F.interpolate(
             self.pixel_delta, size=tuple(shape[-2:]), mode="bilinear", align_corners=False
@@ -924,9 +999,10 @@ class FilamentOptimizer:
             self.optimizer.zero_grad(set_to_none=False)
 
     def _validated_params(self):
-        return [self.params["global_logits"], self.height_offsets] + (
+        params = [self.params["global_logits"], self.height_offsets] + (
             [self.bg_logits] if self.bg_logits is not None else []
         )
+        return [p for p in params if p.requires_grad]
 
     def _soft_background(self, tau: float) -> torch.Tensor:
         """The base color during training with --optimize_background: a
@@ -1160,6 +1236,8 @@ class FilamentOptimizer:
                 pass
 
         if record_best:
+            if self.height_assign and not self.constrained:
+                self.assign_heights_step()
             self._maybe_update_best_discrete()
             if (
                 getattr(self.args, "constrained_opt", False)
@@ -2458,6 +2536,17 @@ class FilamentOptimizer:
 
             from autoforge.Helper.PruningHelper import disc_to_logits, find_color_bands
 
+            own_heights = self.height_assign
+            if own_heights:
+                # Each sampled stack is judged with the heights assigned for
+                # it (the final result gets exactly that), not with the
+                # heights of the most likely stack.
+                from autoforge.Helper.HeightAssign import heights_to_logits
+
+                effective_logits = heights_to_logits(
+                    self.assigned_heights(disc_global, effective_logits), self.max_layers
+                )
+
             for disc_global in candidates:
                 # Build discrete global logits from disc_global to avoid
                 # re-running Gumbel-Softmax inside composite_image_disc.
@@ -2493,6 +2582,11 @@ class FilamentOptimizer:
                     if self.constrained:
                         # The stored solution is the feasible stack itself.
                         self.best_params["global_logits"] = disc_global_logits.clone()
+                    if own_heights:
+                        offs = self._apply_height_offset(
+                            torch.zeros_like(effective_logits), self.best_params["height_offsets"]
+                        )
+                        self.best_params["pixel_height_logits"] = effective_logits - offs
                     self.best_tau = tau_g
                     self.best_seed = seed
                     self.best_swaps = len(find_color_bands(disc_global)) - 1
