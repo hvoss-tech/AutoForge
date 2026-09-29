@@ -89,12 +89,14 @@ _DEFAULTS = {
     "stl_output_size": 150,
     "processing_reduction_factor": 2,
     "nozzle_diameter": 0.4,
-    "early_stopping": 2000,
+    "early_stopping": 3000,
     "perform_pruning": False,
     "fast_pruning": True,
     "fast_pruning_percent": 0.25,
     "spike_removal": True,
     "spike_threshold_layers": 1,
+    "pixel_height_smoothness": 1.0,
+    "edge_bleed": 0.25,
     "pruning_max_colors": 100,
     "pruning_max_swaps": 100,
     "pruning_max_layer": 75,
@@ -359,6 +361,7 @@ def build_pipeline_state(
         "focus_map_full": focus_map_full,
         "focus_map_proc": focus_map_proc,
         "pixel_height_logits_init": pixel_height_logits_init,
+        "processing_pixel_height_logits_init": processing_pixel_height_logits_init,
         "global_logits_init": global_logits_init,
         "pixel_height_labels": pixel_height_labels,
         "processing_target": processing_target,
@@ -573,6 +576,38 @@ def _run_optimization_loop(
 # Export: finalise and write all output files
 # ---------------------------------------------------------------------------
 
+def _best_heights_at_output_res(
+    best_proc: Optional[torch.Tensor],
+    proc_init: Optional[np.ndarray],
+    full_init: torch.Tensor,
+    alpha: Optional[np.ndarray],
+) -> torch.Tensor:
+    """The best solution's per-pixel height logits at the output resolution.
+
+    Training runs at the processing resolution from ``proc_init`` (the
+    full-resolution init, downscaled). What it changed per pixel - the
+    intermediate stack search refines single pixels' heights - is carried
+    over onto the full-resolution init (nearest neighbour; exact when the two
+    resolutions agree). Restoring the plain init instead, as this used to,
+    was only right while training left the per-pixel logits alone: it threw
+    the refined heights away while keeping the stack chosen for them, so the
+    exported result and every preview after it came out in wrong colors.
+    """
+    if best_proc is None or proc_init is None:
+        return full_init.clone()
+    delta = best_proc.detach().float() - torch.from_numpy(proc_init).to(best_proc.device).float()
+    if delta.shape != full_init.shape:
+        delta = torch.nn.functional.interpolate(
+            delta[None, None], size=tuple(full_init.shape[-2:]), mode="nearest"
+        )[0, 0]
+    out = full_init + delta.to(full_init.dtype)
+    if alpha is not None:
+        a = alpha[..., 0] if alpha.ndim == 3 else alpha
+        if a.shape == tuple(out.shape):
+            out[torch.from_numpy(a < 128).to(out.device)] = full_init[torch.from_numpy(a < 128).to(out.device)]
+    return out
+
+
 def export_results(
     result: Dict[str, Any],
     cancel_event: Optional[threading.Event] = None,
@@ -604,6 +639,11 @@ def export_results(
     """
     optimizer: FilamentOptimizer = result["optimizer"]
     args: argparse.Namespace = result["args"]
+    # Exports (and the pruning that runs inside them) composite with the
+    # job's own edge bleed, whatever job ran last.
+    from autoforge.Helper.OptimizerHelper import EDGE_BLEED, set_edge_bleed
+
+    set_edge_bleed(float(getattr(args, "edge_bleed", EDGE_BLEED)))
     device: torch.device = result["device"]
     material_colors_np: np.ndarray = result["material_colors_np"]
     material_TDs_np: np.ndarray = result["material_TDs_np"]
@@ -631,13 +671,23 @@ def export_results(
     # single pruning phase had run. Every pass after the first then started
     # from a worse solution than the one it was supposed to improve, which is
     # what made repeated pruning steadily degrade the result.
+    refine_carried = False
     if not getattr(optimizer, "_full_res_height_restored", False):
-        optimizer.pixel_height_logits = torch.from_numpy(
-            pixel_height_logits_init
-        ).to(device)
-        optimizer.best_params["pixel_height_logits"] = torch.from_numpy(
-            pixel_height_logits_init
-        ).to(device)
+        full_init = torch.from_numpy(pixel_height_logits_init).to(device)
+        optimizer.pixel_height_logits = full_init.clone()
+        carried = _best_heights_at_output_res(
+            optimizer.best_params.get("pixel_height_logits"),
+            result.get("processing_pixel_height_logits_init"),
+            full_init,
+            alpha,
+        )
+        # Training changed single pixels' heights (the intermediate stack
+        # search): carried over from the processing resolution they sit in
+        # blocks, with stair-steps along every edge, until something assigns
+        # them at the output resolution - pruning's pixel refine did, so the
+        # result showed those artifacts until pruning got that far.
+        refine_carried = not torch.equal(carried, full_init)
+        optimizer.best_params["pixel_height_logits"] = carried
         optimizer._full_res_height_restored = True
     optimizer.target = output_target
     optimizer.pixel_height_labels = torch.tensor(
@@ -648,6 +698,14 @@ def export_results(
 
     with torch.no_grad():
         with safe_autocast(device):
+            if refine_carried:
+                from autoforge.Helper.PixelHeightRefine import refine_pixel_heights
+
+                refine_pixel_heights(
+                    optimizer,
+                    sweeps=int(getattr(args, "pixel_height_refine_sweeps", 2)),
+                    radius=int(getattr(args, "pixel_height_refine_radius", 3)),
+                )
             # ---- Pruning ----
             if args.perform_pruning:
                 max_colors_for_pruning = args.pruning_max_colors

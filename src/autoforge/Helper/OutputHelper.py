@@ -7,6 +7,7 @@ import uuid
 import numpy as np
 
 from autoforge.Helper.FilamentHelper import load_materials_data
+from autoforge.Helper.HeightfieldMesh import heightfield_mesh
 
 
 def extract_filament_swaps(disc_global, disc_height_image, background_layers):
@@ -241,11 +242,15 @@ def generate_stl(
 ):
     """
     Generate a binary STL file from a height map with an optional alpha mask.
-    If alpha_mask is provided, vertices where alpha < 128 are omitted.
-    This function builds a manifold mesh consisting of:
-      - a top surface (only quads whose four vertices are valid),
-      - side walls along the boundary edges of the top surface, and
-      - a bottom face covering the valid region.
+
+    The solid is the one the per-pixel mesh describes - a vertex at every
+    pixel centre at its height, each grid cell split into two triangles along
+    its (i, j)-(i+1, j+1) diagonal, vertical walls along the outline and a
+    flat bottom at z=0 - meshed with far fewer triangles: the plateaus the
+    layer quantisation produces are merged (see HeightfieldMesh). Every vertex
+    is a vertex of the per-pixel mesh and every triangle lies in one of its
+    planes, so the surface is exactly the same; the mesh is closed,
+    2-manifold along every edge and consistently oriented (outward normals).
 
     Args:
         height_map (np.ndarray): 2D array representing the height map.
@@ -253,140 +258,13 @@ def generate_stl(
         background_height (float): The height of the background in the STL model.
         maximum_x_y_size (float): Maximum size (in millimeters) for the x and y dimensions.
         alpha_mask (np.ndarray): Optional alpha mask (same shape as height_map).
-            A pixel is “valid” only if its alpha is ≥ 128.
+            A pixel is “valid” only if its alpha is ≥ 128; a cell is
+            meshed only if its four corners are valid.
     """
-    H, W = height_map.shape
-
-    # Compute valid mask: every pixel is valid if no alpha mask is provided.
-    valid_mask = (
-        np.ones((H, W), dtype=bool) if alpha_mask is None else (alpha_mask >= 128)
+    verts, faces = heightfield_mesh(
+        height_map, background_height, maximum_x_y_size, alpha_mask
     )
-
-    # --- Vectorized Creation of Vertices ---
-    # Create a meshgrid of coordinates. Note that the y coordinate is flipped so that row 0 is at the top.
-    j, i = np.meshgrid(np.arange(W), np.arange(H))
-    x = j.astype(np.float32)
-    y = (H - 1 - i).astype(np.float32)
-    z = height_map.astype(np.float32) + background_height
-
-    top_vertices = np.stack([x, y, z], axis=2)
-    bottom_vertices = top_vertices.copy()
-    bottom_vertices[:, :, 2] = 0
-
-    # Scale vertices so the maximum x or y dimension equals maximum_x_y_size.
-    original_max = max(W - 1, H - 1)
-    scale = maximum_x_y_size / original_max
-    top_vertices[:, :, :2] *= scale
-    bottom_vertices[:, :, :2] *= scale
-
-    # --- Top and Bottom Surfaces ---
-    # Only use cells (quads) where all four corners are valid.
-    quad_valid = (
-        valid_mask[:-1, :-1]
-        & valid_mask[:-1, 1:]
-        & valid_mask[1:, 1:]
-        & valid_mask[1:, :-1]
-    )
-    valid_i, valid_j = np.nonzero(quad_valid)
-    num_quads = len(valid_i)
-
-    # Define the four corners of each valid quad.
-    v0 = top_vertices[valid_i, valid_j]
-    v1 = top_vertices[valid_i, valid_j + 1]
-    v2 = top_vertices[valid_i + 1, valid_j + 1]
-    v3 = top_vertices[valid_i + 1, valid_j]
-
-    # Top surface: using triangles (v2, v1, v0) and (v3, v2, v0)
-    top_triangles = np.concatenate(
-        [np.stack([v2, v1, v0], axis=1), np.stack([v3, v2, v0], axis=1)], axis=0
-    )
-
-    # Bottom face (using bottom vertices; note the reversed order so normals point downward)
-    bv0 = bottom_vertices[valid_i, valid_j]
-    bv1 = bottom_vertices[valid_i, valid_j + 1]
-    bv2 = bottom_vertices[valid_i + 1, valid_j + 1]
-    bv3 = bottom_vertices[valid_i + 1, valid_j]
-
-    bottom_triangles = np.concatenate(
-        [np.stack([bv0, bv1, bv2], axis=1), np.stack([bv0, bv2, bv3], axis=1)], axis=0
-    )
-
-    # --- Side Walls ---
-    # Determine boundary edges from the grid of valid quads.
-    # For each quad edge, if there is no neighboring valid quad sharing that edge, it is a boundary.
-    side_triangles_list = []
-
-    # Left edges: for quads in column 0 or when left neighbor is not valid.
-    left_cond = np.zeros_like(quad_valid, dtype=bool)
-    left_cond[:, 0] = quad_valid[:, 0]
-    left_cond[:, 1:] = quad_valid[:, 1:] & (~quad_valid[:, :-1])
-    li, lj = np.nonzero(left_cond)
-    lv0 = top_vertices[li, lj]
-    lv1 = top_vertices[li + 1, lj]
-    lb0 = bottom_vertices[li, lj]
-    lb1 = bottom_vertices[li + 1, lj]
-    left_tris = np.concatenate(
-        [np.stack([lv0, lv1, lb1], axis=1), np.stack([lv0, lb1, lb0], axis=1)], axis=0
-    )
-    side_triangles_list.append(left_tris)
-
-    # Right edges: for quads in the last column or when right neighbor is not valid.
-    right_cond = np.zeros_like(quad_valid, dtype=bool)
-    right_cond[:, -1] = quad_valid[:, -1]
-    right_cond[:, :-1] = quad_valid[:, :-1] & (~quad_valid[:, 1:])
-    ri, rj = np.nonzero(right_cond)
-    rv0 = top_vertices[ri, rj + 1]
-    rv1 = top_vertices[ri + 1, rj + 1]
-    rb0 = bottom_vertices[ri, rj + 1]
-    rb1 = bottom_vertices[ri + 1, rj + 1]
-    right_tris = np.concatenate(
-        [np.stack([rv0, rv1, rb1], axis=1), np.stack([rv0, rb1, rb0], axis=1)], axis=0
-    )
-    side_triangles_list.append(right_tris)
-
-    # Top edges: for quads in the first row or when the above neighbor is not valid.
-    top_cond = np.zeros_like(quad_valid, dtype=bool)
-    top_cond[0, :] = quad_valid[0, :]
-    top_cond[1:, :] = quad_valid[1:, :] & (~quad_valid[:-1, :])
-    ti, tj = np.nonzero(top_cond)
-    tv0 = top_vertices[ti, tj]
-    tv1 = top_vertices[ti, tj + 1]
-    tb0 = bottom_vertices[ti, tj]
-    tb1 = bottom_vertices[ti, tj + 1]
-    top_wall_tris = np.concatenate(
-        [np.stack([tv0, tv1, tb1], axis=1), np.stack([tv0, tb1, tb0], axis=1)], axis=0
-    )
-    side_triangles_list.append(top_wall_tris)
-
-    # Bottom edges: for quads in the last row or when the below neighbor is not valid.
-    bottom_cond = np.zeros_like(quad_valid, dtype=bool)
-    bottom_cond[-1, :] = quad_valid[-1, :]
-    bottom_cond[:-1, :] = quad_valid[:-1, :] & (~quad_valid[1:, :])
-    bi, bj = np.nonzero(bottom_cond)
-    bv0_edge = top_vertices[bi + 1, bj]
-    bv1_edge = top_vertices[bi + 1, bj + 1]
-    bb0 = bottom_vertices[bi + 1, bj]
-    bb1 = bottom_vertices[bi + 1, bj + 1]
-    bottom_wall_tris = np.concatenate(
-        [
-            np.stack([bv0_edge, bv1_edge, bb1], axis=1),
-            np.stack([bv0_edge, bb1, bb0], axis=1),
-        ],
-        axis=0,
-    )
-    side_triangles_list.append(bottom_wall_tris)
-
-    # Combine all side wall triangles.
-    side_triangles = (
-        np.concatenate(side_triangles_list, axis=0)
-        if side_triangles_list
-        else np.empty((0, 3, 3), dtype=np.float32)
-    )
-
-    # --- Combine All Triangles ---
-    all_triangles = np.concatenate(
-        [top_triangles, side_triangles, bottom_triangles], axis=0
-    )
+    all_triangles = verts[faces]
 
     # --- Compute Normals Vectorized ---
     v1_arr = all_triangles[:, 0, :]
@@ -416,26 +294,12 @@ def generate_stl(
     stl_data["v3"] = all_triangles[:, 2, :]
     stl_data["attr"] = 0
 
-    # Write to an in-memory buffer
-    buffer = io.BytesIO()
     header_str = "Binary STL generated from heightmap with alpha mask"
     header = header_str.encode("utf-8").ljust(80, b" ")
-    buffer.write(header)
-    buffer.write(struct.pack("<I", num_triangles))
-    buffer.write(stl_data.tobytes())
-
-    # `buffer` is already a complete, valid binary STL (we hand-built the
-    # header/triangle-count/triangle-soup above). Binary STL has no
-    # shared-vertex representation - every triangle stores its own 3
-    # vertices independently - so round-tripping through
-    # trimesh.load(...).merge_vertices().export(...) here cannot change a
-    # single byte of the output: merge_vertices() only collapses trimesh's
-    # in-memory indexed representation, which export() re-expands back into
-    # the exact same triangle soup on the way out. Verified byte-identical
-    # output (same size/volume/area/watertightness) while being ~10x faster
-    # at typical mesh sizes - just write the bytes we already have.
     with open(filename, "wb") as f:
-        f.write(buffer.getvalue())
+        f.write(header)
+        f.write(struct.pack("<I", num_triangles))
+        f.write(stl_data.tobytes())
 
 
 def generate_swap_instructions(

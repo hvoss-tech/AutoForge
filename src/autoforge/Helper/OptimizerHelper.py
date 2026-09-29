@@ -196,17 +196,39 @@ def batched_layer_material_indices(
     return torch.argmax(y_soft, dim=-1)
 
 
+# Weight of the 8 neighbours' mean in every layer's effective presence (see
+# bleed_layer_effect): the default, and the value every composite of this
+# process uses (--edge_bleed; FilamentOptimizer sets it from its args).
+EDGE_BLEED = 0.1
+_edge_bleed = EDGE_BLEED
+
+
+def set_edge_bleed(strength: float) -> None:
+    global _edge_bleed
+    _edge_bleed = float(strength)
+
+
+def get_edge_bleed() -> float:
+    return _edge_bleed
+
+
 @torch.jit.script
-def bleed_layer_effect(mask: torch.Tensor, strength: float = 0.1) -> torch.Tensor:
+def bleed_layer_effect(mask: torch.Tensor, strength: float = EDGE_BLEED) -> torch.Tensor:
     """
-    Applies a simple 2D 3x3 average blur to simulate edge bleeding.
+    Edge bleed: each layer's presence at a pixel blends with the mean of its
+    8 neighbours', ``(1 - strength) * own + strength * neighbours``.
+
+    Both sides of a height step are affected: the lower pixel gets a thin
+    share of the taller neighbour's upper layers, and the taller pixel's own
+    upper layers thin out at the edge, so its lower layers show through
+    there. A flat area is unchanged (neighbours equal to itself).
 
     Args:
         mask (torch.Tensor): [H,W] or [L,H,W] tensor of masks.
-        strength (float): Amount of the bleed to spread to neighbors.
+        strength (float): Weight of the neighbours' mean.
 
     Returns:
-        torch.Tensor: Mask with neighboring bleed added.
+        torch.Tensor: Blended mask, in [0, 1] for masks in [0, 1].
     """
     if mask.dim() == 2:
         mask = mask.unsqueeze(0)  # [1,H,W]
@@ -230,8 +252,7 @@ def bleed_layer_effect(mask: torch.Tensor, strength: float = 0.1) -> torch.Tenso
         1
     )  # [L,H,W]
 
-    # Combine original mask with bleed from neighbors
-    return mask + strength * blurred
+    return (1.0 - strength) * mask + strength * blurred
 
 
 # --------------------------------------------------------------------------
@@ -641,6 +662,7 @@ def _print_mask_segment(
     h: float,
     max_layers: int,
     compute_dtype: Optional[torch.dtype] = None,
+    bleed: float = EDGE_BLEED,
 ) -> torch.Tensor:
     """[L,H,W] effective thickness of every layer (soft print mask with
     neighbour bleed, times the layer height). Run under activation
@@ -671,7 +693,7 @@ def _print_mask_segment(
         p_print = p_print.to(compute_dtype)
 
     # 4. thickness and opacity
-    p_print_bleed = bleed_layer_effect(p_print, strength=0.1)  # [L,H,W]
+    p_print_bleed = bleed_layer_effect(p_print, bleed)  # [L,H,W]
     del p_print
     eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
     del p_print_bleed
@@ -856,11 +878,11 @@ def composite_image_cont(
             )
     if continuous_z.requires_grad:
         eff_thick = torch.utils.checkpoint.checkpoint(
-            _print_mask_segment, continuous_z, tau_height, h, max_layers, compute_dtype,
+            _print_mask_segment, continuous_z, tau_height, h, max_layers, compute_dtype, get_edge_bleed(),
             use_reentrant=True, preserve_rng_state=False,
         )
     else:
-        eff_thick = _print_mask_segment(continuous_z, tau_height, h, max_layers, compute_dtype)
+        eff_thick = _print_mask_segment(continuous_z, tau_height, h, max_layers, compute_dtype, get_edge_bleed())
     # Issued after the big mask kernels: this chain of tiny per-layer kernels
     # launches while the GPU works on those.
     reach, slow_reach, cov_w, run_start = _cont_coverage_params(
@@ -932,6 +954,7 @@ def _composite_cont_chunk(
     carry_thick: torch.Tensor,  # [H,W]
     carry_cov: torch.Tensor,  # [H,W]
     compute_dtype: Optional[torch.dtype] = None,
+    bleed: float = EDGE_BLEED,
 ):
     """One slice (layers lo..lo+k-1) of the continuous composite.
 
@@ -955,7 +978,7 @@ def _composite_cont_chunk(
         p_print = p_print.to(compute_dtype)
         layer_colors = layer_colors.to(compute_dtype)
 
-    p_print_bleed = bleed_layer_effect(p_print, strength=0.1)
+    p_print_bleed = bleed_layer_effect(p_print, bleed)
     del p_print
     eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
     del p_print_bleed
@@ -1081,6 +1104,7 @@ def composite_image_cont_lowmem(
             carry_thick,
             carry_cov,
             compute_dtype,
+            get_edge_bleed(),
             use_reentrant=True,
             preserve_rng_state=False,
         )
@@ -1275,9 +1299,9 @@ def composite_image_disc(
     """Discrete counterpart of `composite_image_cont` (see
     ``_composite_image_disc``); repeated calls replay a CUDA graph."""
 
-    def run(pl, gl, mc, mt, bg, tau_h, tau_g, h_, n_layers, seed, dtype, chunk):
+    def run(pl, gl, mc, mt, bg, tau_h, tau_g, h_, n_layers, seed, dtype, chunk, bleed):
         return _composite_image_disc(
-            pl, gl, tau_h, tau_g, h_, n_layers, mc, mt, bg, seed, dtype, chunk
+            pl, gl, tau_h, tau_g, h_, n_layers, mc, mt, bg, seed, dtype, chunk, bleed
         )
 
     return _replay_captured(
@@ -1291,6 +1315,7 @@ def composite_image_disc(
         int(rng_seed),
         compute_dtype,
         int(layer_chunk),
+        get_edge_bleed(),
     )
 
 
@@ -1308,6 +1333,7 @@ def _composite_image_disc(
     rng_seed: int = -1,
     compute_dtype: Optional[torch.dtype] = None,
     layer_chunk: int = 25,
+    bleed: float = EDGE_BLEED,
 ) -> torch.Tensor:
     """
     Discrete counterpart of `composite_image_cont`.
@@ -1380,7 +1406,7 @@ def _composite_image_disc(
         if compute_dtype is not None:
             p_print = p_print.to(compute_dtype)
 
-        p_print_bleed = bleed_layer_effect(p_print, strength=0.1)
+        p_print_bleed = bleed_layer_effect(p_print, bleed)
         eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
         opac, carry_thick, carry_cov = _layer_opacity(
             eff_thick,

@@ -16,6 +16,7 @@ from autoforge.Helper.OptimizerHelper import (
     composite_image_disc,
     adaptive_round,
     bleed_layer_effect,
+    get_edge_bleed,
     deterministic_gumbel_noise,
     layer_coverage_params,
     material_run_starts,
@@ -70,7 +71,7 @@ def _eff_thick_from_logits(
         stop = min(start + LAYER_CHUNK, max_layers)
         layer_idx = torch.arange(start, stop, device=device).view(-1, 1, 1)
         p_print = (layer_idx < z_int.unsqueeze(0)).to(eff_logits.dtype)   # [k,H,W]
-        p_bleed = bleed_layer_effect(p_print, 0.1)
+        p_bleed = bleed_layer_effect(p_print, get_edge_bleed())
         del p_print
         torch.clamp(p_bleed, 0.0, 1.0, out=eff[start:stop])
         eff[start:stop] *= h

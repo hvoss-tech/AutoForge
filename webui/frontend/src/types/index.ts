@@ -43,6 +43,8 @@ export interface OptimizationSettings {
   fast_pruning_percent: number
   spike_removal: boolean
   spike_threshold_layers: number
+  pixel_height_smoothness: number
+  edge_bleed: number
   pruning_max_colors: number
   pruning_max_swaps: number
   pruning_max_layer: number

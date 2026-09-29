@@ -96,8 +96,22 @@ def test_bleed_layer_effect_spreads_into_neighbours():
     mask[0, 2, 2] = 1.0
     out = bleed_layer_effect(mask, strength=0.5)
     assert out.shape == mask.shape
-    assert out[0, 2, 2] == pytest.approx(1.0)  # centre tap is zero
-    assert out[0, 2, 1] > 0.0 and out[0, 1, 2] > 0.0  # neighbours gained bleed
+    # the isolated pixel thins out (its neighbours have nothing): 1 - s
+    assert out[0, 2, 2] == pytest.approx(0.5)
+    # each neighbour gains s/8
+    assert out[0, 2, 1] == pytest.approx(0.5 / 8) and out[0, 1, 2] == pytest.approx(0.5 / 8)
+
+
+def test_bleed_layer_effect_is_two_sided_at_a_step_and_neutral_on_flats():
+    # a layer printed on the left half only: at the step the printed side
+    # thins, the unprinted side gets a share; away from it nothing changes
+    mask = torch.zeros(1, 5, 6)
+    mask[0, :, :3] = 1.0
+    out = bleed_layer_effect(mask, strength=0.1)
+    assert out[0, 2, 2] == pytest.approx(0.9 + 0.1 * 5 / 8)  # tall side of the step
+    assert out[0, 2, 3] == pytest.approx(0.1 * 3 / 8)  # low side of the step
+    assert out[0, 2, 1] == pytest.approx(1.0) and out[0, 2, 5] == pytest.approx(0.0)
+    assert float(out.max()) <= 1.0 + 1e-6
 
 
 # --------------------------------------------------------------------------

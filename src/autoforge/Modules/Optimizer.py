@@ -21,6 +21,8 @@ from autoforge.Helper.DeviceUtils import (
     synchronize,
 )
 from autoforge.Helper.OptimizerHelper import (
+    EDGE_BLEED,
+    set_edge_bleed,
     batched_layer_material_indices,
     composite_graph_scope,
     composite_image_cont,
@@ -292,6 +294,8 @@ class FilamentOptimizer:
         # re-assigned exactly for the current stack (see HeightAssign).
         self.height_assign = bool(getattr(args, "height_assign", False))
         self.height_assign_smooth = float(getattr(args, "height_assign_smoothness", 2.0))
+        # Every composite of the process uses this run's edge bleed.
+        set_edge_bleed(float(getattr(args, "edge_bleed", EDGE_BLEED)))
         if self.height_assign and not self.constrained:
             # The heights move by assignment only: gradient steps on the
             # offsets / smooth field between assignments only pull them off
@@ -618,7 +622,6 @@ class FilamentOptimizer:
 
     @composite_graph_scope()
     @torch.no_grad()
-    @torch.no_grad()
     def intermediate_search(self) -> None:
         """A short stack search and per-pixel height refine on the best
         solution in the middle of training (--intermediate_search_interval),
@@ -690,8 +693,13 @@ class FilamentOptimizer:
             self._proj_target.zero_()
             self._proj_target.scatter_(1, dg.view(-1, 1), 1.0)
         # The running average would pull the snapshots back toward the old
-        # parameters; restart it here.
-        self._ema = None
+        # parameters; restart it here - in place: the captured update graph
+        # writes the average into these very buffers, so dropping them
+        # (``self._ema = None``) left it writing into freed memory, which the
+        # allocator handed to the next small tensor (the base color).
+        if getattr(self, "_ema", None) is not None:
+            for e, t in zip(self._ema, self._ema_tensors()):
+                e.copy_(t.detach())
         # Snapshots are judged against best_discrete_loss: re-measure the
         # best by the snapshot's own measure so a later, worse snapshot
         # cannot replace it.
@@ -722,6 +730,8 @@ class FilamentOptimizer:
             loss = _candidate_loss(self, eff, cols, tds)
         return float(loss)
 
+    @composite_graph_scope()
+    @torch.no_grad()
     def constrained_local_search(
         self,
         max_rounds: int = 1000,

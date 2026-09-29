@@ -14,7 +14,7 @@ import os
 
 import torch
 
-from autoforge.Helper.OptimizerHelper import material_run_starts, run_starts
+from autoforge.Helper.OptimizerHelper import get_edge_bleed, material_run_starts, run_starts
 
 try:
     import triton
@@ -32,7 +32,6 @@ if os.environ.get("AUTOFORGE_TRITON", "").strip().lower() in {"off", "0", "false
 
 
 if _HAS_TRITON:
-
     @triton.jit
     def _lab_f(t):
         return tl.where(
@@ -52,7 +51,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _disc_composite_kernel(
-        z_ptr, out_ptr, params_ptr, bg_ptr, H, W, L, h, inv_h,
+        z_ptr, out_ptr, params_ptr, bg_ptr, H, W, L, h, inv_h, own, nbw,
         tlab_ptr, wt_ptr, smooth, zstride,
         ERR: tl.constexpr, BLOCK: tl.constexpr, LOSS: tl.constexpr = False,
     ):
@@ -111,7 +110,7 @@ if _HAS_TRITON:
                 + (l < z_ul).to(tl.float32) + (l < z_ur).to(tl.float32)
                 + (l < z_dl).to(tl.float32) + (l < z_dr).to(tl.float32)
             )
-            m = (l < z).to(tl.float32) + 0.1 * (0.125 * nb)
+            m = own * (l < z).to(tl.float32) + nbw * nb
             eff = tl.minimum(tl.maximum(m, 0.0), 1.0) * h
             run_thick = eff + cont * run_thick
             root = tl.sqrt(tl.maximum(run_thick, 1e-12))
@@ -163,6 +162,14 @@ if _HAS_TRITON:
             tl.store(o + 2, cb * 255.0, mask=valid)
 
 
+def _bleed_weights():
+    """Edge bleed (OptimizerHelper.bleed_layer_effect) as the kernels take
+    it: a layer's effective presence is own * own presence + nbw * (sum over
+    the 8 neighbours)."""
+    s = get_edge_bleed()
+    return 1.0 - s, s / 8.0
+
+
 def stack_params(dg: torch.Tensor, material_colors, material_TDs, background, h: float) -> torch.Tensor:
     """[L,8] fp32 per-layer table for the kernel (see its params row)."""
     dg = dg.to(torch.long)
@@ -208,7 +215,7 @@ def composite_heights(z: torch.Tensor, params: torch.Tensor, bg: torch.Tensor, h
     grid = (triton.cdiv(H * W, BLOCK),)
     _disc_composite_kernel[grid](
         zi, out, params.contiguous(), bg, H, W, int(params.shape[0]),
-        float(h), 1.0 / float(h), out, out, 0.0, 0, ERR=False, BLOCK=BLOCK,
+        float(h), 1.0 / float(h), *_bleed_weights(), out, out, 0.0, 0, ERR=False, BLOCK=BLOCK,
     )
     return out
 
@@ -224,7 +231,7 @@ def heights_error(z, params, bg: torch.Tensor, h: float, target_lab, weights, sm
     grid = (triton.cdiv(H * W, BLOCK),)
     _disc_composite_kernel[grid](
         zi, out, params.contiguous(), bg, H, W, int(params.shape[0]),
-        float(h), 1.0 / float(h), target_lab.contiguous(), weights.contiguous(), float(smooth), 0,
+        float(h), 1.0 / float(h), *_bleed_weights(), target_lab.contiguous(), weights.contiguous(), float(smooth), 0,
         ERR=True, BLOCK=BLOCK,
     )
     return out
@@ -290,7 +297,7 @@ if _HAS_TRITON:
     @triton.jit
     def _cont_fwd_kernel(
         z_ptr, out_ptr, prm_ptr, bg_ptr, rt_ptr, s_ptr, g_ptr,
-        H, W, L, h, inv_h, scale,
+        H, W, L, h, inv_h, scale, own, nbw,
         STORE: tl.constexpr, BLOCK: tl.constexpr,
     ):
         """Forward walk. With STORE it is the backward's first pass instead:
@@ -323,7 +330,7 @@ if _HAS_TRITON:
             w = tl.load(p + 5)
             cont = tl.load(p + 6)
             t = l + 0.5
-            m = _sig((z - t) * scale) + 0.0125 * _nb_sum(
+            m = own * _sig((z - t) * scale) + nbw * _nb_sum(
                 z_u, z_d, z_l, z_r, z_ul, z_ur, z_dl, z_dr,
                 v_u, v_d, v_l, v_r, v_ul, v_ur, v_dl, v_dr, t, scale)
             eff = tl.minimum(tl.maximum(m, 0.0), 1.0) * h
@@ -347,7 +354,7 @@ if _HAS_TRITON:
     @triton.jit
     def _cont_bwd_kernel(
         z_ptr, g_ptr, prm_ptr, rt_ptr, s_ptr, red_ptr,
-        H, W, L, h, inv_h, scale,
+        H, W, L, h, inv_h, scale, own, nbw,
         BLOCK: tl.constexpr,
     ):
         """Top-down pass: parameter gradients (per-block partial sums into red
@@ -388,7 +395,7 @@ if _HAS_TRITON:
             rt_p = tl.load(rt_ptr + lp * N + offs, mask=valid & (l > 0), other=0.0)
             s = tl.load(s_ptr + l * N + offs, mask=valid, other=0.0)
             t = l + 0.5
-            m = _sig((z - t) * scale) + 0.0125 * _nb_sum(
+            m = own * _sig((z - t) * scale) + nbw * _nb_sum(
                 z_u, z_d, z_l, z_r, z_ul, z_ur, z_dl, z_dr,
                 v_u, v_d, v_l, v_r, v_ul, v_ur, v_dl, v_dr, t, scale)
             eff = tl.minimum(tl.maximum(m, 0.0), 1.0) * h
@@ -435,9 +442,9 @@ if _HAS_TRITON:
         tl.store(red_ptr + pid * (L + 1) * 8 + L * 8 + 2, tl.sum(gb * T, axis=0))
 
     @triton.jit
-    def _cont_dz_kernel(z_ptr, gm_ptr, dz_ptr, H, W, L, scale, BLOCK: tl.constexpr):
-        """dL/dz: each pixel's print mask feeds its own mask (weight 1) and
-        its 8 neighbours' (0.0125 each)."""
+    def _cont_dz_kernel(z_ptr, gm_ptr, dz_ptr, H, W, L, scale, own, nbw, BLOCK: tl.constexpr):
+        """dL/dz: each pixel's print mask feeds its own mask (weight own)
+        and its 8 neighbours' (nbw each): the edge bleed."""
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         N = H * W
@@ -460,7 +467,7 @@ if _HAS_TRITON:
                 + tl.load(b + W - 1, mask=valid & dn & lf, other=0.0)
                 + tl.load(b + W + 1, mask=valid & dn & rt, other=0.0)
             )
-            gsum = tl.load(b, mask=valid, other=0.0) + 0.0125 * nb
+            gsum = own * tl.load(b, mask=valid, other=0.0) + nbw * nb
             ps = _sig((z - (l + 0.5)) * scale)
             acc += gsum * (scale * ps * (1.0 - ps))
         tl.store(dz_ptr + offs, acc, mask=valid)
@@ -483,7 +490,7 @@ class _ContComposite(torch.autograd.Function):
         out = torch.empty(H, W, 3, device=z.device, dtype=torch.float32)
         grid = (triton.cdiv(H * W, _BLOCK),)
         _cont_fwd_kernel[grid](
-            z, out, prm, bg, out, out, out, H, W, L, float(h), 1.0 / float(h), float(scale),
+            z, out, prm, bg, out, out, out, H, W, L, float(h), 1.0 / float(h), float(scale), *_bleed_weights(),
             STORE=False, BLOCK=_BLOCK,
         )
         ctx.save_for_backward(z, prm, bg)
@@ -519,15 +526,15 @@ def _cont_backward_raw(z, prm, bg, h, scale, g):
         grid_b = (triton.cdiv(N, _BLOCK_BWD),)
         red = torch.zeros(grid_b[0], L + 1, 8, device=z.device, dtype=torch.float32)
         _cont_fwd_kernel[grid](
-            z, g, prm, bg, rt, s, g, H, W, L, h, 1.0 / h, scale, STORE=True, BLOCK=_BLOCK,
+            z, g, prm, bg, rt, s, g, H, W, L, h, 1.0 / h, scale, *_bleed_weights(), STORE=True, BLOCK=_BLOCK,
         )
         _cont_bwd_kernel[grid_b](
-            z, g, prm, rt, s, red, H, W, L, h, 1.0 / h, scale, BLOCK=_BLOCK_BWD, num_warps=1,
+            z, g, prm, rt, s, red, H, W, L, h, 1.0 / h, scale, *_bleed_weights(), BLOCK=_BLOCK_BWD, num_warps=1,
         )
         del rt
         red = red.sum(0)
         dz = torch.empty_like(z)
-        _cont_dz_kernel[grid](z, s, dz, H, W, L, scale, BLOCK=_BLOCK)
+        _cont_dz_kernel[grid](z, s, dz, H, W, L, scale, *_bleed_weights(), BLOCK=_BLOCK)
         return dz, red
 
 
@@ -972,7 +979,7 @@ class _ContCompositeLossPrm(torch.autograd.Function):
         out = torch.empty(H, W, 3, device=z.device, dtype=torch.float32)
         grid = (triton.cdiv(N, _BLOCK),)
         _cont_fwd_kernel[grid](
-            z, out, prm, bg, out, out, out, H, W, L, float(h), 1.0 / float(h), float(scale),
+            z, out, prm, bg, out, out, out, H, W, L, float(h), 1.0 / float(h), float(scale), *_bleed_weights(),
             STORE=False, BLOCK=_BLOCK,
         )
         BL = 256
@@ -1088,7 +1095,7 @@ class _ContCompositeLoss(torch.autograd.Function):
         out = torch.empty(H, W, 3, device=z.device, dtype=torch.float32)
         grid = (triton.cdiv(N, _BLOCK),)
         _cont_fwd_kernel[grid](
-            z, out, prm, bg, out, out, out, H, W, L, float(h), 1.0 / float(h), float(scale),
+            z, out, prm, bg, out, out, out, H, W, L, float(h), 1.0 / float(h), float(scale), *_bleed_weights(),
             STORE=False, BLOCK=_BLOCK,
         )
         BL = 256
@@ -1187,7 +1194,7 @@ def batched_heights_error_sum(z, params: torch.Tensor, bg: torch.Tensor, h: floa
     part = torch.empty(B, nblk, device=z.device, dtype=torch.float32)
     _disc_composite_kernel[(nblk, B)](
         zi, part, params.contiguous(), bg, H, W, L,
-        float(h), 1.0 / float(h), target_lab.contiguous(), weights.contiguous(), 0.0, zstride,
+        float(h), 1.0 / float(h), *_bleed_weights(), target_lab.contiguous(), weights.contiguous(), 0.0, zstride,
         ERR=True, BLOCK=BLOCK, LOSS=True,
     )
     out = torch.empty(B, device=z.device, dtype=torch.float32)

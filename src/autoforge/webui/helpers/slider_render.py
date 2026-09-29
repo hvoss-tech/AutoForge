@@ -28,6 +28,9 @@ from autoforge.Helper.FilamentHelper import hex_to_rgb
 from autoforge.Helper.OptimizerHelper import (
     _layer_opacity,
     bleed_layer_effect,
+    EDGE_BLEED,
+    get_edge_bleed,
+    set_edge_bleed,
     layer_coverage_params,
     material_run_starts,
 )
@@ -134,7 +137,7 @@ def composite_from_slider_stack(
     layer_idx = torch.arange(max_layers, device=device).view(-1, 1, 1)
     p_print = (layer_idx < z_int.unsqueeze(0)).to(material_colors.dtype)  # [L,H,W]
 
-    p_print_bleed = bleed_layer_effect(p_print, strength=0.1)
+    p_print_bleed = bleed_layer_effect(p_print, get_edge_bleed())
     eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
 
     run_start = material_run_starts(layer_colors, layer_TDs)
@@ -223,6 +226,8 @@ def compute_slider_render(
     """
     optimizer = pipeline_result["optimizer"]
     args = pipeline_result["args"]
+    # The job's own edge bleed (another job may have set a different one).
+    set_edge_bleed(float(getattr(args, "edge_bleed", EDGE_BLEED)))
     background: torch.Tensor = pipeline_result["background"]
     if background_rgb is not None:
         background = torch.tensor(background_rgb, dtype=background.dtype, device=background.device)

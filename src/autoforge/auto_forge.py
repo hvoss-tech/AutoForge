@@ -295,6 +295,14 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of perturb-and-descend rounds for --stack_search",
     )
     parser.add_argument(
+        "--edge_bleed",
+        type=float,
+        default=0.1,
+        help="Edge bleed strength (0-1): every layer's presence at a pixel blends with the mean of its 8 neighbours' by "
+        "this weight, so at a height step the taller side thins and shows its lower layers and the lower side takes on "
+        "some of the taller one's (0 = no bleed)",
+    )
+    parser.add_argument(
         "--pixel_height_smoothness",
         type=float,
         default=2.0,

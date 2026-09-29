@@ -84,12 +84,17 @@ class OptimizationSettings(CamelCaseModel):
     stl_output_size: int = Field(150, gt=0)
     processing_reduction_factor: int = Field(2, ge=1)
     nozzle_diameter: float = Field(0.4, gt=0)
-    early_stopping: int = Field(2000, ge=1)
+    early_stopping: int = Field(3000, ge=1)
     perform_pruning: bool = False
     fast_pruning: bool = True
     fast_pruning_percent: float = Field(0.25, gt=0, le=1)
     spike_removal: bool = True
     spike_threshold_layers: int = 1
+    # Pixel height refine: cost per layer of height difference to each
+    # neighbour, traded against colour error (0 = colour only).
+    pixel_height_smoothness: float = Field(1.0, ge=0)
+    # Edge bleed strength (see OptimizerHelper.bleed_layer_effect).
+    edge_bleed: float = Field(0.25, ge=0, le=1)
     pruning_max_colors: int = Field(100, ge=1)
     pruning_max_swaps: int = Field(100, ge=0)
     pruning_max_layer: int = Field(75, ge=1)

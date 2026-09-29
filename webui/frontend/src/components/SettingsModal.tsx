@@ -54,6 +54,8 @@ const ADVANCED_FIELDS: Field[] = [
   { key: 'learning_rate_warmup_fraction', label: 'Learning rate warmup', help: 'Fraction of the run over which the learning rate ramps up.', type: 'number', step: 0.01, min: 0, max: 1 },
   { key: 'init_tau', label: 'Start temperature', help: 'How freely colors may mix early on (Gumbel-softmax tau). Higher explores more.', type: 'number', step: 0.1, min: 0.01 },
   { key: 'final_tau', label: 'End temperature', help: 'How strictly each layer commits to one filament by the end (Gumbel-softmax tau).', type: 'number', step: 0.001, min: 0.001 },
+  { key: 'pixel_height_smoothness', label: 'Height smoothing', help: 'How strongly the per-pixel height refinement keeps neighbouring heights together. Lower keeps more fine detail but leaves more single-pixel spikes; 0 optimizes color only.', type: 'number', step: 0.25, min: 0 },
+  { key: 'edge_bleed', label: 'Edge bleed', help: 'How much neighbouring pixels see of each other\'s layers at a height step: the taller side thins at the edge and shows its lower layers, the lower side takes on some of the taller one. 0 treats every pixel on its own.', type: 'number', step: 0.05, min: 0, max: 1 },
   { key: 'min_layers', label: 'Min layers', help: 'Lower limit of color layers.', type: 'number', step: 1, min: 0, integer: true },
   { key: 'processing_reduction_factor', label: 'Processing reduction', help: 'Works on a downscaled image during optimization. Higher is faster and uses less memory, with less detail.', type: 'number', step: 1, min: 1, integer: true },
   { key: 'nozzle_diameter', label: 'Nozzle diameter', unit: 'mm', help: 'Details finer than the nozzle cannot be printed and are smoothed away.', type: 'number', step: 0.05, min: 0.1 },
