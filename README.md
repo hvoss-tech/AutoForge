@@ -297,10 +297,6 @@ docker run --rm -v "$PWD:/work" -w /work autoforge-webui:cpu \
 ```
 The container runs as root, so on Linux the output files belong to root; `sudo chown -R "$USER" output` makes them yours again.
 
-## You can now run Autoforge for free in your browser thanks to [Huggingface space support](https://huggingface.co/spaces/hvoss-techfak/Autoforge).
-This includes the option to run it locally if you have a powerful pc and don't want to limit yourself to the Huggingface computing limits. \
-For this simply go to the [Huggingface](https://huggingface.co/spaces/hvoss-techfak/Autoforge) space and pull the docker container for this project (upper right corner -> three dots -> "run locally")
-
 ## Development
 
 To have a "nightly" version of the repository or have live updating changes during development please do the following: 
