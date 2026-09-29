@@ -114,6 +114,24 @@ test('downloads and the export zip contain the result files', async ({ page, req
   for (const name of ['final_model.stl', 'final_model_colored.ply', 'final_model.png', 'swap_instructions.txt']) {
     expect(bytes.includes(Buffer.from(name)), name).toBe(true)
   }
+
+  // With a project name every download carries it, and the zip also holds
+  // the project file.
+  await byTestId(page, 'project-name-input').fill('E2E Car')
+  await byTestId(page, 'project-name-input').press('Enter')
+  for (const [button, filename] of [['download-stl', 'E2E-Car_model.stl'], ['download-preview', 'E2E-Car_result.png'], ['download-instructions', 'E2E-Car_swap_instructions.txt'], ['download-project', 'E2E-Car_hueforge.hfp']]) {
+    await byTestId(page, 'file-menu-btn').click()
+    const [download] = await Promise.all([page.waitForEvent('download'), byTestId(page, button).click()])
+    expect(download.suggestedFilename()).toBe(filename)
+  }
+  await byTestId(page, 'file-menu-btn').click()
+  const [namedZip] = await Promise.all([page.waitForEvent('download'), byTestId(page, 'file-menu-export').click()])
+  expect(namedZip.suggestedFilename()).toBe('E2E-Car_project.zip')
+  const namedBytes = fs.readFileSync(await namedZip.path())
+  for (const name of ['E2E-Car_model.stl', 'E2E-Car_model_colored.ply', 'E2E-Car_result.png', 'E2E-Car_swap_instructions.txt', 'E2E-Car_project.json']) {
+    expect(namedBytes.includes(Buffer.from(name)), name).toBe(true)
+  }
+  await byTestId(page, 'project-name-input').fill('')
 })
 
 test('editing a slider re-renders the 3D view without touching the result files', async ({ page, request }) => {

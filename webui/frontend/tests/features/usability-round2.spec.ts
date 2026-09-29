@@ -304,7 +304,7 @@ test.describe('Project', () => {
     await byTestId(page, 'project-name-input').fill('E2E My Print')
     await byTestId(page, 'td-input-0').click()
     const [download] = await Promise.all([page.waitForEvent('download'), page.keyboard.press('Control+s')])
-    expect(download.suggestedFilename()).toBe('E2E-My-Print.json')
+    expect(download.suggestedFilename()).toBe('E2E-My-Print_project.json')
     const saved = JSON.parse(fs.readFileSync(await download.path(), 'utf8'))
     expect(saved.name).toBe('E2E My Print')
     await expect(byTestId(page, 'project-dirty-indicator')).toHaveCount(0)

@@ -6,7 +6,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { insertBandAbove, isInPrintOrder, moveBand, printOrder, sortBandsByLayer } from '../src/lib/bandOps.ts'
 import { staleReasons } from '../src/lib/staleResult.ts'
-import { hasUnsavedChanges, projectFileName, projectFingerprint, projectNameFromFile } from '../src/lib/project.ts'
+import { exportFileName, hasUnsavedChanges, projectFileName, projectFingerprint, projectNameFromFile } from '../src/lib/project.ts'
 import { appendLossPoint, sparklinePath } from '../src/lib/lossHistory.ts'
 import { clampSize, zoomAt, IDENTITY_ZOOM } from '../src/lib/layout.ts'
 import { describePruningChange, resultCounts } from '../src/lib/pruning.ts'
@@ -99,8 +99,12 @@ test('stale results', async (t) => {
 
 test('project files', async (t) => {
   await t.test('file names come from the project name', () => {
-    assert.equal(projectFileName('My Cat / v2'), 'My-Cat-v2.json')
+    assert.equal(projectFileName('My Cat / v2'), 'My-Cat-v2_project.json')
     assert.equal(projectFileName('  '), 'autoforge-project.json')
+    assert.equal(projectNameFromFile(undefined, 'car_project.json'), 'car')
+    assert.equal(projectNameFromFile(undefined, 'car_project-2.json'), 'car')
+    assert.equal(exportFileName('car', 'model.stl', 'final_model.stl'), 'car_model.stl')
+    assert.equal(exportFileName(' ', 'model.stl', 'final_model.stl'), 'final_model.stl')
     assert.equal(projectNameFromFile('Stored', 'x.json'), 'Stored')
     assert.equal(projectNameFromFile(undefined, 'Sunset.json'), 'Sunset')
     assert.equal(projectNameFromFile(undefined, 'autoforge-project-1789.json'), '')

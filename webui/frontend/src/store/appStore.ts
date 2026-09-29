@@ -202,6 +202,20 @@ function downloadBlob(blob: Blob, filename: string) {
   URL.revokeObjectURL(url)
 }
 
+/** What a saved project file holds (also bundled into the export zip). */
+export function projectFileData(state: Pick<AppState, 'projectName' | 'inputImage' | 'settings' | 'colorSliders' | 'activeFilaments'>) {
+  return {
+    version: 1,
+    name: state.projectName,
+    savedAt: new Date().toISOString(),
+    colorSliders: state.colorSliders,
+    settings: state.settings,
+    activeFilaments: state.activeFilaments,
+    // A blob: URL only works in this tab; store the durable server path.
+    inputImage: durableInputImageUrl(state.inputImage, state.settings),
+  }
+}
+
 /** Fingerprint of everything a saved project file holds (see saveProjectToFile). */
 export function currentProjectFingerprint(state: Pick<AppState, 'projectName' | 'inputImage' | 'settings' | 'colorSliders' | 'activeFilaments'>): string {
   return projectFingerprint({
@@ -654,16 +668,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   saveProjectToFile: () => {
     flushPendingSnapshot()
     const state = get()
-    const data = {
-      version: 1,
-      name: state.projectName,
-      savedAt: new Date().toISOString(),
-      colorSliders: state.colorSliders,
-      settings: state.settings,
-      activeFilaments: state.activeFilaments,
-      // A blob: URL only works in this tab; store the durable server path.
-      inputImage: durableInputImageUrl(state.inputImage, state.settings),
-    }
+    const data = projectFileData(state)
     downloadBlob(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }), projectFileName(state.projectName))
     const fingerprint = currentProjectFingerprint(state)
     set({ savedProjectFingerprint: fingerprint })

@@ -1,9 +1,14 @@
 import asyncio
-import io
+import json
 import os
+import re
+import tempfile
 import zipfile
+from typing import Any
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from starlette.background import BackgroundTask
 from ..config import config
 from ..helpers.mesh_persist import wait_for_pending_mesh
 from ..services.optimization_service import get_optimization_service
@@ -194,12 +199,29 @@ async def download_named_output(job_id: str, filename: str):
     return FileResponse(path, filename=filename)
 
 
+class ExportRequest(BaseModel):
+    name: str | None = None
+    # The webui project file (what File › Save project writes), bundled as
+    # `<name>_project.json` so the zip holds everything needed to reopen it.
+    project: dict[str, Any] | None = None
+
+
+@router.post("/export/{job_id}")
+async def export_project_with_file(job_id: str, body: ExportRequest):
+    return await _export_zip_response(job_id, body.name, body.project)
+
+
 @router.get("/export/{job_id}")
-async def export_project(job_id: str):
+async def export_project(job_id: str, name: str | None = None):
+    return await _export_zip_response(job_id, name, None)
+
+
+async def _export_zip_response(job_id: str, name: str | None, project: dict[str, Any] | None):
     """Zip up a completed job's output files — STL (or the per-material STLs
     a FlatForge run produced), colored PLY, preview PNG, swap instructions,
     project file — as one downloadable bundle, mirroring the CLI's
-    `--output-folder` contents after a run."""
+    `--output-folder` contents after a run. ``name`` (the project name)
+    names the zip and the files in it: `car_project.zip` with `car_model.stl`."""
     svc = get_optimization_service()
     job = svc.get_job(job_id)
     if not job or job.status != "completed":
@@ -210,20 +232,63 @@ async def export_project(job_id: str):
     if not job_dir.startswith(checkpoints + os.sep) or not os.path.isdir(job_dir):
         raise HTTPException(404, "Job output folder not found")
 
-    buffer = io.BytesIO()
+    prefix = _export_prefix(name)
+    fd, zip_path = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    try:
+        added = await asyncio.to_thread(_write_export_zip, zip_path, job_dir, prefix, project)
+    except BaseException:
+        os.remove(zip_path)
+        raise
+    if added == 0:
+        os.remove(zip_path)
+        raise HTTPException(404, "No output files found for this job")
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{prefix}_project.zip" if prefix else f"{job_id}_export.zip",
+        background=BackgroundTask(os.remove, zip_path),
+    )
+
+
+def _export_prefix(name: str | None) -> str:
+    """The project name as a file-name prefix (same slug as the frontend's
+    lib/project.ts), or "" when there is none."""
+    return re.sub(r"[\W_]+", "-", (name or "").strip()).strip("-")[:80]
+
+
+def _export_arcname(filename: str, prefix: str) -> str:
+    """Name of a job file inside a project-named bundle: `car_model.stl`
+    rather than `final_model.stl`. Per-material FlatForge STLs keep their
+    material name after the prefix."""
+    if not prefix:
+        return filename
+    renamed = {
+        "final_model.stl": "model.stl",
+        "final_model_colored.ply": "model_colored.ply",
+        "final_model.png": "result.png",
+        "final_loss.txt": "loss.txt",
+        "project_file.hfp": "hueforge.hfp",
+    }.get(filename, filename)
+    return f"{prefix}_{renamed}"
+
+
+def _write_export_zip(zip_path: str, job_dir: str, prefix: str, project: dict[str, Any] | None = None) -> int:
+    # Runs in a worker thread: the STL alone can be a few hundred MB, and
+    # zipping it on the event loop froze every other request (and the
+    # websocket) for the whole time. Level 1 is ~4x faster than the default
+    # for ~2% larger output on these meshes. Written to a temp file rather
+    # than a BytesIO — StreamingResponse iterated that line by line, which
+    # took longer than the compression itself.
     added = 0
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
         for filename in _export_files_for(job_dir):
             path = os.path.join(job_dir, filename)
             if os.path.exists(path):
-                zf.write(path, arcname=filename)
+                zf.write(path, arcname=_export_arcname(filename, prefix))
                 added += 1
-    if added == 0:
-        raise HTTPException(404, "No output files found for this job")
-
-    buffer.seek(0)
-    return StreamingResponse(
-        buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{job_id}_export.zip"'},
-    )
+        if added and project is not None:
+            project_name = f"{prefix}_project.json" if prefix else "autoforge-project.json"
+            zf.writestr(project_name, json.dumps(project, indent=2))
+    return added

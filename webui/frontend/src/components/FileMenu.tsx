@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { useAppStore } from '../store/appStore'
+import { projectFileData, useAppStore } from '../store/appStore'
 import { Box, ChevronDown, FilePlus, FileText, FolderOpen, Image as ImageIcon, PackageOpen, Save, Layers } from 'lucide-react'
 import { buildPrintPlan, printPlanText } from '../lib/printPlan'
 import { withEffectiveBaseColor } from '../lib/baseColor'
 import { describeApiError } from '../lib/apiError'
 import { onUiCommand } from '../lib/uiEvents'
+import { exportFileName } from '../lib/project'
 
 function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob)
@@ -14,7 +15,9 @@ function downloadBlob(blob: Blob, filename: string) {
   document.body.appendChild(a)
   a.click()
   a.remove()
-  URL.revokeObjectURL(url)
+  // Revoking right after click() can cancel a large download before the
+  // browser has read the blob.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
 }
 
 const itemClass =
@@ -38,6 +41,10 @@ export const FileMenu: React.FC = () => {
   const startNewProject = useAppStore((s) => s.startNewProject)
   const requestConfirm = useAppStore((s) => s.requestConfirm)
   const resolvedBase = useAppStore((s) => s.resolvedBase)
+  const projectName = useAppStore((s) => s.projectName)
+  const pushToast = useAppStore((s) => s.pushToast)
+  const [exporting, setExporting] = useState(false)
+  const named = (suffix: string, fallback: string) => exportFileName(projectName, suffix, fallback)
 
   // The .zip, STL and .hfp are written by an optimizer run; the auto-preview
   // has no printable model. The swap instructions and the image are made from
@@ -97,10 +104,10 @@ export const FileMenu: React.FC = () => {
     }
   }
 
-  const downloadFromServer = async (url: string, filename: string) => {
+  const downloadFromServer = async (url: string, filename: string, init?: RequestInit) => {
     setOpen(false)
     try {
-      const response = await fetch(url)
+      const response = await fetch(url, init)
       if (!response.ok) {
         setLoadError(`Export failed: ${describeApiError(await response.json().catch(() => null), response.status)}`)
         return
@@ -108,6 +115,26 @@ export const FileMenu: React.FC = () => {
       downloadBlob(await response.blob(), filename)
     } catch {
       setLoadError('Export failed')
+    }
+  }
+
+  // The bundle holds the full-size STL and mesh (hundreds of MB) and is
+  // fetched whole before the browser's download starts, so say it's coming.
+  const handleExportZip = async () => {
+    if (!jobId || exporting) return
+    setExporting(true)
+    pushToast('Preparing the export zip — the download starts when it is ready', 'info')
+    try {
+      await downloadFromServer(`/api/outputs/export/${jobId}`, named('project.zip', `${jobId}_export.zip`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: projectName,
+          project: projectFileData(useAppStore.getState()),
+        }),
+      })
+    } finally {
+      setExporting(false)
     }
   }
 
@@ -119,19 +146,19 @@ export const FileMenu: React.FC = () => {
     const known = [...activeFilaments, ...filaments]
     const plan = buildPrintPlan(colorSliders, known, planSettings)
     const baseFilament = known.find((f) => f.uuid === planSettings.base_filament_uuid) ?? null
-    downloadBlob(new Blob([printPlanText(plan, planSettings, baseFilament)], { type: 'text/plain' }), 'swap_instructions.txt')
+    downloadBlob(new Blob([printPlanText(plan, planSettings, baseFilament)], { type: 'text/plain' }), named('swap_instructions.txt', 'swap_instructions.txt'))
   }
 
   const handleImage = () => {
     if (canExport && currentJob) {
-      downloadFromServer(`/api/outputs/current-preview/${currentJob.job_id}`, 'final_model.png')
+      downloadFromServer(`/api/outputs/current-preview/${currentJob.job_id}`, named('result.png', 'final_model.png'))
       return
     }
     setOpen(false)
     if (!previewImage) return
     fetch(previewImage)
       .then((r) => r.blob())
-      .then((blob) => downloadBlob(blob, 'preview.png'))
+      .then((blob) => downloadBlob(blob, named('preview.png', 'preview.png')))
       .catch(() => setLoadError('Export failed'))
   }
 
@@ -196,15 +223,15 @@ export const FileMenu: React.FC = () => {
 
           <div className="my-1 border-t border-gray-700" />
           <div className="px-3 pt-1 pb-0.5 text-[11px] uppercase tracking-wide text-gray-500">Export result</div>
-          <button onClick={() => jobId && downloadFromServer(`/api/outputs/export/${jobId}`, `${jobId}_export.zip`)} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="file-menu-export">
-            <PackageOpen className="w-3.5 h-3.5" /> Everything (.zip)
+          <button onClick={handleExportZip} disabled={!canExport || exporting} title={exportHint} className={itemClass} role="menuitem" data-testid="file-menu-export">
+            <PackageOpen className="w-3.5 h-3.5" /> {exporting ? 'Preparing zip…' : 'Everything (.zip)'}
           </button>
           {isFlatforge ? (
             flatforgeStlFiles.length > 0 ? (
               flatforgeStlFiles.map((name) => (
                 <button
                   key={name}
-                  onClick={() => jobId && downloadFromServer(`/api/outputs/file/${jobId}/${encodeURIComponent(name)}`, name)}
+                  onClick={() => jobId && downloadFromServer(`/api/outputs/file/${jobId}/${encodeURIComponent(name)}`, named(name, name))}
                   className={itemClass}
                   role="menuitem"
                   data-testid="download-stl-flatforge"
@@ -218,7 +245,7 @@ export const FileMenu: React.FC = () => {
               </button>
             )
           ) : (
-            <button onClick={() => jobId && downloadFromServer(`/api/outputs/stl/${jobId}`, 'final_model.stl')} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="download-stl">
+            <button onClick={() => jobId && downloadFromServer(`/api/outputs/stl/${jobId}`, named('model.stl', 'final_model.stl'))} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="download-stl">
               <Box className="w-3.5 h-3.5" /> 3D model (.stl)
             </button>
           )}
@@ -228,7 +255,7 @@ export const FileMenu: React.FC = () => {
           <button onClick={handleImage} disabled={!canExportImage} title={canExportImage ? undefined : 'Upload an image first'} className={itemClass} role="menuitem" data-testid="download-preview">
             <ImageIcon className="w-3.5 h-3.5" /> {canExport ? 'Result image (.png)' : 'Preview image (.png)'}
           </button>
-          <button onClick={() => jobId && downloadFromServer(`/api/outputs/project/${jobId}`, 'final_model.hfp')} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="download-project">
+          <button onClick={() => jobId && downloadFromServer(`/api/outputs/project/${jobId}`, named('hueforge.hfp', 'final_model.hfp'))} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="download-project">
             <Layers className="w-3.5 h-3.5" /> HueForge project (.hfp)
           </button>
           <p className="px-3 pt-1 pb-1 text-[11px] text-gray-400">
