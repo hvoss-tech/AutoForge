@@ -410,6 +410,10 @@ def init_height_map(
     )
 
 
+# How long an idle init worker process lives (see run_init_threads).
+INIT_WORKER_IDLE_TIMEOUT_S = 1
+
+
 def run_init_threads(
     target,
     max_layers,
@@ -460,15 +464,22 @@ def run_init_threads(
         # Only worth spinning up a worker-process pool (real, measurable
         # spawn overhead) when there's actually more than one task to
         # spread across it.
-        from joblib import Parallel, delayed
+        from joblib import Parallel, delayed, parallel_config
 
         tasks = [delayed(_run_one)(i) for i in range(num_runs)]
         # In order as they finish, so progress can be reported (same results).
         results = []
-        for r in Parallel(n_jobs=num_threads, verbose=10, return_as="generator")(tasks):
-            results.append(r)
-            if progress is not None:
-                progress(0.3 + 0.7 * len(results) / num_runs)
+        # The workers run their assignment on the GPU, so each holds its own
+        # CUDA context (~750 MiB) for as long as it lives, and loky keeps idle
+        # workers for 5 minutes. With runs this fast that covered the whole
+        # optimization and pruning, and a full-resolution render ran out of
+        # VRAM next to four idle workers. Let them exit as soon as the
+        # rounds are done.
+        with parallel_config(backend="loky", idle_worker_timeout=INIT_WORKER_IDLE_TIMEOUT_S):
+            for r in Parallel(n_jobs=num_threads, verbose=10, return_as="generator")(tasks):
+                results.append(r)
+                if progress is not None:
+                    progress(0.3 + 0.7 * len(results) / num_runs)
     else:
         results = []
         for i in range(num_runs):

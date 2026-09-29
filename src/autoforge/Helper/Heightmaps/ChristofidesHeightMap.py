@@ -649,7 +649,14 @@ def run_init_threads(
         ]
 
         # Execute tasks in parallel; adjust n_jobs to match your available cores
-        results = Parallel(n_jobs=num_threads, verbose=10)(tasks)
+        # Idle workers exit right away: each holds a CUDA context (see
+        # FastTSPHeightMap.run_init_threads).
+        from joblib import parallel_config
+
+        from autoforge.Helper.Heightmaps.FastTSPHeightMap import INIT_WORKER_IDLE_TIMEOUT_S
+
+        with parallel_config(backend="loky", idle_worker_timeout=INIT_WORKER_IDLE_TIMEOUT_S):
+            results = Parallel(n_jobs=num_threads, verbose=10)(tasks)
 
     else:
         results = [
