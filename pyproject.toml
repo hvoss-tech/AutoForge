@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "AutoForge"
-version="2.1.0"
+version="2.1.1"
 description = "AutoForge - 3D color prints made easy"
 authors = [{ name = "Hendric Voss", email = "hvoss@techfak.uni-bielefeld.de" }]
 readme = "README.md"
