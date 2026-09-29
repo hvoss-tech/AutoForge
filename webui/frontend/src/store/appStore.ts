@@ -14,7 +14,7 @@ import { describeApiError } from '../lib/apiError'
 import * as bandOps from '../lib/bandOps'
 import { inheritRunInputs, readStoredRunInputs, storeRunInputs, type RunInputs } from '../lib/staleResult'
 import { appendLossPoint, type LossPoint } from '../lib/lossHistory'
-import { suggestPruningLimits, resultCounts, type PruningCounts } from '../lib/pruning'
+import { suggestPruningLimits, resultCounts, type PruningCounts, type LiveMesh } from '../lib/pruning'
 import { buildPrintPlan } from '../lib/printPlan'
 import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { projectFileName, projectFingerprint, projectNameFromFile } from '../lib/project'
@@ -322,6 +322,9 @@ interface AppState {
    * (the result image) moves with it, except for this tab's own slider
    * edits: those recolor the mesh in place (lib/meshColors). */
   meshVersion: number
+  /** Mid-prune mesh (see liveMeshUrl): the solution after the prune's
+   * latest step, shown instead of `forJob`'s own while that prune runs. */
+  liveMesh: LiveMesh | null
   stlFile: string | null
   settingsModalOpen: boolean
   activeTab: string
@@ -417,6 +420,7 @@ interface AppState {
   setPreviewImage: (image: string | null) => void
   bumpPreviewVersion: () => void
   bumpImageVersion: () => void
+  setLiveMesh: (liveMesh: LiveMesh | null) => void
   setStlFile: (file: string | null) => void
   setSettingsModalOpen: (open: boolean) => void
   setActiveTab: (tab: string) => void
@@ -488,6 +492,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   previewImage: null,
   previewVersion: 0,
   meshVersion: 0,
+  liveMesh: null,
   stlFile: null,
   settingsModalOpen: false,
   activeTab: 'PLA',
@@ -861,6 +866,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setPreviewImage: (image) => set({ previewImage: image }),
   bumpPreviewVersion: () => set((state) => ({ previewVersion: state.previewVersion + 1, meshVersion: state.meshVersion + 1 })),
   bumpImageVersion: () => set((state) => ({ previewVersion: state.previewVersion + 1 })),
+  setLiveMesh: (liveMesh) => set({ liveMesh }),
   setStlFile: (file) => set({ stlFile: file }),
   setSettingsModalOpen: (open) => set({ settingsModalOpen: open }),
   setActiveTab: (tab) => set({ activeTab: tab }),

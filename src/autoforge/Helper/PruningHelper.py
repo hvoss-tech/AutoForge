@@ -97,6 +97,30 @@ def _make_shared_eff_thick(optimizer: FilamentOptimizer) -> torch.Tensor:
     )
 
 
+def _scoring_handle(eff_logits: torch.Tensor, max_layers: int, h: float, vis_tau: float) -> torch.Tensor:
+    """What candidate_losses / _candidate_loss read of an [L,H,W] thickness
+    when the fused kernels score: the whole-layer heights (``_af_z``). Then
+    only those are built (a zero-size tensor carries them; the thickness
+    was ~13x the work) - else the full thickness."""
+    from autoforge.Helper import FusedComposite as fc
+
+    if fc.fused_available(eff_logits):
+        handle = eff_logits.new_empty(0)
+        handle._af_z = _heights_from_logits(eff_logits, max_layers, h, vis_tau)
+        return handle
+    return _eff_thick_from_logits(eff_logits, max_layers, h, vis_tau)
+
+
+def _shared_scoring_handle(optimizer: FilamentOptimizer) -> torch.Tensor:
+    """``_scoring_handle`` of the best solution's heights (see
+    _make_shared_eff_thick)."""
+    eff_logits = optimizer._apply_height_offset(
+        optimizer.best_params["pixel_height_logits"],
+        optimizer.best_params["height_offsets"],
+    )
+    return _scoring_handle(eff_logits, optimizer.max_layers, optimizer.h, optimizer.vis_tau)
+
+
 def _compose_candidate(
     eff_thick: torch.Tensor,
     material_colors: torch.Tensor,
@@ -384,11 +408,21 @@ def candidate_losses(
             rng_seed=optimizer.best_seed, tau=optimizer.vis_tau,
         )
         del gl_batch
+        z = getattr(eff_thick, "_af_z", None)
+        if z is not None:
+            from autoforge.Helper import FusedComposite as fc
+
+            if fc.fused_available(eff_thick):
+                # The whole chunk in one fused pass (the same loss per
+                # candidate as _candidate_loss's).
+                with _gpu_lock, torch.no_grad():
+                    losses.append(fc.batched_heights_loss(optimizer, z, cols, tds))
+                continue
         # Composite + loss per candidate — iterative, no [B, L, H, W]
         for b in range(len(chunk)):
             with _gpu_lock, torch.no_grad():
-                losses.append(_candidate_loss(optimizer, eff_thick, cols[b], tds[b]))
-    return torch.stack(losses)
+                losses.append(_candidate_loss(optimizer, eff_thick, cols[b], tds[b])[None])
+    return torch.cat(losses)
 
 
 def _eval_candidates_batch(
@@ -414,7 +448,7 @@ def _eval_candidates_batch(
         return float("inf"), None
 
     if eff_thick is None:
-        eff_thick = _make_shared_eff_thick(optimizer)
+        eff_thick = _shared_scoring_handle(optimizer)
 
     losses = candidate_losses(optimizer, dg_candidates, eff_thick, batch_size)
     best_loss_t, best_idx_t = torch.min(losses, dim=0)
@@ -1149,11 +1183,23 @@ def prune_redundant_layers(
                 # and removes that nondeterminism. Accepted per-project
                 # decision: the loss difference this trades away is small
                 # enough to be worth the speed/VRAM win.
-                cand_results = [score_layer(idx) for idx in chunk]
-
-                cand_loss, cand_params, cand_max_layers = min(
-                    cand_results, key=lambda x: x[0]
-                )
+                if use_fused:
+                    losses = _removal_losses_fused(
+                        optimizer, chunk, current_max_layers, current_eff_logits,
+                        current_disc_height, current_pixel_height, shared_height_offset,
+                    )
+                    k = min(range(len(chunk)), key=lambda c: losses[c])
+                    cand_loss = losses[k]
+                    cand_params, cand_max_layers = remove_layer_from_solution(
+                        optimizer, optimizer.best_params, chunk[k], optimizer.h, current_max_layers,
+                        effective_logits=current_eff_logits, disc_height=current_disc_height,
+                        current_height=current_pixel_height,
+                    )
+                else:
+                    cand_results = [score_layer(idx) for idx in chunk]
+                    cand_loss, cand_params, cand_max_layers = min(
+                        cand_results, key=lambda x: x[0]
+                    )
 
                 if cand_loss <= best_loss * (1 + allowed_loss_increase_percent):
                     # Accept immediately and restart outer loop
@@ -1229,6 +1275,43 @@ def prune_redundant_layers(
 
     tbar.close()
     return optimizer.best_params, best_loss, current_max_layers
+
+
+def _removal_losses_fused(optimizer, chunk, current_max_layers, eff, disc_height, current_height,
+                          shared_height_offset, sub_batch: int = 8) -> list:
+    """The fused losses of removing each layer in ``chunk`` - what
+    prune_redundant_layers' score_layer computes one by one - a few
+    candidates per kernel launch and one host sync per launch. The height
+    maps come from the same elementwise ops as remove_layer_from_solution
+    and _fused_logits_loss (so the same values), and a stack's loss from the
+    batched kernel is the same as alone."""
+    from autoforge.Helper import FusedComposite as fc
+
+    h = optimizer.h
+    bp = optimizer.best_params
+    gl = bp["global_logits"]
+    new_L = current_max_layers - 1
+    offset_part = eff - bp["pixel_height_logits"]
+    seed = optimizer.best_seed if optimizer.best_seed is not None and optimizer.best_seed >= 0 else 0
+    out = []
+    for lo in range(0, len(chunk), sub_batch):
+        idx = list(chunk[lo:lo + sub_batch])
+        with _gpu_lock, torch.no_grad():
+            it = torch.tensor(idx, device=eff.device, dtype=torch.int32).view(-1, 1, 1)
+            cur = current_height.unsqueeze(0)
+            new_height = torch.where(disc_height.unsqueeze(0) > it, cur - h, cur)
+            eps = 1e-6
+            ratio = torch.clamp(new_height / (new_L * h), eps, 1.0 - eps)
+            new_pl = (torch.log(ratio) - torch.log1p(-ratio)) - offset_part
+            z = _heights_from_logits(new_pl + shared_height_offset, new_L, h, optimizer.vis_tau)
+            sel = torch.stack([
+                batched_layer_material_indices(torch.cat([gl[:i], gl[i + 1:]], dim=0), optimizer.vis_tau, seed)
+                for i in idx
+            ])
+            out += fc.batched_heights_loss(
+                optimizer, z, optimizer.material_colors[sel], optimizer.material_TDs[sel].clamp(1e-8, 1e8)
+            ).tolist()
+    return out
 
 
 def _fused_logits_loss(optimizer, eff_logits, global_logits, n_layers):

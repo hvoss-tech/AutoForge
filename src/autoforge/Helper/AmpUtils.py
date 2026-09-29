@@ -37,10 +37,11 @@ def _probe_backward(device: torch.device, dtype: torch.dtype) -> bool:
             y = x @ w
             loss = torch.nn.functional.mse_loss(y, target)
         loss.backward()
-        # Step with a dummy optimizer to ensure gradients are usable
-        opt = torch.optim.SGD([w], lr=1e-3)
-        opt.step()
-        return True
+        # Apply the gradient to make sure it is usable (a plain update: a
+        # torch.optim optimizer would import torch._dynamo, ~0.7 s).
+        with torch.no_grad():
+            w.add_(w.grad, alpha=-1e-3)
+        return bool(torch.isfinite(w).all())
     except Exception:
         return False
 

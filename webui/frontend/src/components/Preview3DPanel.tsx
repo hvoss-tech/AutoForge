@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef } from 'react'
 import { acceptsPreviewFor, isInitRequestInFlight, useAppStore } from '../store/appStore'
+import { liveMeshUrl } from '../lib/pruning'
 import { Box, Loader2, AlertTriangle } from 'lucide-react'
 import { ThreeDView } from './ThreeDView'
 import { isOwnRender, meshKeyForJob } from '../lib/meshColors'
@@ -17,6 +18,8 @@ export const Preview3DPanel: React.FC = () => {
   const setSliderLayerRange = useAppStore((s) => s.setSliderLayerRange)
   const currentJob = useAppStore((s) => s.currentJob)
   const meshVersion = useAppStore((s) => s.meshVersion)
+  const liveMesh = useAppStore((s) => s.liveMesh)
+  const pruningJob = useAppStore((s) => s.pruningJob)
   const bumpPreviewVersion = useAppStore((s) => s.bumpPreviewVersion)
   const wsRef = useRef<WebSocket | null>(null)
 
@@ -95,6 +98,16 @@ export const Preview3DPanel: React.FC = () => {
             // Except for this tab's own slider edit: its mesh was already
             // recolored from the render response, and refetching the whole
             // PLY for it is exactly the slow path that replaced.
+            // A pruning step just finished: show the mesh of the solution
+            // as it now stands (see liveMeshUrl) — otherwise the 3D view
+            // only changed once the whole prune was done.
+            if (data.live_mesh?.url && data.live_mesh?.prune_job_id) {
+              useAppStore.getState().setLiveMesh({
+                forJob: data.job_id,
+                pruneJobId: data.live_mesh.prune_job_id,
+                url: data.live_mesh.url,
+              })
+            }
             if (isOwnRender(data.render_id)) useAppStore.getState().bumpImageVersion()
             else bumpPreviewVersion()
 
@@ -224,8 +237,9 @@ export const Preview3DPanel: React.FC = () => {
     }
   }, [inputImage, setPreviewImage, setInitState, setSliderLayerRange, optimizationStarted, jobFailed, jobHasResult])
 
+  const pruningMeshUrl = liveMeshUrl(liveMesh, currentJob?.job_id, pruningJob)
   const coloredPlyUrl = stlFile && currentJob?.job_id
-    ? `${meshKeyForJob(currentJob.job_id)}?v=${meshVersion}`
+    ? `${pruningMeshUrl ?? meshKeyForJob(currentJob.job_id)}?v=${meshVersion}`
     : null
   // The auto-preview mesh (api/init.py) — the real heightmap-init result,
   // draped with the original photo, so the 3D view shows actual geometry

@@ -61,6 +61,15 @@ class CAdamW(Optimizer):
         super().__init__(params, defaults)
         self.init_lr = lr
 
+    # torch.optim.Optimizer wraps these two in torch._disable_dynamo, whose
+    # first call imports all of torch._dynamo (sympy, fsdp, ...): ~0.7 s per
+    # run for machinery nothing here uses. The undecorated originals.
+    def add_param_group(self, param_group: dict) -> None:
+        return getattr(Optimizer.add_param_group, "__wrapped__", Optimizer.add_param_group)(self, param_group)
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        return getattr(Optimizer.zero_grad, "__wrapped__", Optimizer.zero_grad)(self, set_to_none)
+
     @torch.no_grad()
     def step(self, closure: Callable = None):
         """

@@ -363,3 +363,38 @@ def test_rng_seed_search_does_not_regress():
     start = opt.best_discrete_loss
     best_seed, best_loss = opt.rng_seed_search(start, num_seeds=4, autoset_seed=True)
     assert best_loss <= start * 1.02
+
+
+def test_prune_reports_each_finished_step():
+    """The webui refreshes its 3D preview after every pruning step, not only
+    once the whole prune is done — prune() reports each finished step, in
+    order, with its result already in best_params."""
+    opt = _make_optimizer(seed=5, iterations=80, spike_removal=True)
+    for _ in range(40):
+        opt.step(record_best=True)
+
+    steps = []
+
+    def on_step(optimizer, name):
+        assert optimizer is opt
+        dg, dh = opt.get_discretized_solution(best=True)
+        assert dg is not None and dh is not None
+        steps.append(name)
+
+    opt.prune_step_callback = on_step
+    completed = opt.prune(
+        max_colors_allowed=2,
+        max_swaps_allowed=3,
+        min_layers_allowed=1,
+        max_layers_allowed=opt.max_layers,
+        search_seed=True,
+        seed_search_count=4,
+        fine_tune_height=True,
+        pre_fine_tune_height=True,
+        fine_tune_steps=2,
+    )
+    assert completed is True
+    assert steps[:2] == ["Searching color seeds", "Polishing heights"]
+    assert "Reducing colors" in steps and "Fine-tuning height" in steps
+    assert steps[-1] == "Removing spikes"
+    assert steps.index("Reducing colors") < steps.index("Fine-tuning height")

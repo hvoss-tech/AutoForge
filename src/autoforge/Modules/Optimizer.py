@@ -5,6 +5,7 @@ import random
 import os
 import threading
 import time
+import traceback
 from typing import Optional
 
 import numpy as np
@@ -85,6 +86,17 @@ def _compute_height_offset_term(
             mode="bicubic",
         ).squeeze(0).squeeze(0)
     return offsets
+
+
+def _fused_cont_available(material_colors: torch.Tensor) -> bool:
+    """Whether composite_image_cont takes the fused (Triton) path."""
+    from autoforge.Helper import FusedComposite as fc
+    from autoforge.Helper import OptimizerHelper as oh
+
+    return bool(
+        oh._USE_FUSED_CONT and material_colors.is_cuda and fc._HAS_TRITON
+        and not oh.ABLATION_BEER_LAMBERT_OPACITY
+    )
 
 
 class FilamentOptimizer:
@@ -198,6 +210,10 @@ class FilamentOptimizer:
 
         self.preview_callback = preview_callback
         self.preview_callback_interval = preview_callback_interval
+        # Called as prune_step_callback(optimizer, step_name) each time a
+        # pruning step has finished and its result is in best_params (the
+        # webui refreshes its 3D preview from it).
+        self.prune_step_callback = None
 
         # Initialize TensorBoard writer (import is lazy - see module docstring)
         if args.tensorboard:
@@ -617,9 +633,9 @@ class FilamentOptimizer:
         ``progress`` (optional) is called with a 0-1 fraction as it goes."""
         from autoforge.Helper.ConstraintHelper import neighbour_stacks
         from autoforge.Helper.PruningHelper import (
-            _eff_thick_from_logits,
             _eval_candidates_batch,
-            _make_shared_eff_thick,
+            _scoring_handle,
+            _shared_scoring_handle,
             disc_to_logits,
         )
 
@@ -644,10 +660,10 @@ class FilamentOptimizer:
             )
             if saved[1] is not None:
                 self.focus_map = F.interpolate(saved[1][None, None].float(), size=size, mode="bilinear")[0, 0]
-            shared = _eff_thick_from_logits(eff_small, self.max_layers, self.h, self.vis_tau)
+            shared = _scoring_handle(eff_small, self.max_layers, self.h, self.vis_tau)
             # compute_loss resizes the alpha mask itself.
         else:
-            shared = _make_shared_eff_thick(self)
+            shared = _shared_scoring_handle(self)
         try:
             improved, dg, cur_loss = self._search_rounds(
                 dg, shared, max_rounds, compound, should_stop, progress, max_candidates
@@ -657,7 +673,7 @@ class FilamentOptimizer:
         if improved and scale < 1.0:
             # Found on the downsampled copy: keep it only if it wins at the
             # full solver resolution too.
-            full = _make_shared_eff_thick(self)
+            full = _shared_scoring_handle(self)
             new_loss, _ = _eval_candidates_batch(self, [dg], eff_thick=full)
             old_loss, _ = _eval_candidates_batch(self, [start_dg], eff_thick=full)
             del full
@@ -734,8 +750,8 @@ class FilamentOptimizer:
         # Gradient multiplier: forward unchanged, grad wrt offsets_1d scaled by height_offsets_grad_scale
         s = getattr(self, "height_offsets_grad_scale", 1.0)
         offsets_1d = offsets_1d * s + offsets_1d.detach() * (1.0 - s)
-        # Use advanced indexing to map each pixel's label to its cluster offset
-        gathered = offsets_1d[labels]  # [H,W]
+        # Map each pixel's label to its cluster offset (deterministic backward)
+        gathered = self._gather_offsets(offsets_1d, labels)  # [H,W]
         mask = (labels != 0).to(gathered.dtype)
         offsets = gathered * mask  # zero-out background
         if offsets.shape != pixel_logits.shape:
@@ -811,10 +827,35 @@ class FilamentOptimizer:
         new_eff = heights_to_logits(z, self.max_layers)
         self.pixel_height_logits.copy_(new_eff - (eff - self.pixel_height_logits))
 
+    def _gather_offsets(self, offsets_1d: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """``offsets_1d[labels]`` whose backward sums in a fixed order (the
+        stock one uses float atomics, which made runs non-reproducible)."""
+        if not (torch.is_grad_enabled() and offsets_1d.requires_grad):
+            return offsets_1d[labels]
+        from autoforge.Helper.DeterministicOps import gather_plan, segment_gather
+
+        # Keyed on the stored labels (``labels`` is a fresh copy per call):
+        # building the plan syncs, so it must not happen inside a capture.
+        src = self.pixel_height_labels
+        key = (src.data_ptr(), src._version, tuple(labels.shape), offsets_1d.shape[0])
+        cache = getattr(self, "_gather_plan", None)
+        if cache is None or cache[0] != key:
+            cache = (key, gather_plan(labels, offsets_1d.shape[0]))
+            self._gather_plan = cache
+        return segment_gather(offsets_1d, labels, cache[1])
+
     def _delta_up(self, shape):
-        return F.interpolate(
-            self.pixel_delta, size=tuple(shape[-2:]), mode="bilinear", align_corners=False
-        )[0, 0]
+        size = tuple(shape[-2:])
+        if not (torch.is_grad_enabled() and self.pixel_delta.requires_grad):
+            return F.interpolate(self.pixel_delta, size=size, mode="bilinear", align_corners=False)[0, 0]
+        from autoforge.Helper.DeterministicOps import bilinear_plan, bilinear_up
+
+        key = (tuple(self.pixel_delta.shape[-2:]), size)
+        cache = getattr(self, "_delta_plan", None)
+        if cache is None or cache[0] != key:
+            cache = (key, bilinear_plan(key[0], size, self.pixel_delta.device))
+            self._delta_plan = cache
+        return bilinear_up(self.pixel_delta, size, cache[1])[0, 0]
 
     def _remove_height_offset(
         self,
@@ -873,9 +914,30 @@ class FilamentOptimizer:
         material tables, the two parameters and their .grad tensors, and the
         pre-drawn ``_gumbel_exp``) and contains no RNG and no host sync.
         """
-        effective_logits = self._apply_height_offset()
+        loss = self._fused_height_loss(tau_height, tau_global)
+        fused = loss is not None
+        if not fused:
+            loss = self._unfused_loss(tau_height, tau_global)
+        if self.constrained and not fused:
+            logp = torch.log_softmax(self.params["global_logits"].float(), dim=1)
+            loss = loss - self._proj_rho * (logp * self._proj_target).sum(1).mean()
+            excess = torch.clamp(
+                self._expected_counts(self.params["global_logits"]) - self._lim, min=0.0
+            )
+            excess = torch.nan_to_num(excess, posinf=0.0)
+            self._viol.copy_(excess.detach())
+            loss = loss + self._lagr_gate * (self._lam * excess).sum()
 
-        loss = loss_fn(
+        if self.precision.scaler is not None:
+            self.precision.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        return loss
+
+    def _unfused_loss(self, tau_height: float, tau_global: float):
+        """The step's image loss through loss_fn (see _fused_height_loss)."""
+        effective_logits = self._apply_height_offset()
+        return loss_fn(
             {
                 "pixel_height_logits": effective_logits,
                 "global_logits": self.params["global_logits"],
@@ -894,21 +956,53 @@ class FilamentOptimizer:
             compute_dtype=self.composite_compute_dtype,
             gumbel_exp=self._gumbel_exp,
         )
-        if self.constrained:
-            logp = torch.log_softmax(self.params["global_logits"].float(), dim=1)
-            loss = loss - self._proj_rho * (logp * self._proj_target).sum(1).mean()
-            excess = torch.clamp(
-                self._expected_counts(self.params["global_logits"]) - self._lim, min=0.0
-            )
-            excess = torch.nan_to_num(excess, posinf=0.0)
-            self._viol.copy_(excess.detach())
-            loss = loss + self._lagr_gate * (self._lam * excess).sum()
 
-        if self.precision.scaler is not None:
-            self.precision.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        return loss
+    def _fused_height_loss(self, tau_height: float, tau_global: float):
+        """The same loss with the height chain (offsets, smooth field, soft
+        rounding, smoothness penalty) in two kernels (FusedComposite.
+        height_head) instead of ~60 small ones; None where it does not apply
+        (no Triton, tau below 1 - hard rounding -, a height map at another
+        resolution than the labels, the ablations)."""
+        from autoforge.Helper import FusedComposite as fc
+        from autoforge.Helper import OptimizerHelper as oh
+        from autoforge.Helper.DeterministicOps import gather_plan
+
+        if not (
+            fc._HAS_TRITON and self.pixel_height_logits.is_cuda and tau_height >= 1.0
+            and oh._USE_FUSED_CONT and not oh.ABLATION_BEER_LAMBERT_OPACITY
+            and not oh.ABLATION_NO_ADAPTIVE_ROUNDING
+            and tuple(self.pixel_height_labels.shape) == tuple(self.pixel_height_logits.shape)
+            and getattr(self, "height_offsets_grad_scale", 1.0) == 1.0
+            and self.height_offsets.requires_grad
+            and self._gumbel_exp is not None and not oh.ABLATION_NO_GUMBEL_NOISE
+            and self.params["global_logits"].shape[1] <= 128
+        ):
+            return None
+        src = self.pixel_height_labels
+        key = ("hh", src.data_ptr(), src._version, tuple(src.shape), self.height_offsets.shape[0])
+        cache = getattr(self, "_hh_plan", None)
+        if cache is None or cache[0] != key:
+            perm, ends = gather_plan(src, self.height_offsets.shape[0])
+            cache = (key, src.to(torch.int32).contiguous(), perm, ends)
+            self._hh_plan = cache
+        du = self._delta_up(self.pixel_height_logits.shape) if self.pixel_delta is not None else None
+        z, pen = fc.height_head(
+            self.height_offsets, du, self.pixel_height_logits, cache[1], cache[2], cache[3],
+            self.max_layers, self.h, 10.0,
+        )
+        bg = self._soft_background(tau_global) if self.bg_logits is not None else self.background
+        # The per-layer table and the constraint terms (when the limits are
+        # held during training) in the parameter head's kernels.
+        cons = None
+        if self.constrained:
+            cons = (self._proj_target, self._proj_rho, self._lim, self._lam, self._lagr_gate,
+                    self._color_mask, self._base_onehot, self._viol)
+        prm, loss_c = fc.param_head(
+            self.params["global_logits"], self._gumbel_exp, self.material_colors, self.material_TDs,
+            bg, self.h, tau_global, cons,
+        )
+        loss = fc.composite_loss_prm(z, prm, bg, self.h, tau_height, self.target, self.focus_map, self.alpha)
+        return loss + pen + loss_c
 
     def _optimizer_step(self):
         """The parameter update half of ``PrecisionManager.backward_and_step``."""
@@ -1035,12 +1129,12 @@ class FilamentOptimizer:
         colour/swap limits only bases the stack still keeps them under are
         tried (the base changes both counts). Returns True if it changed."""
         from autoforge.Helper.ConstraintHelper import feasible
-        from autoforge.Helper.PruningHelper import _make_shared_eff_thick, candidate_losses
+        from autoforge.Helper.PruningHelper import _shared_scoring_handle, candidate_losses
 
         if self.bg_logits is None or self.best_params is None or "background_index" not in self.best_params:
             return False
         dg, _ = self.get_discretized_solution(best=True)
-        shared = _make_shared_eff_thick(self)
+        shared = _shared_scoring_handle(self)
         start = int(self.best_params["background_index"])
         n_mat = self.material_colors.shape[0]
         losses = {}
@@ -1123,6 +1217,120 @@ class FilamentOptimizer:
                 return False
         return True
 
+    # The parameter update of a step (CAdamW, the dual step, the running
+    # average) as a second graph after the forward/backward one: ~80 small
+    # launches that otherwise cost more CPU time than the GPU spends on the
+    # whole step. The bias-corrected step size of every coming step is
+    # precomputed exactly as step() and CAdamW compute it and read from a
+    # device table by a device-side counter.
+    _upd_graph = None
+
+    def _update_graph_ok(self) -> bool:
+        from autoforge.Helper.CAdamW import CAdamW
+
+        opt = self.optimizer
+        if not isinstance(opt, CAdamW) or self.precision.scaler is not None:
+            return False
+        groups = opt.param_groups
+        if len({(g["lr"], g["betas"], g["eps"], g["weight_decay"], g["correct_bias"]) for g in groups}) != 1:
+            return False
+        g0 = groups[0]
+        if g0["weight_decay"] != 0.0 or not g0["correct_bias"]:
+            return False
+        steps = set()
+        for g in groups:
+            for p in g["params"]:
+                st = opt.state.get(p, {})
+                if p.grad is None or "exp_avg" not in st:
+                    return False
+                steps.add(st["step"])
+        return len(steps) == 1 and getattr(self, "_ema", None) is not None
+
+    def _update_body(self) -> None:
+        from autoforge.Helper import FusedComposite as fc
+
+        opt = self.optimizer
+        neg_ss = self._upd_table.index_select(0, self._upd_j.view(1))  # [1]
+        # Small contiguous fp32 parameters: the whole CAdamW step and the
+        # running average in one kernel each (else ~20 small ops).
+        ema_of = {}
+        for t, e in zip(self._ema_tensors(), self._ema):
+            ema_of[t.data_ptr()] = e
+        fused_all = fc._HAS_TRITON and all(
+            p.is_cuda and p.dtype == torch.float32 and p.is_contiguous() and p.numel() <= fc.CADAMW_MAX
+            and (ema_of.get(p.data_ptr()) is None or ema_of[p.data_ptr()].numel() == p.numel())
+            for g in opt.param_groups for p in g["params"]
+        )
+        for group in opt.param_groups:
+            beta1, beta2 = group["betas"]
+            for p in group["params"]:
+                grad = p.grad
+                state = opt.state[p]
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                if fused_all:
+                    fc.cadamw_fused(p, grad, exp_avg, exp_avg_sq, ema_of.get(p.data_ptr()), neg_ss,
+                                    beta1, beta2, group["eps"], self.EMA_DECAY)
+                    continue
+                exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                denom = exp_avg_sq.sqrt().add_(group["eps"])
+                mask = (exp_avg * grad > 0).to(grad.dtype)
+                mask.div_(mask.mean().clamp_(min=1e-3))
+                norm_grad = (exp_avg * mask) / denom
+                p.addcmul_(norm_grad, neg_ss.to(norm_grad.dtype))
+        if self.constrained:
+            self._dual_step()
+        if not fused_all:
+            self._ema_update()
+
+    @torch.no_grad()
+    def _maybe_capture_update(self) -> None:
+        """Capture the update graph (after an eager update, which created
+        the optimizer state); capturing only records, so nothing changes."""
+        if (
+            self._upd_graph is not None
+            or getattr(self, "_upd_attempted", False)
+            or self._graph is None
+            or not self._update_graph_ok()
+        ):
+            return
+        self._upd_attempted = True
+        import math
+
+        opt = self.optimizer
+        g0 = opt.param_groups[0]
+        beta1, beta2 = g0["betas"]
+        k0 = next(iter(opt.state.values()))["step"]  # updates done so far
+        warmup = int(self.args.iterations * self.args.learning_rate_warmup_fraction)
+        n0 = self.num_steps_done + 1  # the next step's index (this one is done)
+        table = []
+        for j in range(max(self.args.iterations - n0, 0) + 2):
+            n, k = n0 + j, k0 + 1 + j
+            lr = (n / warmup) * self.learning_rate if (n < warmup and warmup > 0) else self.learning_rate
+            table.append(-(lr * math.sqrt(1.0 - beta2 ** k) / (1.0 - beta1 ** k)))
+        try:
+            self._upd_table = torch.tensor(table, dtype=torch.float64, device=self.device).to(torch.float32)
+            self._upd_j = torch.zeros((), dtype=torch.long, device=self.device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._update_body()
+            self._upd_graph = graph
+            self._upd_n0 = n0
+        except Exception as exc:  # pragma: no cover - hardware/driver dependent
+            self._upd_graph = None
+            print(f"Update graph capture unavailable ({exc}); using eager updates.")
+
+    def _replay_update(self) -> bool:
+        """Replay the update graph for this step, if its table covers it."""
+        j = self.num_steps_done - self._upd_n0
+        if not 0 <= j < self._upd_table.shape[0]:
+            return False
+        self._upd_j.fill_(j)  # the table row of this step, whatever ran before
+        self._upd_graph.replay()
+        for st in self.optimizer.state.values():
+            st["step"] += 1
+        return True
+
     def release_cuda_graph(self) -> None:
         """Drop the captured graph and its private memory pool.
 
@@ -1152,6 +1360,9 @@ class FilamentOptimizer:
         self._graph = None
         self._graph_loss = None
         self._graph_tau = None
+        if self._upd_graph is not None:
+            self._upd_graph.reset()
+            self._upd_graph = None
         gc.collect()
         synchronize(self.device)
         empty_cache(self.device)
@@ -1200,12 +1411,17 @@ class FilamentOptimizer:
         if self.bg_logits is not None:
             self._bg_gumbel_exp.exponential_()
 
+        upd_graphed = False
         if self._graph is not None and self._graph_tau == (tau_height, tau_global):
             self._graph.replay()
             loss = self._graph_loss
-            self._optimizer_step()
-            if self.constrained:
-                self._dual_step()
+            if self._upd_graph is not None:
+                upd_graphed = self._replay_update()
+            if not upd_graphed:
+                self._optimizer_step()
+                if self.constrained:
+                    self._dual_step()
+                self._maybe_capture_update()
         else:
             loss = self._forward_backward(tau_height, tau_global)
             self._optimizer_step()
@@ -1224,7 +1440,8 @@ class FilamentOptimizer:
             self._maybe_capture_graph(tau_height, tau_global)
 
         self.num_steps_done += 1
-        self._ema_update()
+        if not upd_graphed:
+            self._ema_update()
 
         if (
             self.preview_callback is not None
@@ -1677,6 +1894,15 @@ class FilamentOptimizer:
         def _tick(label: str) -> None:
             print(f"[time] {label}: {time.time() - _t_prune:.1f}s since prune start")
 
+        def _step_done(name: str) -> None:
+            callback = getattr(self, "prune_step_callback", None)
+            if callback is None:
+                return
+            try:
+                callback(self, name)
+            except Exception:
+                traceback.print_exc()
+
         def _wait_if_paused() -> bool:
             """Blocks while paused. Returns True if cancelled (while paused
             or otherwise)."""
@@ -1722,6 +1948,7 @@ class FilamentOptimizer:
                 current_loss = seed_loss
             else:
                 print("Seed search: no better seed found; keeping the current one")
+            _step_done("Searching color seeds")
 
         if _wait_if_paused():
             return False
@@ -1735,6 +1962,7 @@ class FilamentOptimizer:
                 num_steps=fine_tune_steps,
                 progress_callback=self._prune_phase_progress,
             )
+            _step_done("Polishing heights")
 
         # clear pytorch and system cache to reduce vram usage
         empty_cache(self.device)
@@ -1791,6 +2019,8 @@ class FilamentOptimizer:
             ),
             forced=_current_counts()[0] > max_colors_allowed,
         )
+        if not _skip_legacy:
+            _step_done("Reducing colors")
 
         if _wait_if_paused():
             return False
@@ -1810,6 +2040,8 @@ class FilamentOptimizer:
             ),
             forced=_current_counts()[1] > max_swaps_allowed,
         )
+        if not _skip_legacy:
+            _step_done("Reducing swaps")
 
         if _wait_if_paused():
             return False
@@ -1829,6 +2061,8 @@ class FilamentOptimizer:
             ),
             forced=int(self.max_layers) > max_layers_allowed,
         )
+        if not _skip_legacy:
+            _step_done("Reducing layers")
 
         if _wait_if_paused():
             return False
@@ -1844,6 +2078,8 @@ class FilamentOptimizer:
             ),
             forced=False,
         )
+        if not _skip_legacy:
+            _step_done("Optimising swap positions")
 
         if _wait_if_paused():
             return False
@@ -1861,6 +2097,7 @@ class FilamentOptimizer:
             )
             self._prune_phase_progress(100.0)
             self._draw_prune_preview()
+            _step_done("Fine-tuning height")
 
         if _wait_if_paused():
             return False
@@ -1939,6 +2176,7 @@ class FilamentOptimizer:
             self._prune_phase_progress(100.0)
             self._refine_left_spikes = True
             self._draw_prune_preview()
+            _step_done("Refining pixel heights")
 
         if _wait_if_paused():
             return False
@@ -1999,6 +2237,7 @@ class FilamentOptimizer:
                         self, sweeps=refine_sweeps, spike_aware=True, block=1, radius=refine_radius,
                     )
             self._prune_phase_progress(100.0)
+            _step_done("Removing spikes")
         self._current_prune_phase = None
         # Calculate and Print current loss
         dg, dh = self.get_discretized_solution(best=True)
@@ -2372,8 +2611,10 @@ class FilamentOptimizer:
                     compute_dtype=self.composite_compute_dtype,
                     # The only backward in the pipeline that runs at full
                     # *output* resolution, so it sets the whole run's VRAM
-                    # high-water mark - use the layer-chunked composite.
-                    low_memory=True,
+                    # high-water mark: the fused kernel (recompute backward,
+                    # nothing per layer kept) where it runs, else the
+                    # layer-chunked composite.
+                    low_memory=not _fused_cont_available(self.material_colors),
                 )
                 loss.backward()
                 ft_optimizer.step()
@@ -2421,11 +2662,11 @@ class FilamentOptimizer:
         de-duplicated, and scored against one shared thickness with a single
         host sync.
         """
-        from autoforge.Helper.ConstraintHelper import feasible, project_assignment, top_palettes
+        from autoforge.Helper.ConstraintHelper import _mat, _palette_candidates, feasible, project_assignment, top_palettes
         from autoforge.Helper.OptimizerHelper import deterministic_gumbel_noise
         from autoforge.Helper.PruningHelper import (
             _candidate_loss,
-            _eff_thick_from_logits,
+            _scoring_handle,
             disc_to_logits,
             find_color_bands,
             material_select_from_logits,
@@ -2434,32 +2675,59 @@ class FilamentOptimizer:
         self._ensure_check_scope()
         n_mat = self.material_colors.shape[0]
         logp = torch.log_softmax(self.params["global_logits"].detach().float(), dim=1)
-        seeds = torch.arange(logp.shape[0], dtype=torch.int64, device=logp.device) + seed
-        scores = [logp + deterministic_gumbel_noise(seeds, n_mat), logp]
-        if self.limit_colors is not None:
+        # Several draws at once (``seed`` a list, ``sample`` None): the
+        # deterministic candidates below are shared, so one projection and
+        # one scoring pass cover them all.
+        draws = list(seed) if isinstance(seed, (list, tuple)) else [seed]
+        if sample is None:
+            from autoforge.Helper.OptimizerHelper import batched_layer_material_indices
+
+            samples = [batched_layer_material_indices(self.params["global_logits"], tau_g, s) for s in draws]
+        else:
+            samples = [sample]
+        layer_ids = torch.arange(logp.shape[0], dtype=torch.int64, device=logp.device)
+        scores = [logp + deterministic_gumbel_noise(layer_ids + s, n_mat) for s in draws] + [logp]
+        if self.limit_colors is not None and _palette_candidates(n_mat, self.limit_colors, _mat(self.base_code), "cpu") is not None:
+            # Runner-up palettes only exist where the palettes are enumerated
+            # (the greedy search returns just one).
             neg = torch.full_like(logp, -1e9)
             scores += [torch.where(m.view(1, -1), logp, neg) for m in top_palettes(logp, self.limit_colors, 8, self.base_code)[1:]]
         stacks = project_assignment(torch.stack(scores), self.limit_colors, self.limit_swaps, self.base_code)
-        if feasible(sample, self.limit_colors, self.limit_swaps, self.base_code):
-            stacks[0] = sample.to(stacks.dtype)
+        rows = stacks.cpu().tolist()
+        sample_rows = torch.stack(samples).cpu().tolist()
+        for k, srow in enumerate(sample_rows):
+            if feasible(torch.tensor(srow), self.limit_colors, self.limit_swaps, self.base_code):
+                rows[k] = srow
 
-        unique, seen = [], set()
-        for row in stacks.cpu().tolist():
+        # Each unique stack with the draw it first came from (the rest are
+        # the shared candidates: the first draw's seed).
+        unique, seen, cand_seed = [], set(), []
+        for k, row in enumerate(rows):
             if tuple(row) not in seen:
                 seen.add(tuple(row))
                 unique.append(row)
+                cand_seed.append(draws[k] if k < len(draws) else draws[0])
         cands = torch.tensor(unique, dtype=torch.long, device=logp.device)
 
-        eff = _eff_thick_from_logits(effective_logits, self.max_layers, self.h, self.vis_tau)
-        losses = []
-        for dg in cands:
-            cols, tds = material_select_from_logits(
-                disc_to_logits(dg, n_mat, big_pos=1e5), self.material_colors, self.material_TDs,
-                rng_seed=seed, tau=self.vis_tau,
+        eff = _scoring_handle(effective_logits, self.max_layers, self.h, self.vis_tau)
+        from autoforge.Helper import FusedComposite as fc
+
+        if fc.fused_available(eff):
+            # The stacks are one-hot logits: the selection is the stack itself.
+            losses_t = fc.batched_heights_loss(
+                self, eff._af_z, self.material_colors[cands], self.material_TDs[cands].clamp(1e-8, 1e8)
             )
-            losses.append(_candidate_loss(self, eff, cols, tds))
+        else:
+            losses = []
+            for dg, s in zip(cands, cand_seed):
+                cols, tds = material_select_from_logits(
+                    disc_to_logits(dg, n_mat, big_pos=1e5), self.material_colors, self.material_TDs,
+                    rng_seed=s, tau=self.vis_tau,
+                )
+                losses.append(_candidate_loss(self, eff, cols, tds))
+            losses_t = torch.stack(losses)
         del eff
-        best_loss_t, best_i = torch.min(torch.stack(losses), dim=0)
+        best_loss_t, best_i = torch.min(losses_t, dim=0)
         best_loss = float(best_loss_t)  # the one host sync
         if best_loss < self.best_discrete_loss:
             dg = cands[int(best_i)]
@@ -2468,7 +2736,7 @@ class FilamentOptimizer:
             # The stored solution is the feasible stack itself.
             self.best_params["global_logits"] = disc_to_logits(dg, n_mat, big_pos=1e5)
             self.best_tau = tau_g
-            self.best_seed = seed
+            self.best_seed = cand_seed[int(best_i)]
             self.best_swaps = len(find_color_bands(dg)) - 1
             self.best_step = self.num_steps_done
 
@@ -2489,8 +2757,12 @@ class FilamentOptimizer:
                 torch._foreach_mul_(self._ema, self.EMA_DECAY)
                 torch._foreach_add_(self._ema, [t.detach() for t in ts], alpha=1.0 - self.EMA_DECAY)
 
-    def _maybe_update_best_discrete(self):
-        self._maybe_update_best_discrete_live()
+    def _maybe_update_best_discrete(self, seeds=None):
+        """``seeds``: (live seeds, EMA seeds) for the constrained snapshot of
+        several draws at once (see ``_constrained_update_best``); by default
+        one fresh draw each."""
+        live_seeds, ema_seeds = seeds if seeds is not None else (None, None)
+        self._maybe_update_best_discrete_live(live_seeds)
         # Also try the running average of the parameters: it smooths out the
         # step-to-step noise of the Gumbel gradients.
         if getattr(self, "_ema", None) is None:
@@ -2500,26 +2772,32 @@ class FilamentOptimizer:
             for t, e in zip(self._ema_tensors(), self._ema):
                 t.copy_(e)
             try:
-                self._maybe_update_best_discrete_live()
+                self._maybe_update_best_discrete_live(ema_seeds)
             finally:
                 for t, l in zip(self._ema_tensors(), live):
                     t.copy_(l)
 
-    def _maybe_update_best_discrete_live(self):
+    def _maybe_update_best_discrete_live(self, seeds=None):
         if self.bg_logits is None:
-            return self._update_best_discrete()
+            return self._update_best_discrete(seeds)
         self._use_background(int(self.bg_logits.detach().argmax()))
         try:
-            return self._update_best_discrete()
+            return self._update_best_discrete(seeds)
         finally:
             if self.best_params is not None and "background_index" in self.best_params:
                 self._use_background(self.best_params["background_index"])
 
-    def _update_best_discrete(self):
+    def _update_best_discrete(self, seeds=None):
         """
         Discretize the current solution, compute the discrete-mode loss,
-        and update the best solution if it improves.
+        and update the best solution if it improves. ``seeds`` (constrained
+        runs only): several draws judged in one pass.
         """
+        if seeds is not None:
+            assert self.constrained, "several draws per snapshot need --constrained_opt"
+            with torch.no_grad():
+                self._constrained_update_best(None, self._apply_height_offset(), list(seeds), self.vis_tau)
+            return
         seed = np.random.randint(0, 1000000)
 
         tau_g = self.vis_tau

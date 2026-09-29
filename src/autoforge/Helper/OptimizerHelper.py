@@ -345,7 +345,11 @@ def _stack_after_layers(
     # through[j,i] = transmittance of layers j+1..i
     through = torch.cumprod(trans, dim=1)
     weight = torch.where(covered, through * o_ext.view(n, 1), zero)
-    return weight.t() @ colors_ext
+    # An exact fp32 sum, not a matmul: under autocast a matmul runs in bf16
+    # (TF32 without it), and the lightness this feeds is compared against
+    # each layer's own - a flipped comparison switched a layer's coverage
+    # curve and put whole regions of the composite off by up to 32/255.
+    return (weight.unsqueeze(2) * colors_ext.to(weight.dtype).unsqueeze(1)).sum(0)
 
 
 @torch.jit.script
@@ -508,34 +512,15 @@ class _CumprodDim0(torch.autograd.Function):
 
 
 @torch.jit.script
-def _composite_cont_pre(
-    pixel_height_logits: torch.Tensor,  # [H,W]
+def _composite_cont_mat(
     global_logits: torch.Tensor,  # [L,M]
-    tau_height: float,
     tau_global: float,
-    h: float,
-    max_layers: int,
     material_colors: torch.Tensor,  # [M,3]
     material_TDs: torch.Tensor,  # [M]
-    background: torch.Tensor,  # [3]
-    compute_dtype: Optional[torch.dtype] = None,
     gumbel_exp: Optional[torch.Tensor] = None,  # [L,M] Exponential(1) samples
     no_gumbel: bool = ABLATION_NO_GUMBEL_NOISE,
 ):
-    """Everything in the continuous composite up to the per-layer opacity.
-
-    The composite is cut into scripted pieces so that the opacity step can
-    run under activation checkpointing and the ``cumprod`` can go through
-    ``_CumprodDim0`` - neither can be called from TorchScript, and dropping
-    ``@torch.jit.script`` from the whole composite costs ~40% (2.85ms ->
-    3.98ms fwd+bwd at L=75, H=W=250).
-
-    Returns ``(continuous_z, p_mat, colors_f32, tds_f32)``.
-    """
-    # 1. per-pixel continuous layer index
-    pixel_height = (max_layers * h) * torch.sigmoid(pixel_height_logits)  # [H,W]
-    continuous_z = pixel_height / h  # [H,W]
-    continuous_z = adaptive_round(continuous_z, tau_height, 1.0, 0.0, 0.1)
+    """The material half of ``_composite_cont_pre``: (p_mat, colors, TDs)."""
 
     # 2. global material weights with Gumbel-Softmax
     #
@@ -565,7 +550,88 @@ def _composite_cont_pre(
     colors_f32 = layer_colors
     tds_f32 = layer_TDs
 
+    return p_mat, colors_f32, tds_f32
+
+
+@torch.jit.script
+def _composite_cont_pre(
+    pixel_height_logits: torch.Tensor,  # [H,W]
+    global_logits: torch.Tensor,  # [L,M]
+    tau_height: float,
+    tau_global: float,
+    h: float,
+    max_layers: int,
+    material_colors: torch.Tensor,  # [M,3]
+    material_TDs: torch.Tensor,  # [M]
+    background: torch.Tensor,  # [3]
+    compute_dtype: Optional[torch.dtype] = None,
+    gumbel_exp: Optional[torch.Tensor] = None,  # [L,M] Exponential(1) samples
+    no_gumbel: bool = ABLATION_NO_GUMBEL_NOISE,
+):
+    """Everything in the continuous composite up to the per-layer opacity.
+
+    The composite is cut into scripted pieces so that the opacity step can
+    run under activation checkpointing and the ``cumprod`` can go through
+    ``_CumprodDim0`` - neither can be called from TorchScript, and dropping
+    ``@torch.jit.script`` from the whole composite costs ~40% (2.85ms ->
+    3.98ms fwd+bwd at L=75, H=W=250).
+
+    Returns ``(continuous_z, p_mat, colors_f32, tds_f32)``.
+    """
+    # 1. per-pixel continuous layer index
+    pixel_height = (max_layers * h) * torch.sigmoid(pixel_height_logits)  # [H,W]
+    continuous_z = pixel_height / h  # [H,W]
+    continuous_z = adaptive_round(continuous_z, tau_height, 1.0, 0.0, 0.1)
+    p_mat, colors_f32, tds_f32 = _composite_cont_mat(
+        global_logits, tau_global, material_colors, material_TDs, gumbel_exp, no_gumbel
+    )
     return continuous_z, p_mat, colors_f32, tds_f32
+
+
+
+
+def composite_loss_cont(
+    pixel_height_logits: torch.Tensor,
+    global_logits: torch.Tensor,
+    tau_height: float,
+    tau_global: float,
+    h: float,
+    max_layers: int,
+    material_colors: torch.Tensor,
+    material_TDs: torch.Tensor,
+    background: torch.Tensor,
+    target: torch.Tensor,
+    focus_map: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,
+    compute_dtype: Optional[torch.dtype] = None,
+    gumbel_exp: Optional[torch.Tensor] = None,
+    continuous_z: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """compute_loss(composite_image_cont(...)) (without the height penalty)
+    with the Lab error fused into the composite's kernels, or None where
+    composite_image_cont would not take the fused path. ``continuous_z``:
+    the layer index map when the caller already has it (FusedComposite.
+    height_head); ``pixel_height_logits`` is then unused."""
+    if continuous_z is None:
+        continuous_z, p_mat, colors_f32, tds_f32 = _composite_cont_pre(
+            pixel_height_logits, global_logits, tau_height, tau_global, h, max_layers,
+            material_colors, material_TDs, background, compute_dtype, gumbel_exp,
+        )
+    else:
+        p_mat, colors_f32, tds_f32 = _composite_cont_mat(
+            global_logits, tau_global, material_colors, material_TDs, gumbel_exp
+        )
+    if not (_USE_FUSED_CONT and continuous_z.is_cuda and not ABLATION_BEER_LAMBERT_OPACITY):
+        return None
+    from autoforge.Helper import FusedComposite as fc
+
+    if not fc._HAS_TRITON:
+        return None
+    reach, slow_reach, cov_w, run_start = fc.cont_coverage_params(p_mat, colors_f32, tds_f32, background, h)
+    return fc.composite_loss_cont_fused(
+        continuous_z, colors_f32, reach, slow_reach, cov_w, run_start, background, h, tau_height,
+        target, focus_map, alpha,
+    )
 
 
 @torch.jit.script

@@ -52,6 +52,7 @@ def broadcast_preview(
     max_layer: int | None = None,
     render_id: str | None = None,
     base: dict | None = None,
+    live_mesh: dict | None = None,
 ):
     """Send a preview update to all connected preview clients (thread-safe).
 
@@ -78,6 +79,11 @@ def broadcast_preview(
         # The base the optimizer currently uses (it chooses the base
         # filament too), so the base row follows the live preview.
         payload["base"] = base
+    if live_mesh:
+        # Mid-prune: the mesh of the solution as it stands now
+        # ({"prune_job_id", "url"}), shown in place of `job_id`'s own
+        # until that prune ends.
+        payload["live_mesh"] = live_mesh
     _send_to_all(json.dumps(payload))
 
 

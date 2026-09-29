@@ -64,3 +64,28 @@ export function describePruningChange(before: PruningCounts, after: PruningCount
     before[key] === after[key] ? `${after[key]} ${noun}` : `${before[key]} → ${after[key]} ${noun}`
   return [part('colors', 'colors'), part('swaps', 'swaps'), part('layers', 'layers')].join(', ')
 }
+
+/** A running prune's mesh after its latest step (api/pruning.py's
+ * _on_prune_step): `forJob` is the result the prune started from,
+ * `pruneJobId` the prune itself. */
+export interface LiveMesh {
+  forJob: string
+  pruneJobId: string
+  url: string
+}
+
+/** The live mesh to show instead of `currentJobId`'s own, if any: only while
+ * that very prune is still running (or paused). Once it completes the
+ * pruned result becomes the current job and its final mesh takes over; a
+ * cancelled or failed prune is rolled back, so the original's mesh is
+ * right again. */
+export function liveMeshUrl(
+  liveMesh: LiveMesh | null,
+  currentJobId: string | undefined,
+  pruningJob: { job_id: string; status: string } | null,
+): string | null {
+  if (!liveMesh || !currentJobId || !pruningJob) return null
+  if (liveMesh.forJob !== currentJobId || liveMesh.pruneJobId !== pruningJob.job_id) return null
+  if (!['pending', 'running', 'paused'].includes(pruningJob.status)) return null
+  return liveMesh.url
+}

@@ -3,10 +3,8 @@ from typing import Optional
 
 import numpy as np
 import torch
-from joblib import Parallel, delayed
-from scipy.spatial.distance import cdist
-from skimage.color import rgb2lab
-from sklearn.cluster import MiniBatchKMeans
+
+from autoforge.Helper.Heightmaps._cluster import cdist, kmeans, rgb2lab, weighted_kmeans
 
 from autoforge.Helper.DeviceUtils import accelerator_device
 from autoforge.Helper.Heightmaps.ChristofidesHeightMap import (
@@ -34,13 +32,8 @@ def _compute_overclustering(
     Returns (over_cluster_centroids, over_cluster_labels) where labels
     are per-pixel assignments (avoids redoing the expensive cdist in Stage 2).
     """
-    kmeans = MiniBatchKMeans(
-        n_clusters=overcluster_k,
-        random_state=random_state,
-        max_iter=300,
-    )
-    kmeans.fit(pixels)
-    return kmeans.cluster_centers_, kmeans.labels_  # type: ignore[return-value]
+    seed = random_state if random_state is not None else np.random.randint(2**31)
+    return kmeans(pixels, overcluster_k, seed=seed)
 
 
 def _refine_clusters(
@@ -59,8 +52,6 @@ def _refine_clusters(
 
     Returns (final_centroids, labels) where labels is (H, W).
     """
-    from sklearn.cluster import KMeans
-
     counts1 = np.bincount(labels1, minlength=centroids1.shape[0]).astype(np.float64)
 
     distinct = _compute_distinctiveness(centroids1)
@@ -68,9 +59,7 @@ def _refine_clusters(
         distinct /= distinct.max()
     weights = counts1 * (1.0 + beta_distinct * distinct)
 
-    kmeans2 = KMeans(n_clusters=final_k, random_state=0, n_init="auto")
-    kmeans2.fit(centroids1, sample_weight=weights)
-    centroids_final = kmeans2.cluster_centers_
+    centroids_final = weighted_kmeans(centroids1, weights, final_k, seed=0)
 
     labels_final = _assign_to_centroids(pixels, centroids_final)
     return centroids_final, labels_final.reshape(H, W)
@@ -277,6 +266,8 @@ def init_height_map(
     overcluster_centroids: Optional[np.ndarray] = None,
     overcluster_labels: Optional[np.ndarray] = None,
     overcluster_seed: int = 0,
+    target_lab: Optional[np.ndarray] = None,
+    rank_quality: bool = True,
 ):
     """Initialize pixel height logits using MST-Path + 2-Opt ordering.
 
@@ -291,7 +282,9 @@ def init_height_map(
         random.seed(random_seed)
 
     H, W, _ = target.shape
-    target_lab_reshaped = _prepare_lab_image(target, lab_weights, lab_space)
+    # ``target_lab``: the caller's _prepare_lab_image of the same target
+    # (with the default weights), so it is not converted a second time.
+    target_lab_reshaped = target_lab if target_lab is not None else _prepare_lab_image(target, lab_weights, lab_space)
 
     if overcluster_centroids is not None and overcluster_labels is not None:
         labs, labels = _refine_clusters(
@@ -320,12 +313,13 @@ def init_height_map(
     # other (never surfaced as an absolute score), so a smaller sample is a
     # fine trade: still representative enough to rank consistently, at a
     # fraction of the quadratic cost.
+    # Only ever used to rank several init rounds against each other.
     sil_score = segmentation_quality(
         target_lab_reshaped,
         labels,
         sample_size=1500,
         random_state=random_seed,
-    )
+    ) if rank_quality else 0.0
 
     bg_rgb = np.array(background_tuple).astype(np.float32) / 255.0
     if lab_space:
@@ -445,7 +439,6 @@ def run_init_threads(
     print("Computing over‑clustering (Stage 1) …")
     centroids1, labels1 = _compute_overclustering(pixels, overcluster_k=500, random_state=random_seed)
     print(f"  → {centroids1.shape[0]} over‑cluster centroids computed.")
-    del pixels
     if progress is not None:
         progress(0.3)
 
@@ -459,12 +452,16 @@ def run_init_threads(
             overcluster_centroids=centroids1,
             overcluster_labels=labels1,
             overcluster_seed=seed_offset,
+            target_lab=pixels,
+            rank_quality=num_runs > 1,
         )
 
     if num_threads > 1 and num_runs > 1:
         # Only worth spinning up a worker-process pool (real, measurable
         # spawn overhead) when there's actually more than one task to
         # spread across it.
+        from joblib import Parallel, delayed
+
         tasks = [delayed(_run_one)(i) for i in range(num_runs)]
         # In order as they finish, so progress can be reported (same results).
         results = []

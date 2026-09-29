@@ -65,6 +65,23 @@ EDITED_PLY = "edited_model_colored.ply"
 EDITED_PNG = "edited_model.png"
 
 
+# The mesh of a running prune's solution after its latest step (see
+# api/pruning.py's _on_prune_step), written in the background under
+# live_mesh_target(job_id).
+LIVE_PLY = "live_model_colored.ply"
+
+
+def live_mesh_target(job_id: str) -> str:
+    return f"live:{job_id}"
+
+
+@router.get("/live-ply/{job_id}")
+async def download_live_ply(job_id: str):
+    await asyncio.to_thread(wait_for_pending_mesh, live_mesh_target(job_id))
+    path = _resolve_or_404(job_id, LIVE_PLY, "No live pruning mesh yet")
+    return FileResponse(path, filename=f"{job_id}_live.ply")
+
+
 def discard_slider_edits(job_id: str) -> None:
     """Called when a job's real outputs are regenerated (pruning)."""
     for name in (EDITED_PLY, EDITED_PNG):

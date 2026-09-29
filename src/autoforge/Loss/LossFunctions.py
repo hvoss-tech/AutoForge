@@ -7,6 +7,7 @@ from autoforge.Helper.ImageHelper import srgb_to_lab
 from autoforge.Helper.OptimizerHelper import (
     composite_image_cont,
     composite_image_cont_lowmem,
+    composite_loss_cont,
 )
 
 
@@ -41,6 +42,15 @@ def loss_fn(
         Gumbel-Softmax, so the RNG draw can be kept outside a CUDA-graph
         capture region - see composite_image_cont.
     """
+    if not low_memory:
+        # The Lab error and its gradient in the composite's kernels (one
+        # launch instead of ~50 small ops forward and backward).
+        loss = composite_loss_cont(
+            params["pixel_height_logits"], params["global_logits"], tau_height, tau_global, h, max_layers,
+            material_colors, material_TDs, background, target, focus_map, alpha, compute_dtype, gumbel_exp,
+        )
+        if loss is not None:
+            return loss + _height_penalty(params.get("pixel_height_logits", None), add_penalty_loss)
     composite = composite_image_cont_lowmem if low_memory else composite_image_cont
     comp = composite(
         params["pixel_height_logits"],
@@ -145,10 +155,13 @@ def compute_loss(
         weighted_loss = per_pixel_mse * weights
         total_loss = weighted_loss.mean() / weights.mean().clamp(min=1e-8)
 
-    # Height-map smoothness penalty (Laplacian / total variation)
+    return total_loss + _height_penalty(pixel_height_logits, add_penalty_loss)
+
+
+def _height_penalty(pixel_height_logits, add_penalty_loss: float):
+    """Height-map smoothness penalty (Laplacian / total variation)."""
     if add_penalty_loss > 0 and pixel_height_logits is not None and pixel_height_logits.dim() == 2:
         dy = (pixel_height_logits[:, 1:] - pixel_height_logits[:, :-1]).pow(2).mean()
         dx = (pixel_height_logits[1:, :] - pixel_height_logits[:-1, :]).pow(2).mean()
-        total_loss = total_loss + (dx + dy) * add_penalty_loss
-
-    return total_loss
+        return (dx + dy) * add_penalty_loss
+    return 0.0

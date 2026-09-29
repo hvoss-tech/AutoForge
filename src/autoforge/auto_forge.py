@@ -1152,7 +1152,11 @@ def _post_optimize_and_export(
             )[0, 0]
         return full_init + delta
 
-    assigned = optimizer.height_assign and not optimizer.constrained and optimizer.best_params is not None
+    # Under colour/swap limits the heights are trained, not assigned, but the
+    # stack is final: assigning every pixel its height for that stack at the
+    # output resolution beats the trained cluster heights by far (the height
+    # fine-tunes and seed search it replaces never came close).
+    assigned = optimizer.height_assign and optimizer.best_params is not None
     if assigned:
         # The trained heights are per-pixel assignments at solver resolution
         # (the base logits moved during training), so the delta-on-init
@@ -1519,8 +1523,18 @@ def start(args) -> float:
         if optimizer.height_assign and not optimizer.constrained:
             # The last gradient steps moved the heights off the assignment.
             optimizer.assign_heights_step()
-        for _ in range(60):
-            optimizer._maybe_update_best_discrete()
+        if optimizer.constrained:
+            # The same 60 draws (live and running-average parameters, in the
+            # order the loop below takes them), judged in one pass: the
+            # parameters don't change between them.
+            draws = [np.random.randint(0, 1000000) for _ in range(120)]
+            ema = getattr(optimizer, "_ema", None) is not None
+            optimizer._maybe_update_best_discrete(
+                (draws[0::2], draws[1::2]) if ema else (draws[:60], None)
+            )
+        else:
+            for _ in range(60):
+                optimizer._maybe_update_best_discrete()
         optimizer.search_background()
         if args.constrained_opt:
             optimizer.constrained_local_search(compound=True)

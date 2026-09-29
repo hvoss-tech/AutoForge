@@ -327,7 +327,7 @@ def refine_layer_materials(
     from autoforge.Helper.PruningHelper import (
         _compute_loss_for_heightmap,
         _eval_candidates_batch,
-        _make_shared_eff_thick,
+        _shared_scoring_handle,
         disc_to_logits,
         find_color_bands,
     )
@@ -339,7 +339,7 @@ def refine_layer_materials(
     num_materials = optimizer.material_colors.shape[0]
     L = int(dg.shape[0])
     with torch.no_grad():
-        eff = _make_shared_eff_thick(optimizer)
+        eff = _shared_scoring_handle(optimizer)
         best_dg = dg.clone()
         best, _ = _eval_candidates_batch(optimizer, [best_dg], eff_thick=eff)
         for _ in range(sweeps):
@@ -738,6 +738,41 @@ def _within_limits(c: torch.Tensor, max_colors: int, max_swaps: int, base=None, 
     return ok
 
 
+class _LayerStep:
+    """One coordinate-descent step of ``search_stack`` (``fn(layer)``, the
+    layer a 0-dim device tensor) replayed from a CUDA graph: the step is ~25
+    tiny launch-bound kernels and runs thousands of times, while a replay
+    is one launch plus the layer index. The first call runs eagerly (Triton
+    compiles and library handles must not happen inside a capture), the
+    second captures; a captured graph only records, so capturing never
+    changes the state - the step is then replayed for real. Off CUDA, or
+    while another capture is running, every call is eager."""
+
+    def __init__(self, fn, device, pool=None):
+        self.fn = fn
+        self.layer = torch.zeros((), dtype=torch.long, device=device)
+        self.graph = None
+        self.calls = 0
+        self.pool = pool
+        self.use_graph = device.type == "cuda" and not torch.cuda.is_current_stream_capturing()
+
+    def __call__(self, layer: int) -> None:
+        self.layer.fill_(layer)
+        if not self.use_graph:
+            self.fn(self.layer)
+            return
+        if self.graph is None:
+            self.calls += 1
+            if self.calls == 1:
+                self.fn(self.layer)
+                return
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
+                self.fn(self.layer)
+            self.graph = g
+        self.graph.replay()
+
+
 def search_stack(
     optimizer,
     max_colors: int = 10**9,
@@ -777,57 +812,87 @@ def search_stack(
         # sweep instead of one per layer.
         best_t = proxy(cur[None])[0].to(acc)
         start = float(best_t)
+        # The steps below update these buffers in place, so they can be
+        # replayed from graphs (see _LayerStep); same ops as a plain loop.
+        pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
+        ar_m = torch.arange(M, device=dev)
+        improved = torch.zeros((), dtype=torch.bool, device=dev)
+
+        def cd_step(layer_t):
+            """All materials for one layer, the best taken if it improves."""
+            c = cur.repeat(M, 1)
+            c.scatter_(1, layer_t.view(1, 1).expand(M, 1), ar_m.view(M, 1))
+            ok = _within_limits(c, max_colors, max_swaps, base, M)
+            losses = torch.where(ok, proxy._eval(c), torch.full((M,), float("inf"), device=dev))
+            # index_select, not losses[i]: a 0-dim index tensor is read on
+            # the host (a sync per step, and no graph capture).
+            i = torch.argmin(losses).view(1)
+            li = losses.index_select(0, i)[0].to(acc)
+            take = li < best_t - 1e-6
+            best_t.copy_(torch.where(take, li, best_t))
+            cur.copy_(torch.where(take, c.index_select(0, i)[0], cur))
+            improved.logical_or_(take)
+
+        step = _LayerStep(cd_step, dev, pool)
         # Coordinate descent: all materials for one layer per batch.
         # Progress: the descent is the first fifth, the rounds the rest (an
         # early stop jumps to the end).
         for sweep_i in range(12):
             if progress is not None:
                 progress(0.2 * sweep_i / 12)
-            improved = torch.zeros((), dtype=torch.bool, device=dev)
+            improved.zero_()
             for layer in range(L - 1, -1, -1):
-                c = cur.repeat(M, 1)
-                c[:, layer] = torch.arange(M, device=dev)
-                ok = _within_limits(c, max_colors, max_swaps, base, M)
-                losses = torch.where(ok, proxy(c), torch.full((M,), float("inf"), device=dev))
-                i = torch.argmin(losses)
-                li = losses[i].to(acc)
-                take = li < best_t - 1e-6
-                best_t = torch.where(take, li, best_t)
-                cur = torch.where(take, c[i], cur)
-                improved |= take
+                step(layer)
             if not bool(improved):
                 break
         best = float(best_t)
         cd = best
+        cur = cur.clone()
+
+        ds = {}  # descend buffers and step, per batch size
 
         def descend(c, lo, hi, sweeps=3):
             """Parallel coordinate descent of stacks c [B,L] over layers lo..hi."""
             B = c.shape[0]
+            if B not in ds:
+                st = {
+                    "c": torch.empty_like(c),
+                    "cl": torch.empty(B, dtype=torch.float32, device=dev),
+                    "moved": torch.zeros((), dtype=torch.bool, device=dev),
+                }
+                ar_b = ar_m.repeat(B).view(-1, 1)
+                rows = torch.arange(B, device=dev)
+
+                def d_step(layer_t, st=st, ar_b=ar_b, rows=rows):
+                    v = st["c"].repeat_interleave(M, 0)
+                    v.scatter_(1, layer_t.view(1, 1).expand(B * M, 1), ar_b)
+                    ok = _within_limits(v, max_colors, max_swaps, base, M)
+                    lv = torch.where(ok, proxy._eval(v), torch.full((v.shape[0],), float("inf"), device=dev))
+                    lv, j = lv.view(B, M).min(dim=1)
+                    better = lv < st["cl"] - 1e-6
+                    st["moved"].logical_or_(better.any())
+                    st["c"].copy_(torch.where(better[:, None], v.view(B, M, L)[rows, j], st["c"]))
+                    st["cl"].copy_(torch.where(better, lv, st["cl"]))
+
+                st["step"] = _LayerStep(d_step, dev, pool)
+                ds[B] = st
+            st = ds[B]
             # A random move can break the colour/swap limits by itself (a
             # segment fill adds a colour, an insert adds swaps); such a start
             # scores inf, so only stacks within the limits can ever win.
-            cl = torch.where(
+            st["c"].copy_(c)
+            st["cl"].copy_(torch.where(
                 _within_limits(c, max_colors, max_swaps, base, M),
                 proxy(c),
                 torch.full((B,), float("inf"), device=dev),
-            )
-            ar = torch.arange(M, device=dev)
-            rows = torch.arange(B, device=dev)
+            ))
             for _ in range(sweeps):
-                moved = torch.zeros((), dtype=torch.bool, device=dev)
+                st["moved"].zero_()
                 for layer in range(hi - 1, lo - 1, -1):
-                    v = c.repeat_interleave(M, 0)
-                    v[:, layer] = ar.repeat(B)
-                    ok = _within_limits(v, max_colors, max_swaps, base, M)
-                    lv = torch.where(ok, proxy(v), torch.full((v.shape[0],), float("inf"), device=dev))
-                    lv, j = lv.view(B, M).min(dim=1)
-                    better = lv < cl - 1e-6
-                    moved |= better.any()
-                    c = torch.where(better[:, None], v.view(B, M, L)[rows, j], c)
-                    cl = torch.where(better, lv, cl)
-                if not bool(moved):
+                    st["step"](layer)
+                if not bool(st["moved"]):
                     break
-            return c, cl
+            return st["c"].clone(), st["cl"].clone()
 
         stall = 0
         for _r in range(rounds):
@@ -935,11 +1000,16 @@ def palette_search_stack(
 def _plateau_classes(labels: "np.ndarray", n: int):
     """Greedy colouring of the plateaus (labels 1..n) so that plateaus of one
     colour are >= 3 pixels apart (their 3x3 influence regions never overlap).
-    Returns an int array [n+1] of colour ids."""
+    Returns an int array [n+1] of colour ids.
+
+    The adjacency is gathered with NumPy (each distinct ordered pair of
+    labels found within two pixels once, as the set of pairs it replaces),
+    so the degrees - and with them the colouring order - are unchanged."""
     import numpy as np
 
     H, W = labels.shape
-    pairs = set()
+    K = n + 1
+    codes = []
     for dy in range(-2, 3):
         for dx in range(-2, 3):
             if dy < 0 or (dy == 0 and dx <= 0):
@@ -947,19 +1017,62 @@ def _plateau_classes(labels: "np.ndarray", n: int):
             a = labels[: H - dy, max(0, -dx) : W - max(0, dx)]
             b = labels[dy:, max(0, dx) : W - max(0, -dx)]
             m = a != b
-            pairs.update(zip(a[m].tolist(), b[m].tolist()))
-    adj = [[] for _ in range(n + 1)]
-    for a, b in pairs:
-        adj[a].append(b)
-        adj[b].append(a)
-    color = np.full(n + 1, -1, dtype=np.int64)
-    for v in sorted(range(1, n + 1), key=lambda v: -len(adj[v])):
-        used = {color[u] for u in adj[v]}
+            codes.append(a[m].astype(np.int64) * K + b[m])
+    codes = np.unique(np.concatenate(codes)) if codes else np.zeros(0, dtype=np.int64)
+    A, B = codes // K, codes % K
+    deg = np.bincount(A, minlength=K) + np.bincount(B, minlength=K)
+    # Neighbours of every label (both directions), as flat Python lists.
+    src = np.concatenate([A, B])
+    dst = np.concatenate([B, A])
+    order = np.argsort(src, kind="stable")
+    flat = dst[order].tolist()
+    ptr = np.concatenate([[0], np.cumsum(np.bincount(src, minlength=K))]).tolist()
+    color = [-1] * K
+    # Most neighbours first (ties by label, as the stable sort it replaces).
+    for v in (np.argsort(-deg[1:], kind="stable") + 1).tolist():
+        used = {color[u] for u in flat[ptr[v]:ptr[v + 1]]}
         c = 0
         while c in used:
             c += 1
         color[v] = c
-    return color
+    return np.asarray(color, dtype=np.int64)
+
+
+def _label_equal_regions(values: torch.Tensor):
+    """4-connected regions of equal value, numbered 1..n by (value, raster
+    index of their first pixel) - exactly what labelling ``values == v`` for
+    every value v in ascending order with scipy.ndimage.label and offsetting
+    the labels gives - computed on the device: every pixel takes the lowest
+    index of its region by propagation with pointer jumping. Returns
+    (labels int64 [H,W] numpy, n)."""
+    H, W = values.shape
+    N = H * W
+    dev = values.device
+    v = values.reshape(H, W)
+    idx = torch.arange(N, device=dev, dtype=torch.int64).view(H, W)
+    lab = idx.clone()
+    eq_d = v[1:, :] == v[:-1, :]
+    eq_r = v[:, 1:] == v[:, :-1]
+    big = torch.iinfo(torch.int64).max
+    while True:
+        new = lab.clone()
+        new[1:, :] = torch.minimum(new[1:, :], torch.where(eq_d, lab[:-1, :], big))
+        new[:-1, :] = torch.minimum(new[:-1, :], torch.where(eq_d, lab[1:, :], big))
+        new[:, 1:] = torch.minimum(new[:, 1:], torch.where(eq_r, lab[:, :-1], big))
+        new[:, :-1] = torch.minimum(new[:, :-1], torch.where(eq_r, lab[:, 1:], big))
+        flat = new.view(-1)
+        for _ in range(4):
+            flat = flat[flat]
+        new = flat.view(H, W)
+        if torch.equal(new, lab):
+            break
+        lab = new
+    roots = torch.nonzero(lab.view(-1) == idx.view(-1)).view(-1)  # one per region, raster order
+    rv = v.reshape(-1)[roots]
+    rank = torch.argsort(rv, stable=True)  # by value, raster order within a value
+    ids = torch.empty(N, dtype=torch.int64, device=dev)
+    ids[roots[rank]] = torch.arange(1, roots.numel() + 1, device=dev)
+    return ids[lab.view(-1)].view(H, W).cpu().numpy(), int(roots.numel())
 
 
 @composite_graph_scope()
@@ -975,7 +1088,6 @@ def refine_plateaus(optimizer, min_size: int = 2, shifts=(-3, -2, -1, 1, 2, 3), 
     the real composite. Kept only if the real loss improved.
     """
     import numpy as np
-    from scipy import ndimage
 
     from autoforge.Helper.PruningHelper import _compute_loss_for_heightmap, disc_to_logits
 
@@ -1000,17 +1112,12 @@ def refine_plateaus(optimizer, min_size: int = 2, shifts=(-3, -2, -1, 1, 2, 3), 
     err_map = _heights_error_fn(optimizer, dg, disc_logits, L, target_lab, weights, smooth)
 
     # Plateaus: connected components of equal height (4-connectivity).
-    zc = z.cpu().numpy()
+    zc = z
     if mode == "target":
         # Regions of similar target colour (same Lab grid cell, connected).
         zc = torch.round(target_lab / cell).to(torch.int64)
-        zc = ((zc[..., 0] * 1009 + zc[..., 1]) * 1009 + zc[..., 2]).cpu().numpy()
-    labels = np.zeros((H, W), dtype=np.int64)
-    n = 0
-    for v in np.unique(zc):
-        lab, k = ndimage.label(zc == v)
-        labels[lab > 0] = lab[lab > 0] + n
-        n += k
+        zc = (zc[..., 0] * 1009 + zc[..., 1]) * 1009 + zc[..., 2]
+    labels, n = _label_equal_regions(zc)
     sizes = np.bincount(labels.ravel(), minlength=n + 1)
     big = sizes >= min_size
     big[0] = False

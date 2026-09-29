@@ -2,11 +2,11 @@ import random
 from typing import Optional
 
 import numpy as np
-from joblib import Parallel, delayed
-from scipy.spatial.distance import cdist
-from skimage.color import rgb2lab
-from sklearn.cluster import MiniBatchKMeans, KMeans
-from sklearn.metrics import silhouette_score
+
+# NumPy/torch stand-ins for scipy / skimage / sklearn: importing those cost
+# ~0.6 s per run (see _cluster); the sklearn k-means of the Christofides
+# init itself stays, imported where it runs.
+from autoforge.Helper.Heightmaps._cluster import cdist, rgb2lab, silhouette as _silhouette
 
 
 def _compute_distinctiveness(centroids: np.ndarray) -> np.ndarray:
@@ -31,6 +31,8 @@ def two_stage_weighted_kmeans(
     The pixel‑level data are *only* used in stage‑1; stage‑2 runs on the much
     smaller set of stage‑1 centroids which makes this fast and memory‑friendly.
     """
+
+    from sklearn.cluster import KMeans, MiniBatchKMeans
 
     # Stage 1: heavy over‑segmentation so that even tiny colour modes appear.
     kmeans1 = MiniBatchKMeans(
@@ -108,7 +110,7 @@ def segmentation_quality(
     X_subset = target_lab_reshaped[idx]
     # In rare cases (k == 1) sklearn will raise; catch and return -1
     try:
-        return silhouette_score(X_subset, lbl_subset, metric="euclidean")
+        return _silhouette(X_subset, lbl_subset)
     except ValueError:
         return -1.0
 
@@ -626,6 +628,7 @@ def run_init_threads(
     lab_space = True
 
     if num_threads > 1:
+        from joblib import Parallel, delayed
 
         tasks = [
             delayed(init_height_map)(

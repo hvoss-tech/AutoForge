@@ -104,6 +104,7 @@ async def start_pruning(settings: PruningSettings):
                 optimizer.restore_solution_snapshot(rollback["snapshot"])
             optimizer._prune_runs = rollback["prune_runs"]
             optimizer.preview_callback = rollback["preview_callback"]
+            optimizer.prune_step_callback = None
         finally:
             svc.return_pipeline_result(job_id, prune_job_id)
         broadcast = rollback.get("broadcast")
@@ -318,9 +319,11 @@ async def start_pruning(settings: PruningSettings):
             # user's slider-edited mesh — are that result as it was, and are
             # what an undo back to it has to show.
 
-            def _broadcast_result() -> None:
+            def _broadcast_result(final_image=None, live_mesh: dict | None = None) -> None:
                 """Push the pruned slider stack + image to the frontend, so
-                the color layers and both previews follow each pass."""
+                the color layers and both previews follow each pass.
+                `live_mesh` points the 3D view at the mesh of the solution as
+                it stands mid-prune (see _on_prune_step)."""
                 try:
                     from ..helpers.sliders import derive_sliders_from_result
                     from .ws import broadcast_preview
@@ -328,7 +331,8 @@ async def start_pruning(settings: PruningSettings):
                     slider_data = derive_sliders_from_result(pipeline_result)
                     if not (slider_data and slider_data["sliders"]):
                         return
-                    final_image = optimizer.get_best_discretized_image()
+                    if final_image is None:
+                        final_image = optimizer.get_best_discretized_image()
                     if final_image is None:
                         return
                     import base64
@@ -352,12 +356,78 @@ async def start_pruning(settings: PruningSettings):
                         sliders=slider_data["sliders"],
                         min_layer=slider_data["min_layer"],
                         max_layer=slider_data["max_layer"],
+                        live_mesh=live_mesh,
                     )
                 except Exception:
                     import traceback
                     traceback.print_exc()
 
             rollback["broadcast"] = _broadcast_result
+
+            # The solution the last live mesh was built from, so a step that
+            # changed nothing (a phase with no improvement, or one already
+            # within its limit) doesn't rebuild and resend the same mesh.
+            _last_step_solution: dict = {}
+
+            def _on_prune_step(_optimizer, _step: str) -> None:
+                """After each pruning step: build the mesh of the solution as
+                it now stands and point the 3D view at it. Without this the
+                3D view only changed once the whole prune had finished.
+
+                The mesh goes to the prune job's own LIVE_PLY, never to
+                `job_id`'s files — those stay the result as it was, for an
+                undo or a cancel. Only the GPU reads happen here, on the
+                prune thread; the (slow) mesh build and export run in the
+                background, coalesced when steps finish back to back."""
+                import cv2
+                import numpy as np
+
+                from ..helpers.colored_mesh import generate_colored_preview_mesh
+                from ..helpers.mesh_persist import schedule_persist
+                from .outputs import LIVE_PLY, live_mesh_target
+
+                disc_global, disc_height = optimizer.get_discretized_solution(best=True)
+                if disc_global is None or disc_height is None:
+                    return
+                previous = _last_step_solution.get("value")
+                if previous is not None and torch.equal(previous[0], disc_global) and torch.equal(previous[1], disc_height):
+                    return
+                _last_step_solution["value"] = (disc_global.clone(), disc_height.clone())
+
+                final_image = optimizer.get_best_discretized_image()
+                if final_image is None:
+                    return
+                height_map_mm = disc_height.cpu().numpy().astype(np.float32) * float(args.layer_height)
+                color = np.ascontiguousarray(final_image.cpu().numpy().astype(np.uint8)[..., :3])
+                if color.shape[:2] != height_map_mm.shape[:2]:
+                    color = cv2.resize(
+                        color, (height_map_mm.shape[1], height_map_mm.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                alpha = pipeline_result.get("alpha")
+                background_height = float(args.background_height)
+                stl_output_size = float(args.stl_output_size)
+
+                def _write() -> None:
+                    mesh = generate_colored_preview_mesh(
+                        height_map=height_map_mm,
+                        color_image=color,
+                        background_height=background_height,
+                        maximum_x_y_size=stl_output_size,
+                        alpha_mask=alpha,
+                    )
+                    ply_path = os.path.join(output_dir, LIVE_PLY)
+                    tmp = f"{ply_path}.{threading.get_ident()}.tmp.ply"
+                    mesh.export(tmp, encoding="binary")
+                    os.replace(tmp, ply_path)
+
+                schedule_persist(live_mesh_target(prune_job_id), _write)
+                _broadcast_result(
+                    final_image,
+                    live_mesh={"prune_job_id": prune_job_id, "url": f"/api/outputs/live-ply/{prune_job_id}"},
+                )
+
+            optimizer.prune_step_callback = _on_prune_step
 
             def _discrete_loss() -> float | None:
                 """The loss of the solution as it now stands — the measure
@@ -469,6 +539,7 @@ async def start_pruning(settings: PruningSettings):
                 # come up empty. Aliasing, not re-registering: see
                 # alias_pipeline_result for why this must not go through
                 # set_pipeline_result's "release every older result" path.
+                optimizer.prune_step_callback = None
                 svc.alias_pipeline_result(prune_job_id, job_id)
                 svc.update_status(
                     prune_job_id, "completed", progress=100.0, phase=None,

@@ -86,7 +86,7 @@ def main() -> None:
     poller = threading.Thread(
         target=_poll_nvidia_smi, args=(stop_event, nvidia_smi_samples), daemon=True
     )
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and os.environ.get("AF_NO_SMI") != "1":
         poller.start()
 
     t0 = time.perf_counter()
@@ -112,7 +112,7 @@ def main() -> None:
     synchronize()
     elapsed = time.perf_counter() - t0
     stop_event.set()
-    if torch.cuda.is_available():
+    if poller.is_alive():
         poller.join(timeout=3)
 
     peak_reserved_gb = (
