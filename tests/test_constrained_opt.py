@@ -594,3 +594,38 @@ def test_webui_run_and_prune_report_progress_for_every_step(tmp_path, _cli_input
     for phase in ("Searching layer stacks", "Refining pixel heights", "Removing spikes"):
         pcts = [p for ph, p in reports if ph == phase]
         assert len(pcts) >= 3 and pcts[-1] == 100.0, (phase, pcts)
+
+
+def test_intermediate_search_runs_mid_training_and_keeps_training_state():
+    """--intermediate_search_interval: every N steps a stack search + pixel
+    height refine on the best solution. It must stay within the limits, never
+    make the best solution worse, keep writing into the training tensor the
+    step reads (not replace it), and hand the best heights back to training."""
+    from autoforge.Helper.ConstraintHelper import feasible
+
+    opt = _optimizer(
+        pruning_max_colors=3, pruning_max_swaps=4, iterations=40,
+        intermediate_search_interval=20, intermediate_search_start=0,
+        intermediate_search_rounds=3, intermediate_search_patience=2,
+    )
+    calls = []
+    real = opt.intermediate_search
+
+    def spy():
+        before = opt.solution_loss()
+        tensor = opt.pixel_height_logits
+        real()
+        calls.append((before, opt.solution_loss()))
+        assert opt.pixel_height_logits is tensor
+        bp = opt.best_params
+        eff_best = opt._apply_height_offset(bp["pixel_height_logits"], bp["height_offsets"])
+        assert torch.allclose(opt._apply_height_offset().detach(), eff_best, atol=1e-5)
+
+    opt.intermediate_search = spy
+    for i in range(40):
+        opt.step(record_best=i % 5 == 0)
+    assert len(calls) == 1  # step 20; none on the last step
+    before, after = calls[0]
+    assert after <= before + 1e-6
+    dg, _ = opt.get_discretized_solution(best=True)
+    assert feasible(dg, opt.limit_colors, opt.limit_swaps, opt.base_code)

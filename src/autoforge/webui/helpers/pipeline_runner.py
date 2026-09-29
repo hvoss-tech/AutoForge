@@ -67,6 +67,13 @@ _DEFAULTS = {
     "json_file": "",
     "output_folder": "output",
     "iterations": 6000,
+    # Stack search + pixel height refine during training (see
+    # FilamentOptimizer.intermediate_search): from step 2000, every 1000.
+    "intermediate_search_interval": 1000,
+    "intermediate_search_start": 2000,
+    "intermediate_search_rounds": 15,
+    "intermediate_search_patience": 5,
+    "intermediate_search_pin": 0.0,
     "warmup_fraction": 1.0,
     "learning_rate_warmup_fraction": 0.01,
     "init_tau": 1.0,

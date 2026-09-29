@@ -448,6 +448,39 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--intermediate_search_interval",
+        type=int,
+        default=1000,
+        help="Every N training steps run a short layer-stack search (within the colour/swap limits) and a per-pixel "
+        "height refine on the best solution, and continue training from the result (0 = off)",
+    )
+    parser.add_argument(
+        "--intermediate_search_start",
+        type=int,
+        default=2000,
+        help="--intermediate_search_interval: first step of the searches (the early steps explore; 0 = first at the interval)",
+    )
+    parser.add_argument(
+        "--intermediate_search_rounds",
+        type=int,
+        default=15,
+        help="--intermediate_search_interval: maximum perturb-and-descend rounds of each stack search",
+    )
+    parser.add_argument(
+        "--intermediate_search_patience",
+        type=int,
+        default=5,
+        help="--intermediate_search_interval: stop each stack search after this many rounds without improvement",
+    )
+    parser.add_argument(
+        "--intermediate_search_pin",
+        type=float,
+        default=0.0,
+        help="--intermediate_search_interval: logit margin (+-value) the found stack is written back into training "
+        "with; 0 leaves the stack logits to training and hands back only the heights",
+    )
+
+    parser.add_argument(
         "--prune_sweep",
         type=str,
         default="",

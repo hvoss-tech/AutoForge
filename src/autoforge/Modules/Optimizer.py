@@ -618,6 +618,110 @@ class FilamentOptimizer:
 
     @composite_graph_scope()
     @torch.no_grad()
+    @torch.no_grad()
+    def intermediate_search(self) -> None:
+        """A short stack search and per-pixel height refine on the best
+        solution in the middle of training (--intermediate_search_interval),
+        written back into the training parameters so training continues from
+        it. The same steps pruning finishes with (search_stack, apply_stack,
+        refine_pixel_heights), at the solver resolution and within the
+        colour/swap limits the run holds."""
+        from autoforge.Helper.ConstraintHelper import feasible
+        from autoforge.Helper.PixelHeightRefine import apply_stack, refine_pixel_heights, search_stack
+        from autoforge.Helper.PruningHelper import disc_to_logits
+
+        if self.best_params is None:
+            return
+        args = self.args
+        max_colors = self.limit_colors if self.limit_colors is not None else 10**9
+        max_swaps = self.limit_swaps if self.limit_swaps is not None else 10**9
+        sweeps = int(getattr(args, "pixel_height_refine_sweeps", 2))
+        radius = int(getattr(args, "pixel_height_refine_radius", 3))
+        # The refine and apply_stack replace self.pixel_height_logits (and a
+        # reverted one restores an older tensor); the captured training graph
+        # reads the training tensor, so it is kept and written into below.
+        live = self.pixel_height_logits
+        self._refine_anchor_z = None
+        try:
+            dg, _ = self.get_discretized_solution(best=True)
+            # Two starting points: the best stack so far, and the stack
+            # training currently holds (its logits projected onto the
+            # limits). The search is local and the landscape rugged; from the
+            # best stack alone it settles in one basin and stays there.
+            starts = [dg]
+            logp = torch.log_softmax(self.params["global_logits"].detach().float(), dim=1)
+            train_dg = self.project_feasible(logp) if self.constrained else logp.argmax(dim=1)
+            if not bool((train_dg == dg).all()):
+                starts.append(train_dg)
+            kept = False
+            for k, start in enumerate(starts):
+                new = search_stack(
+                    self, max_colors, max_swaps,
+                    rounds=int(getattr(args, "intermediate_search_rounds", 15)),
+                    patience=int(getattr(args, "intermediate_search_patience", 5)),
+                    seed=self.num_steps_done + k, init_dg=start, verbose=False,
+                )
+                cur, _ = self.get_discretized_solution(best=True)
+                if not bool((new == cur).all()) and feasible(new, self.limit_colors, self.limit_swaps, self.base_code):
+                    kept = apply_stack(self, new, sweeps, radius) or kept
+            if not kept:
+                refine_pixel_heights(self, sweeps=sweeps, radius=radius)
+        finally:
+            self.pixel_height_logits = live
+            self._refine_anchor_z = None
+
+        # Continue training from the best solution: its stack pinned in the
+        # logits, its heights as the effective heights (offsets as stored,
+        # the frozen base absorbing the rest, the smooth field kept).
+        bp = self.best_params
+        dg, _ = self.get_discretized_solution(best=True)
+        pin = float(getattr(args, "intermediate_search_pin", 0.0))
+        if pin > 0:
+            self.params["global_logits"].copy_(disc_to_logits(dg, self.material_colors.shape[0], big_pos=pin))
+        self.height_offsets.copy_(bp["height_offsets"])
+        base = bp["pixel_height_logits"]
+        if self.pixel_delta is not None:
+            base = base - self._delta_up(base.shape)
+        self.pixel_height_logits.copy_(base)
+        if self.bg_logits is not None and "background_index" in bp:
+            self.bg_logits.fill_(-20.0)
+            self.bg_logits[int(bp["background_index"])] = 20.0
+        if self.constrained and pin > 0:
+            self._proj_target.zero_()
+            self._proj_target.scatter_(1, dg.view(-1, 1), 1.0)
+        # The running average would pull the snapshots back toward the old
+        # parameters; restart it here.
+        self._ema = None
+        # Snapshots are judged against best_discrete_loss: re-measure the
+        # best by the snapshot's own measure so a later, worse snapshot
+        # cannot replace it.
+        self.best_discrete_loss = self._snapshot_loss(dg)
+        # The search is progress: training continues from here rather than
+        # early-stopping on the snapshots that cannot beat it right away.
+        self.best_step = self.num_steps_done
+
+    def _snapshot_loss(self, dg: torch.Tensor) -> float:
+        """The best solution's loss by the measure _constrained_update_best
+        scores snapshots with."""
+        from autoforge.Helper import FusedComposite as fc
+        from autoforge.Helper.PruningHelper import _candidate_loss, _scoring_handle, disc_to_logits, material_select_from_logits
+
+        bp = self.best_params
+        eff_logits = self._apply_height_offset(bp["pixel_height_logits"], bp["height_offsets"])
+        eff = _scoring_handle(eff_logits, self.max_layers, self.h, self.vis_tau)
+        cands = dg.view(1, -1).to(torch.long)
+        if fc.fused_available(eff):
+            loss = fc.batched_heights_loss(
+                self, eff._af_z, self.material_colors[cands], self.material_TDs[cands].clamp(1e-8, 1e8)
+            )[0]
+        else:
+            cols, tds = material_select_from_logits(
+                disc_to_logits(dg, self.material_colors.shape[0], big_pos=1e5), self.material_colors,
+                self.material_TDs, rng_seed=self.best_seed, tau=self.vis_tau,
+            )
+            loss = _candidate_loss(self, eff, cols, tds)
+        return float(loss)
+
     def constrained_local_search(
         self,
         max_rounds: int = 1000,
@@ -1471,6 +1575,15 @@ class FilamentOptimizer:
                 )
                 if getattr(self.args, "constraint_pin", True):
                     self._pin_to_best()
+        interval = int(getattr(self.args, "intermediate_search_interval", 1000))
+        start = max(int(getattr(self.args, "intermediate_search_start", 2000)), interval)
+        if (
+            interval > 0
+            and self.num_steps_done >= start
+            and (self.num_steps_done - start) % interval == 0
+            and self.num_steps_done < self.args.iterations
+        ):
+            self.intermediate_search()
         # torch.cuda.empty_cache()
 
         # `.item()` forces a CUDA sync, blocking the CPU until every kernel
