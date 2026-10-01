@@ -1423,7 +1423,7 @@ class FilamentOptimizer:
             lr = (n / warmup) * self.learning_rate if (n < warmup and warmup > 0) else self.learning_rate
             table.append(-(lr * math.sqrt(1.0 - beta2 ** k) / (1.0 - beta1 ** k)))
         try:
-            self._upd_table = torch.tensor(table, dtype=torch.float64, device=self.device).to(torch.float32)
+            self._upd_table = torch.tensor(table, dtype=torch.float64).to(torch.float32).to(self.device)
             self._upd_j = torch.zeros((), dtype=torch.long, device=self.device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):

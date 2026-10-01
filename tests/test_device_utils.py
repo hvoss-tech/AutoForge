@@ -7,6 +7,7 @@ no-ops) rather than on which backend happens to be present.
 
 import argparse
 
+import numpy as np
 import pytest
 import torch
 
@@ -289,6 +290,27 @@ class TestNonCudaRunNeverTouchesCuda:
         assert torch.isfinite(opt.loss).all()
 
 
+def _emulate_mps_on_cuda(monkeypatch):
+    """Select the no-float64 (MPS) code paths on a CUDA device."""
+    monkeypatch.setattr(DU, "has_float64", lambda device: device.type == "cpu")
+
+
+def _no_float64_on_gpu():
+    """Dispatch mode that fails on any float64 CUDA tensor, as MPS would."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+
+    class NoFloat64OnGpu(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            for t in tree_flatten(out)[0]:
+                if isinstance(t, torch.Tensor) and t.is_cuda and t.dtype == torch.float64:
+                    raise AssertionError(f"float64 tensor on the GPU from {func}")
+            return out
+
+    return NoFloat64OnGpu()
+
+
 class TestStackSearchWithoutFloat64:
     """MPS has no float64 at all: any float64 tensor on the device raises
     there. The stack searches used to keep their bookkeeping in float64 on the
@@ -318,29 +340,17 @@ class TestStackSearchWithoutFloat64:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA-family GPU")
     def test_no_float64_on_device_with_mps_paths(self, monkeypatch):
-        from torch.utils._python_dispatch import TorchDispatchMode
-        from torch.utils._pytree import tree_flatten
-
         from autoforge.Helper import FusedComposite as fc
-        from autoforge.Helper import PixelHeightRefine as phr
 
         monkeypatch.setattr(fc, "_HAS_TRITON", False)
-        monkeypatch.setattr(phr, "_decision_dtype", lambda device: torch.float32)
         monkeypatch.setenv("AUTOFORGE_GRAPH", "off")
-
-        class NoFloat64OnGpu(TorchDispatchMode):
-            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-                out = func(*args, **(kwargs or {}))
-                for t in tree_flatten(out)[0]:
-                    if isinstance(t, torch.Tensor) and t.is_cuda and t.dtype == torch.float64:
-                        raise AssertionError(f"float64 tensor on the GPU from {func}")
-                return out
+        _emulate_mps_on_cuda(monkeypatch)
 
         device = torch.device("cuda")
         opt = self._trained_optimizer(device)
         # Only the searches run under the hook: the TorchScript training step
         # doesn't run under a dispatch mode.
-        with NoFloat64OnGpu():
+        with _no_float64_on_gpu():
             self._run_searches(opt, device)
 
     @pytest.mark.skipif(not DU.mps_is_available(), reason="Requires Apple Metal")
@@ -354,3 +364,54 @@ class TestStackSearchWithoutFloat64:
         assert _decision_dtype(torch.device("mps")) == torch.float32
         assert _decision_dtype(torch.device("cuda")) == torch.float64
         assert _decision_dtype(torch.device("cpu")) == torch.float64
+
+
+class TestInitWithoutFloat64:
+    """The heightmap init's k-means put the float64 pixels on the device
+    (``torch.as_tensor(..., device=mps)``) and summed clusters in float64
+    there, so every run on Apple Silicon crashed at "Computing
+    over-clustering"; the deterministic gather's backward did the same."""
+
+    @staticmethod
+    def _kmeans(device):
+        from autoforge.Helper.Heightmaps._cluster import kmeans
+
+        rng = np.random.default_rng(0)
+        pixels = rng.random((5000, 3)) * 100.0  # float64, like the Lab pixels
+        return kmeans(pixels, 20, seed=1, device=device)
+
+    @staticmethod
+    def _gather_backward(device):
+        from autoforge.Helper.DeterministicOps import gather_plan, segment_gather
+
+        gen = torch.Generator().manual_seed(0)
+        labels = torch.randint(0, 7, (64, 64), generator=gen).to(device)
+        values = torch.randn(7, generator=gen).to(device).requires_grad_()
+        segment_gather(values, labels, gather_plan(labels, 7)).square().sum().backward()
+        return values.grad
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA-family GPU")
+    def test_no_float64_on_device_with_mps_paths(self, monkeypatch):
+        device = torch.device("cuda")
+        ref_c, ref_l = self._kmeans(device)
+        ref_g = self._gather_backward(device)
+        _emulate_mps_on_cuda(monkeypatch)
+        with _no_float64_on_gpu():
+            c, l = self._kmeans(device)
+            g = self._gather_backward(device)
+        assert c.dtype == np.float64 and c.shape == (20, 3)
+        assert (l == ref_l).mean() > 0.99
+        np.testing.assert_allclose(c, ref_c, atol=1e-3)
+        torch.testing.assert_close(g, ref_g)
+
+    @pytest.mark.skipif(not DU.mps_is_available(), reason="Requires Apple Metal")
+    def test_runs_on_mps(self):
+        device = torch.device("mps")
+        c, _ = self._kmeans(device)
+        assert np.isfinite(c).all()
+        assert torch.isfinite(self._gather_backward(device)).all()
+
+    def test_has_float64(self):
+        assert not DU.has_float64(torch.device("mps"))
+        assert DU.has_float64(torch.device("cuda"))
+        assert DU.has_float64(torch.device("cpu"))

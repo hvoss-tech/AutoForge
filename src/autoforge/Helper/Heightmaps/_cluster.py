@@ -82,6 +82,14 @@ def _kmeanspp(x: torch.Tensor, k: int, gen: torch.Generator, weights: Optional[t
 
 def _segment_sums(x: torch.Tensor, labels: torch.Tensor, k: int, weights: Optional[torch.Tensor] = None):
     """(per-label sums of x [k, D], per-label weight [k]) in a fixed order."""
+    from autoforge.Helper import DeviceUtils
+
+    dev = x.device
+    host = not DeviceUtils.has_float64(dev)
+    if host:
+        # MPS has no float64: take the sums on the host, return float32.
+        x, labels = x.cpu(), labels.cpu()
+        weights = weights.cpu() if weights is not None else None
     order = torch.argsort(labels, stable=True)
     xs = x[order].double()
     ws = (weights[order].double() if weights is not None else torch.ones(x.shape[0], dtype=torch.float64, device=x.device))
@@ -91,6 +99,8 @@ def _segment_sums(x: torch.Tensor, labels: torch.Tensor, k: int, weights: Option
     v = torch.cat([(xs * ws.view(-1, 1)).t(), ws.view(1, -1)], 0).contiguous()  # [D+1, N]
     cs = torch.cat([v.new_zeros(v.shape[0], 1), torch.cumsum(v, 1)], 1)[:, ends]  # [D+1, k]
     seg = torch.diff(cs, dim=1, prepend=cs.new_zeros(cs.shape[0], 1))
+    if host:
+        return seg[:-1].t().float().to(dev), seg[-1].float().to(dev)
     return seg[:-1].t(), seg[-1]
 
 
@@ -118,7 +128,8 @@ def kmeans(
     prec = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("highest")  # exact distances, no TF32
     try:
-        x = torch.as_tensor(np.ascontiguousarray(pixels), device=device).to(dt)
+        # Cast on the host: MPS can't hold the float64 input even briefly.
+        x = torch.from_numpy(np.ascontiguousarray(pixels, dtype=np.float64 if dt == torch.float64 else np.float32)).to(device)
         n = x.shape[0]
         k = min(k, n)
         gen = torch.Generator(device=device).manual_seed(int(seed) % (2**63))
@@ -128,13 +139,13 @@ def kmeans(
         for _ in range(max_iter):
             labels = _assign(x, c, chunk)
             sums, cnt = _segment_sums(x, labels, k)
-            new = torch.where(cnt.view(-1, 1) > 0, sums / cnt.clamp(min=1).view(-1, 1), c.double()).to(dt)
+            new = torch.where(cnt.view(-1, 1) > 0, sums / cnt.clamp(min=1).view(-1, 1), c.to(sums.dtype)).to(dt)
             shift = float((new - c).pow(2).sum())
             c = new
             if shift <= thr:
                 break
         labels = _assign(x, c, chunk)
-        return c.double().cpu().numpy(), labels.cpu().numpy()
+        return c.cpu().double().numpy(), labels.cpu().numpy()
     finally:
         torch.set_float32_matmul_precision(prec)
 

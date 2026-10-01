@@ -594,7 +594,9 @@ def _decision_dtype(device: torch.device) -> torch.dtype:
     """dtype of the on-device accept/reject bookkeeping in the stack searches:
     float64 (as the Python-float comparison it replaced), except on MPS, which
     has no float64 - there fp32, exact for the fp32 losses it compares."""
-    return torch.float32 if device.type == "mps" else torch.float64
+    from autoforge.Helper import DeviceUtils
+
+    return torch.float64 if DeviceUtils.has_float64(device) else torch.float32
 
 
 class PaletteProxy:

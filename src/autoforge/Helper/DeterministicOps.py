@@ -40,6 +40,11 @@ def gather_plan(labels: torch.Tensor, n: int):
 
 def segment_gather(values: torch.Tensor, labels: torch.Tensor, plan) -> torch.Tensor:
     """``values[labels]`` with a deterministic backward (see gather_plan)."""
+    from autoforge.Helper import DeviceUtils
+
+    if not DeviceUtils.has_float64(values.device):
+        # Its backward sums in float64, which MPS doesn't have.
+        return values[labels]
     return _SegmentGather.apply(values, labels, *plan)
 
 

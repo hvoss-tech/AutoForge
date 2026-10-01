@@ -74,6 +74,12 @@ def backend_of(device: torch.device) -> str:
     return device.type
 
 
+def has_float64(device: torch.device) -> bool:
+    """False on MPS, which has no float64: creating or casting to a float64
+    tensor there raises, so float64 work has to stay on the host."""
+    return device.type != "mps"
+
+
 def is_accelerator(device: torch.device) -> bool:
     return device.type in ("cuda", "mps")
 
