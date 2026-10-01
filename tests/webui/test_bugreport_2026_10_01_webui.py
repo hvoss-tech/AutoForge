@@ -284,3 +284,73 @@ def test_w15_update_check_versions_and_error_cache(monkeypatch):
     clock[0] += system._UPDATE_ERROR_TTL
     asyncio.run(system.check_for_update())
     assert len(calls) == 2  # retried well before the hour
+
+
+# --- Bugs from the agent worktrees (2026-10-01 review, numbered as there) ---
+
+
+def test_wt15_new_job_waits_for_a_stopping_thread(client, monkeypatch):
+    """#15: a cancelled job's thread still running blocks the next start
+    (two jobs on the GPU), and one that ends in time doesn't."""
+    import threading
+
+    import autoforge.webui.api.workers as workers
+
+    release = threading.Event()
+    workers.start_worker("old-job", lambda: release.wait(10))
+    import autoforge.webui.api.optimization as opt_api
+    import autoforge.webui.api.pruning as prune_api
+
+    # Don't make the test wait out the real grace period.
+    monkeypatch.setattr(opt_api, "wait_until_idle", lambda timeout: workers.running_worker())
+    monkeypatch.setattr(prune_api, "wait_until_idle", lambda timeout: workers.running_worker())
+    _active_filament(client)
+    image = _upload_png(client)
+    r = client.post("/api/optimize/start", json={"input_image": image, "iterations": 10})
+    assert r.status_code == 409 and "still stopping" in r.json()["detail"]
+    r = client.post("/api/pruning/start", json={"job_id": "x"})
+    assert r.status_code == 409 and "still stopping" in r.json()["detail"]
+    release.set()
+    assert workers.wait_until_idle(5.0) is None
+
+
+def test_wt16_render_rejects_malformed_input_with_400(client):
+    """#16: bad sliders / background colour are a 400, not a 500."""
+    for body in (
+        {"job_id": "__init__", "sliders": "nope"},
+        {"job_id": "__init__", "sliders": [1, 2]},
+        {"job_id": "__init__", "sliders": [{"layer": "abc"}]},
+        {"job_id": "__init__", "sliders": [], "background_color": "red"},
+        {"job_id": "__init__", "sliders": [], "background_color": 12},
+    ):
+        r = client.post("/api/preview/render-with-sliders", json=body)
+        assert r.status_code == 400, (body, r.status_code, r.text)
+
+
+def test_wt17_preview_images_clamp_instead_of_wrapping():
+    """#17: a composite value of 256 (bf16 rounding near white) becomes 255,
+    not 0, in the preview PNG and every exported image."""
+    import base64
+
+    import cv2
+    import numpy as np
+
+    from autoforge.Helper.ImageHelper import image_to_uint8
+    from autoforge.webui.api.ws import encode_png_b64
+
+    img = torch.tensor([[[256.0, -1.0, 254.7]]])
+    assert image_to_uint8(img).tolist() == [[[255, 0, 254]]]
+    png = base64.b64decode(encode_png_b64(img))
+    decoded = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+    assert decoded[0, 0].tolist() == [254, 0, 255]  # BGR
+
+
+def test_wt15_a_thread_finishing_within_the_grace_period_is_waited_for():
+    """#15: a just-finished job's thread (still freeing memory) doesn't
+    turn the next start into a 409."""
+    import time
+
+    import autoforge.webui.api.workers as workers
+
+    workers.start_worker("finishing", lambda: time.sleep(0.2))
+    assert workers.wait_until_idle(2.0) is None

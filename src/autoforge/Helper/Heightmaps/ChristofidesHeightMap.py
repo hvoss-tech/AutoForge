@@ -10,10 +10,13 @@ from autoforge.Helper.Heightmaps._cluster import cdist, rgb2lab, silhouette as _
 
 
 def _compute_distinctiveness(centroids: np.ndarray) -> np.ndarray:
-    """Return the minimum inter‑centroid distance for every centroid."""
+    """Return the minimum inter‑centroid distance for every centroid (0 for a
+    lone centroid: with no other one the minimum is inf, and the callers'
+    normalisation inf / inf made every weight NaN)."""
     dmat = cdist(centroids, centroids, metric="euclidean")
     np.fill_diagonal(dmat, np.inf)
-    return dmat.min(axis=1)
+    d = dmat.min(axis=1)
+    return np.where(np.isfinite(d), d, 0.0)
 
 
 def two_stage_weighted_kmeans(

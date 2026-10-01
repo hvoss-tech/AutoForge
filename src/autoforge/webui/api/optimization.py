@@ -1,3 +1,4 @@
+import asyncio
 import os
 import logging
 import numpy as np
@@ -13,7 +14,8 @@ from ..helpers.gpu_memory import empty_device_cache, release_pipeline_result
 from ..helpers.telemetry import capture_exception
 from ..services.image_service import get_image_service
 from ..config import config
-from .ws import broadcast_preview
+from .workers import STILL_STOPPING, running_worker, start_worker, wait_until_idle
+from .ws import broadcast_preview, encode_png_b64
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -102,6 +104,11 @@ async def start_optimization(settings: OptimizationSettings):
     # Settings dialog while the first was paused) competed for the same GPU
     # memory and left two jobs broadcasting into the same preview. Pruning
     # counts too — it runs the same optimizer the new run would clear out.
+    # A cancelled job is "cancelled" at once, but its thread only stops at its
+    # next check; starting now would put two jobs on the GPU (see workers).
+    if running_worker() is not None and await asyncio.to_thread(wait_until_idle, 2.0) is not None:
+        raise HTTPException(409, STILL_STOPPING)
+
     busy = svc.get_any_active_job()
     if busy is not None:
         if busy.job_id.startswith("prune-"):
@@ -235,16 +242,12 @@ async def start_optimization(settings: OptimizationSettings):
                 try:
                     img = opt.get_best_discretized_image()
                     if img is not None:
-                        import cv2, numpy as np
                         loss_val = (
                             opt.best_discrete_loss.item()
                             if hasattr(opt.best_discrete_loss, 'item')
                             else opt.best_discrete_loss
                         ) if opt.best_discrete_loss is not None else None
-                        img_np = img.cpu().numpy().astype(np.uint8)
-                        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                        success, buf = cv2.imencode('.png', img_bgr)
-                        b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+                        b64 = encode_png_b64(img)
                         svc.update_status(
                             job.job_id, "running",
                             progress=_overall("Optimizing", step / max(settings.iterations, 1)),
@@ -347,8 +350,7 @@ async def start_optimization(settings: OptimizationSettings):
             # more importantly, leaves room for the next image's init.
             empty_device_cache(run_device)
 
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
+    start_worker(job.job_id, _run)
 
     return {
         "job_id": job.job_id,

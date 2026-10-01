@@ -20,7 +20,7 @@ import torch
 from autoforge.Helper.AmpUtils import safe_autocast
 from autoforge.Helper.DeviceUtils import activate_device
 from autoforge.Helper.FilamentHelper import hex_to_rgb
-from autoforge.Helper.ImageHelper import imread, resize_image, to_bgr_or_bgra_uint8
+from autoforge.Helper.ImageHelper import image_to_uint8, imread, imwrite, resize_image, to_bgr_or_bgra_uint8
 from autoforge.Helper.OtherHelper import get_device, set_seed
 from autoforge.Helper.OutputHelper import generate_stl
 from autoforge.Modules.Optimizer import FilamentOptimizer
@@ -747,10 +747,10 @@ def export_results(
             comp_disc = optimizer.get_best_discretized_image()
             args.max_layers = optimizer.max_layers
 
-            comp_disc_np = comp_disc.cpu().numpy().astype(np.uint8)
+            comp_disc_np = image_to_uint8(comp_disc)
             comp_disc_np = cv2.cvtColor(comp_disc_np, cv2.COLOR_RGB2BGR)
             preview_path = os.path.join(args.output_folder, "final_model.png")
-            cv2.imwrite(preview_path, comp_disc_np)
+            imwrite(preview_path, comp_disc_np)
 
             # ---- STL ----
             if export_progress is not None:

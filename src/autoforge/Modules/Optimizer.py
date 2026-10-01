@@ -1999,6 +1999,10 @@ class FilamentOptimizer:
         custom_height_logits: torch.Tensor = None,
         custom_global_logits: torch.Tensor = None,
     ):
+        # No solution yet (before the first discrete check): the callers -
+        # the webui's previews and live meshes - check for None; this raised.
+        if self.best_params is None:
+            return None
         with torch.no_grad():
             if custom_height_logits is not None:
                 effective_logits = self._apply_height_offset(
@@ -3228,5 +3232,8 @@ class FilamentOptimizer:
         """
         Clean up resources when the optimizer is destroyed.
         """
-        if self.writer is not None:
-            self.writer.close()
+        # getattr: an __init__ that failed before setting it made this raise
+        # "no attribute 'writer'" on top of the real error.
+        writer = getattr(self, "writer", None)
+        if writer is not None:
+            writer.close()

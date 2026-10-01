@@ -81,6 +81,15 @@ class OptimizationSettings(CamelCaseModel):
     background_height: float = Field(0.24, ge=0)
     background_color: str = "#000000"
     auto_background_color: bool = True
+
+    @field_validator("background_color", mode="before")
+    @classmethod
+    def _normalize_background_color(cls, value: Any) -> str:
+        # Unchecked, a value like "red" was accepted and only failed once a
+        # run had started (hex_to_rgb). Empty means the default.
+        if value is None or str(value).strip() == "":
+            return "#000000"
+        return normalize_hex_color(value)
     stl_output_size: int = Field(150, gt=0)
     processing_reduction_factor: int = Field(2, ge=1)
     nozzle_diameter: float = Field(0.4, gt=0)

@@ -42,6 +42,21 @@ def _drop_on_failure(future: "asyncio.Future", ws: WebSocket) -> None:
         _preview_connections.discard(ws)
 
 
+def encode_png_b64(img) -> str:
+    """An RGB 0-255 float image (tensor or array) as the base64 PNG the
+    previews carry, clamped to 0-255 (see image_to_uint8)."""
+    import base64
+
+    import cv2
+
+    from autoforge.Helper.ImageHelper import image_to_uint8
+
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(image_to_uint8(img), cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise ValueError("PNG encoding failed")
+    return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+
 def broadcast_preview(
     image_data: str,
     job_id: str,

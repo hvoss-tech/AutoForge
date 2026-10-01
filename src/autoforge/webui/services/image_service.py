@@ -30,9 +30,11 @@ class ImageService:
     def get_path(self, image_id: str) -> str | None:
         resolved = os.path.realpath(os.path.join(config.uploads_path, image_id))
         uploads = os.path.realpath(config.uploads_path)
-        if not resolved.startswith(uploads + os.sep) and resolved != uploads:
+        # A file inside uploads/ only: "" or "." resolved to the uploads
+        # folder itself, which was returned as if it were an image.
+        if not resolved.startswith(uploads + os.sep):
             return None
-        return resolved if os.path.exists(resolved) else None
+        return resolved if os.path.isfile(resolved) else None
 
     def get_url(self, image_id: str) -> str | None:
         path = self.get_path(image_id)

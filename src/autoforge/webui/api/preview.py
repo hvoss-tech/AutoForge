@@ -43,7 +43,21 @@ async def render_preview(data: dict):
     layer→material assignment (and therefore the compositing) is redone,
     so this is cheap enough to run on every slider drag/edit.
     """
-    sliders = data.get("sliders", [])
+    # Malformed input is a 400, not a 500 from deep inside the render.
+    sliders = data.get("sliders") or []
+    if not isinstance(sliders, list) or not all(isinstance(s, dict) for s in sliders):
+        raise HTTPException(400, "sliders must be a list of slider objects")
+    for s in sliders:
+        try:
+            int(s.get("layer", 0))
+            float(s.get("td") or 0.0)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"Invalid slider: {s!r} (layer must be a whole number, td a number)")
+    background_color = data.get("background_color")
+    try:
+        background_rgb = tuple(hex_to_rgb(background_color)) if background_color else None
+    except (AttributeError, TypeError, ValueError):
+        raise HTTPException(400, f"Invalid background_color: {background_color!r} (expected #RRGGBB)")
     svc = get_optimization_service()
     filament_svc = get_filament_service()
 
@@ -109,8 +123,6 @@ async def render_preview(data: dict):
         render_lock = _render_locks[effective_job_id]
 
     want_vertex_colors = bool(data.get("vertex_colors"))
-    background_color = data.get("background_color")
-    background_rgb = tuple(hex_to_rgb(background_color)) if background_color else None
 
     def _render():
         # One render per target at a time (they write the same files), and a

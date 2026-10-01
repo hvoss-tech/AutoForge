@@ -20,7 +20,7 @@ Output:
     A 8-bit grayscale PNG (0..255). During optimization this will be normalized to 0..1.
     White (255) -> full priority, Black (0) -> low priority.
 
-If --output is omitted, the mask will be saved next to the input as <input>_mask.<ext>.
+If --output is omitted, the mask will be saved next to the input as <input>_mask.png.
 
 You can create soft gradients by enabling gradient mode (g), which applies a
 cosine falloff from the center of the brush.
@@ -42,7 +42,7 @@ def parse_args():
     p.add_argument(
         "--output",
         default="",
-        help="Path to save the priority mask (optional). If omitted, saves as <input>_mask.<ext>",
+        help="Path to save the priority mask (optional). If omitted, saves as <input>_mask.png",
     )
     p.add_argument(
         "--initial", default="", help="Optional existing mask to load and edit"
@@ -75,10 +75,15 @@ class PriorityMaskEditor:
 
     def _apply_brush(self, x, y, erase=False):
         rr = self.brush_radius
-        x0 = max(0, x - rr)
-        x1 = min(self.w, x + rr + 1)
-        y0 = max(0, y - rr)
-        y1 = min(self.h, y + rr + 1)
+        # A drag leaving the window reports coordinates outside the image:
+        # keep the window valid (x1 >= x0), or a negative end index sliced a
+        # different region than the brush grid and the callback raised.
+        x0 = min(max(0, x - rr), self.w)
+        x1 = max(x0, min(self.w, x + rr + 1))
+        y0 = min(max(0, y - rr), self.h)
+        y1 = max(y0, min(self.h, y + rr + 1))
+        if x1 == x0 or y1 == y0:
+            return
         patch = self.mask[y0:y1, x0:x1]
         yy, xx = np.ogrid[y0:y1, x0:x1]
         dist = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
@@ -142,11 +147,10 @@ class PriorityMaskEditor:
 
 
 def _default_output_path(input_path: str) -> str:
-    root, ext = os.path.splitext(input_path)
-    # Fallback to .png if no extension
-    if ext == "":
-        ext = ".png"
-    return f"{root}_mask{ext}"
+    # Always PNG: a mask next to a .jpg input was saved as a lossy JPEG,
+    # whose compression noise then weighted the loss.
+    root, _ext = os.path.splitext(input_path)
+    return f"{root}_mask.png"
 
 
 def main():

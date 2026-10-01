@@ -8,7 +8,47 @@ import numpy as np
 
 
 def imread(filename: str, flags: int = cv2.IMREAD_COLOR) -> MatLike:
-    return cv2.imdecode(np.fromfile(filename, dtype=np.uint8), flags)
+    data = np.fromfile(filename, dtype=np.uint8)
+    img = cv2.imdecode(data, flags)
+    if img is not None and flags == cv2.IMREAD_UNCHANGED:
+        # IMREAD_UNCHANGED (needed for alpha / 16 bit) makes OpenCV ignore the
+        # EXIF orientation, unlike IMREAD_COLOR and every image viewer: a
+        # phone photo taken upright was processed lying on its side.
+        img = apply_exif_orientation(img, exif_orientation(data.tobytes()))
+    return img
+
+
+def exif_orientation(data: bytes) -> int:
+    """The EXIF orientation tag (1-8) of an encoded image, 1 if absent."""
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as im:
+            value = int(im.getexif().get(0x0112, 1))
+    except Exception:
+        return 1
+    return value if 1 <= value <= 8 else 1
+
+
+def apply_exif_orientation(img: np.ndarray, orientation: int) -> np.ndarray:
+    """``img`` [H,W(,C)] as it is displayed for EXIF ``orientation`` (1-8)."""
+    if orientation == 2:
+        img = img[:, ::-1]
+    elif orientation == 3:
+        img = img[::-1, ::-1]
+    elif orientation == 4:
+        img = img[::-1]
+    elif orientation == 5:
+        img = np.swapaxes(img, 0, 1)
+    elif orientation == 6:
+        img = np.rot90(img, k=-1)
+    elif orientation == 7:
+        img = np.rot90(np.swapaxes(img, 0, 1), k=2)
+    elif orientation == 8:
+        img = np.rot90(img, k=1)
+    return np.ascontiguousarray(img)
 
 
 def imwrite(filename: str, img: MatLike, params: Sequence[int] = ()) -> None:
@@ -47,6 +87,16 @@ def to_bgr_or_bgra_uint8(img) -> np.ndarray:
     return img
 
 
+def image_to_uint8(img) -> np.ndarray:
+    """A 0-255 float image (tensor or array) as uint8, clipped first: a plain
+    cast wraps around, so a composite value of 256 (bf16 steps by 1 near
+    white) became 0 - a black pixel - and a slightly negative one ~255.
+    Values are truncated as before, only clamped into range."""
+    if isinstance(img, torch.Tensor):
+        img = img.detach().float().cpu().numpy()
+    return np.clip(np.asarray(img, dtype=np.float32), 0, 255).astype(np.uint8)
+
+
 def resize_image(img, max_size):
     h_img, w_img, _ = img.shape
 
@@ -57,8 +107,10 @@ def resize_image(img, max_size):
         scale = max_size / h_img
 
     # Compute new dimensions and round them
-    new_w = int(round(w_img * scale))
-    new_h = int(round(h_img * scale))
+    # At least 1 px: a very long, thin image rounded its short side to 0
+    # and cv2.resize failed.
+    new_w = max(1, int(round(w_img * scale)))
+    new_h = max(1, int(round(h_img * scale)))
 
     # Resize the image with an appropriate interpolation method
     img_out = cv2.resize(img, dsize=(new_w, new_h), interpolation=cv2.INTER_AREA)

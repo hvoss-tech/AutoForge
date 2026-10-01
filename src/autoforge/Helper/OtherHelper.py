@@ -1,4 +1,5 @@
 import os
+import random
 import sys
 import time
 from typing import Any
@@ -18,6 +19,9 @@ def set_seed(args) -> Any:
     random_seed = args.random_seed
     if random_seed == 0:
         random_seed = int(time.time() * 1000) % 1000000
+    # Python's own RNG too: the depth initializer's ordering search draws
+    # from it, so --random_seed did not make that run reproducible.
+    random.seed(random_seed)
     np.random.seed(random_seed)
     torch.manual_seed(random_seed)
     return random_seed

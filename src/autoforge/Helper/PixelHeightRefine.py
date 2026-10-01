@@ -100,6 +100,21 @@ def _pixel_weights(optimizer, shape):
     return w
 
 
+def _movable(optimizer, shape) -> torch.Tensor:
+    """[H,W] bool: pixels a refine may move. Transparent pixels (alpha <
+    128) stay unprinted, as in the optimizer's own height assignment: their
+    colour error weighs nothing, but the height-jump cost and the edge bleed
+    into their valid neighbours would otherwise raise them."""
+    if optimizer.alpha is None:
+        return torch.ones(shape, dtype=torch.bool, device=optimizer.device)
+    a = optimizer.alpha
+    if a.dim() == 3:
+        a = a.squeeze(-1)
+    if tuple(a.shape) != tuple(shape):
+        a = F.interpolate(a[None, None].float(), size=shape, mode="nearest")[0, 0]
+    return (a >= 128).to(optimizer.device)
+
+
 def _height_variation(z: torch.Tensor) -> torch.Tensor:
     """[H,W] summed |height difference| (layers) to the 8 neighbours,
     diagonals weighted 1/sqrt(2); image borders count as equal height.
@@ -161,6 +176,28 @@ def _drop_new_spikes(z_old, z_new, threshold, max_rounds: int = 8):
         near = F.max_pool2d(new.float()[None, None], 3, stride=1, padding=1)[0, 0] > 0
         z_new = torch.where(near & (z_new != z_old), z_old, z_new)
     return z_old
+
+
+def _keep_heights_if_better(optimizer, new_logits, dg, pre_loss):
+    """Install ``new_logits`` as the solution's height logits and keep them
+    only if the real discrete loss beats ``pre_loss``; otherwise (or on an
+    error while measuring) the previous logits are restored.
+    Returns (kept, post_loss)."""
+    from autoforge.Helper.PruningHelper import _compute_loss_for_heightmap
+
+    old_best = optimizer.best_params["pixel_height_logits"]
+    old_live = optimizer.pixel_height_logits
+    optimizer.best_params["pixel_height_logits"] = new_logits
+    optimizer.pixel_height_logits = new_logits
+    kept = False
+    try:
+        post_loss = _compute_loss_for_heightmap(optimizer, dg)
+        kept = post_loss < pre_loss
+    finally:
+        if not kept:
+            optimizer.best_params["pixel_height_logits"] = old_best
+            optimizer.pixel_height_logits = old_live
+    return kept, post_loss
 
 
 @composite_graph_scope()
@@ -232,13 +269,14 @@ def refine_pixel_heights(
 
     yy = torch.arange(H, device=z.device).view(-1, 1)
     xx = torch.arange(W, device=z.device).view(1, -1)
+    movable = _movable(optimizer, (H, W))
     classes = []
     for a in range(stride):
         for b in range(stride):
             oy, ox = (yy - a) % stride, (xx - b) % stride
             ay, ax = yy - oy, xx - ox
             anchor = (oy == 0) & (ox == 0)
-            member = (oy < block) & (ox < block) & (ay >= 0) & (ax >= 0)
+            member = (oy < block) & (ox < block) & (ay >= 0) & (ax >= 0) & movable
             classes.append((anchor, member, ay.clamp(min=0), ax.clamp(min=0)))
     if radius < 0:
         cands = range(L + 1)
@@ -290,15 +328,7 @@ def refine_pixel_heights(
         pixel_logits=_heights_to_eff_logits(z, L),
         height_offsets=optimizer.best_params["height_offsets"],
     )
-    old_best = optimizer.best_params["pixel_height_logits"]
-    old_live = optimizer.pixel_height_logits
-    optimizer.best_params["pixel_height_logits"] = new_logits
-    optimizer.pixel_height_logits = new_logits
-    post_loss = _compute_loss_for_heightmap(optimizer, dg)
-    kept = post_loss < pre_loss
-    if not kept:
-        optimizer.best_params["pixel_height_logits"] = old_best
-        optimizer.pixel_height_logits = old_live
+    kept, post_loss = _keep_heights_if_better(optimizer, new_logits, dg, pre_loss)
     spikes = int(spike_mask(z, spike_thr).sum())
     dev = float((z - z_anchor).abs().float().mean())
     print(
@@ -475,10 +505,32 @@ def refine_stack_palette(
 def apply_stack(optimizer, dg: torch.Tensor, refine_sweeps: int = 2, radius: int = -1, progress=None) -> bool:
     """Swap in stack ``dg``, re-solve the heights per pixel, and keep the
     result only if the real loss beats the current solution."""
-    from autoforge.Helper.PruningHelper import disc_to_logits
-
     before = optimizer.solution_loss()
     snap = optimizer.solution_snapshot()
+    try:
+        after = _apply_stack_unchecked(optimizer, dg, refine_sweeps, radius, progress)
+    except BaseException:
+        # Never leave the new stack half applied (stack swapped in, heights
+        # not yet re-solved) behind an error.
+        optimizer.restore_solution_snapshot(snap)
+        raise
+    shown = f"{_fmt_loss(before)} -> {_fmt_loss(after)}"
+    if after is None or before is None or after >= before:
+        optimizer.restore_solution_snapshot(snap)
+        print(f"Stack swap: {shown} | reverted")
+        return False
+    print(f"Stack swap: {shown} | kept")
+    return True
+
+
+def _fmt_loss(loss) -> str:
+    return "n/a" if loss is None else f"{loss:.4f}"
+
+
+def _apply_stack_unchecked(optimizer, dg, refine_sweeps, radius, progress):
+    """Swap in stack ``dg`` and re-solve the heights; the new loss."""
+    from autoforge.Helper.PruningHelper import disc_to_logits
+
     optimizer.best_params["global_logits"] = disc_to_logits(
         dg, optimizer.material_colors.shape[0], big_pos=1e5
     )
@@ -498,13 +550,7 @@ def apply_stack(optimizer, dg: torch.Tensor, refine_sweeps: int = 2, radius: int
         bp["pixel_height_logits"] = new_logits
         optimizer.pixel_height_logits = new_logits
     refine_pixel_heights(optimizer, sweeps=refine_sweeps, radius=radius, progress=progress)
-    after = optimizer.solution_loss()
-    if after is None or before is None or after >= before:
-        optimizer.restore_solution_snapshot(snap)
-        print(f"Stack swap: {before:.4f} -> {after:.4f} | reverted")
-        return False
-    print(f"Stack swap: {before:.4f} -> {after:.4f} | kept")
-    return True
+    return optimizer.solution_loss()
 
 
 @torch.jit.script
@@ -1120,6 +1166,7 @@ def refine_plateaus(optimizer, min_size: int = 2, shifts=(-3, -2, -1, 1, 2, 3), 
         zc = torch.round(target_lab / cell).to(torch.int64)
         zc = (zc[..., 0] * 1009 + zc[..., 1]) * 1009 + zc[..., 2]
     labels, n = _label_equal_regions(zc)
+    movable = _movable(optimizer, (H, W))
     sizes = np.bincount(labels.ravel(), minlength=n + 1)
     big = sizes >= min_size
     big[0] = False
@@ -1137,7 +1184,7 @@ def refine_plateaus(optimizer, min_size: int = 2, shifts=(-3, -2, -1, 1, 2, 3), 
 
     with torch.no_grad():
         for c in range(int(color.max()) + 1):
-            in_class = (color_t[lab_t] == c)  # [H,W] pixels of plateaus in this class
+            in_class = (color_t[lab_t] == c) & movable  # [H,W] pixels of plateaus in this class
             if not bool(in_class.any()):
                 continue
             fp_lab = F.max_pool2d(torch.where(in_class, lab_t, torch.zeros_like(lab_t)).float()[None, None], 3, 1, 1)[0, 0].long()
@@ -1161,13 +1208,6 @@ def refine_plateaus(optimizer, min_size: int = 2, shifts=(-3, -2, -1, 1, 2, 3), 
     new_logits = optimizer._remove_height_offset(
         pixel_logits=_heights_to_eff_logits(z, L), height_offsets=optimizer.best_params["height_offsets"]
     )
-    old_best, old_live = optimizer.best_params["pixel_height_logits"], optimizer.pixel_height_logits
-    optimizer.best_params["pixel_height_logits"] = new_logits
-    optimizer.pixel_height_logits = new_logits
-    post_loss = _compute_loss_for_heightmap(optimizer, dg)
-    kept = post_loss < pre_loss
-    if not kept:
-        optimizer.best_params["pixel_height_logits"] = old_best
-        optimizer.pixel_height_logits = old_live
+    kept, post_loss = _keep_heights_if_better(optimizer, new_logits, dg, pre_loss)
     print(f"Plateau refine ({mode}): {n} plateaus, loss {pre_loss:.4f} -> {post_loss:.4f} | {'kept' if kept else 'reverted'}")
     return kept

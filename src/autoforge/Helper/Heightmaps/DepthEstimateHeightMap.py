@@ -143,7 +143,8 @@ def init_height_map_depth_color_adjusted(
     H, W, _ = target.shape
     pixels = target.reshape(-1, 3).astype(np.float32)
 
-    optimal_n = max_layers  # // 2
+    # sklearn refuses more clusters than samples (a tiny or 1-pixel image).
+    optimal_n = max(1, min(max_layers, pixels.shape[0]))
     # ---------------------------
     # Step 3: Perform color clustering on the full image
     # ---------------------------

@@ -379,6 +379,15 @@ def generate_swap_instructions(
     return instructions
 
 
+def _file_safe(name) -> str:
+    """A material name as part of a file name: spaces to "_", and "/" plus
+    the other characters Windows forbids in file names to "-"."""
+    name = str(name).replace(" ", "_")
+    for ch in '/\\:*?"<>|':
+        name = name.replace(ch, "-")
+    return name
+
+
 def _rgb_to_hex(rgb) -> str:
     """``rrggbb`` of a 0-1 RGB triple, rounded like every other conversion
     (truncating turned a #808080 filament into 7f7f7f)."""
@@ -437,7 +446,7 @@ def generate_flatforge_stls(
     
     # Find the most transparent material (highest TD value) for clear areas
     most_transparent_idx = int(np.argmax(material_TDs_np))
-    clear_material_name = material_names[most_transparent_idx].replace(" ", "_").replace("/", "-")
+    clear_material_name = _file_safe(material_names[most_transparent_idx])
     clear_rgb = material_colors_np[most_transparent_idx]
     clear_color_hex = _rgb_to_hex(clear_rgb)
     print(f"Selected clear material: {material_names[most_transparent_idx]} (TD: {material_TDs_np[most_transparent_idx]:.2f})")
@@ -516,7 +525,7 @@ def generate_flatforge_stls(
 
     # Generate STL for each unique material
     for mat_idx in unique_materials:
-        material_name = material_names[mat_idx].replace(" ", "_").replace("/", "-")
+        material_name = _file_safe(material_names[mat_idx])
         # Get color hex from material_colors_np
         rgb = material_colors_np[mat_idx]
         color_hex = "#" + _rgb_to_hex(rgb)

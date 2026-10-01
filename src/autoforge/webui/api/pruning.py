@@ -1,3 +1,4 @@
+import asyncio
 import os
 import copy
 import threading
@@ -12,6 +13,7 @@ from ..helpers.pipeline_runner import friendly_error_message
 from ..helpers.sliders import result_counts_from_optimizer, should_repeat_prune
 from ..helpers.telemetry import capture_exception
 from ..config import config
+from .workers import STILL_STOPPING, running_worker, start_worker, wait_until_idle
 
 router = APIRouter()
 
@@ -19,6 +21,10 @@ router = APIRouter()
 @router.post("/start")
 async def start_pruning(settings: PruningSettings):
     svc = get_optimization_service()
+
+    # The previous job's thread may still be stopping (see workers).
+    if running_worker() is not None and await asyncio.to_thread(wait_until_idle, 2.0) is not None:
+        raise HTTPException(409, STILL_STOPPING)
 
     # Pruning drives the same GPU (and the same FilamentOptimizer as any
     # active optimization) — two such jobs running concurrently interleave
@@ -339,15 +345,10 @@ async def start_pruning(settings: PruningSettings):
                         final_image = optimizer.get_best_discretized_image()
                     if final_image is None:
                         return
-                    import base64
-                    import cv2
-                    import numpy as np
+                    from .ws import encode_png_b64
 
-                    img_np = final_image.cpu().numpy().astype(np.uint8)
-                    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                    _ok, buf = cv2.imencode('.png', img_bgr)
                     broadcast_preview(
-                        base64.b64encode(buf.tobytes()).decode('utf-8'),
+                        encode_png_b64(final_image),
                         # A client matches broadcasts against
                         # currentJob.job_id, which is still `job_id` (the id
                         # this prune action started from) for the whole
@@ -402,7 +403,9 @@ async def start_pruning(settings: PruningSettings):
                 if final_image is None:
                     return
                 height_map_mm = disc_height.cpu().numpy().astype(np.float32) * float(args.layer_height)
-                color = np.ascontiguousarray(final_image.cpu().numpy().astype(np.uint8)[..., :3])
+                from autoforge.Helper.ImageHelper import image_to_uint8
+
+                color = np.ascontiguousarray(image_to_uint8(final_image)[..., :3])
                 if color.shape[:2] != height_map_mm.shape[:2]:
                     color = cv2.resize(
                         color, (height_map_mm.shape[1], height_map_mm.shape[0]),
@@ -565,6 +568,5 @@ async def start_pruning(settings: PruningSettings):
                 traceback.print_exc()
             svc.update_status(prune_job_id, "failed", error=friendly_error_message(e))
 
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
+    start_worker(prune_job_id, _run)
     return {"job_id": prune_job_id, "status": "running"}

@@ -26,6 +26,7 @@ import torch
 
 from autoforge.Helper.DeviceUtils import activate_device
 from autoforge.Helper.FilamentHelper import hex_to_rgb
+from autoforge.Helper.ImageHelper import image_to_uint8, imwrite
 from autoforge.Helper.OptimizerHelper import (
     _layer_opacity,
     bleed_layer_effect,
@@ -265,7 +266,7 @@ def compute_slider_render(
             max_layers,
         )
 
-    comp_np = np.ascontiguousarray(comp.detach().cpu().numpy().astype(np.uint8))
+    comp_np = np.ascontiguousarray(image_to_uint8(comp))
     comp_bgr = cv2.cvtColor(comp_np, cv2.COLOR_RGB2BGR)
     ok, buf = cv2.imencode(".png", comp_bgr)
     png_bytes = buf.tobytes() if ok else None
@@ -316,7 +317,7 @@ def write_slider_png(render: dict[str, Any], output_dir: str, png_name: str) -> 
     if render["png_bytes"] is not None:
         _atomic_write_bytes(preview_path, render["png_bytes"])
     else:
-        cv2.imwrite(preview_path, cv2.cvtColor(render["comp_np"], cv2.COLOR_RGB2BGR))
+        imwrite(preview_path, cv2.cvtColor(render["comp_np"], cv2.COLOR_RGB2BGR))
     return preview_path
 
 

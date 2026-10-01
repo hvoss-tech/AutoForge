@@ -308,13 +308,17 @@ def heightfield_mesh(height_map, background_height, maximum_x_y_size, alpha_mask
     solid ``generate_stl`` writes (see the module docstring)."""
     H, W = height_map.shape
     z = height_map.astype(np.float32) + background_height
-    scale = maximum_x_y_size / max(W - 1, H - 1)
+    # max(..., 1): a single pixel has no extent to scale.
+    scale = maximum_x_y_size / max(W - 1, H - 1, 1)
     xs = np.arange(W, dtype=np.float32) * scale
     ys = (H - 1 - np.arange(H)).astype(np.float32) * scale
 
     if alpha_mask is None:
         quad_valid = np.ones((H - 1, W - 1), dtype=bool)
     else:
+        alpha_mask = np.asarray(alpha_mask)
+        if alpha_mask.ndim == 3:  # (H, W, 1), as the image loaders build it
+            alpha_mask = alpha_mask[..., 0]
         valid_mask = alpha_mask >= 128
         quad_valid = (
             valid_mask[:-1, :-1]
@@ -322,6 +326,9 @@ def heightfield_mesh(height_map, background_height, maximum_x_y_size, alpha_mask
             & valid_mask[1:, 1:]
             & valid_mask[1:, :-1]
         )
+    if quad_valid.size == 0 or not quad_valid.any():
+        # A one-pixel-wide map, or everything transparent: no cell to mesh.
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.int64)
     NT = 2 * (W - 1)
 
     # --- Runs of coplanar half-cells ---
@@ -480,8 +487,12 @@ def heightfield_mesh(height_map, background_height, maximum_x_y_size, alpha_mask
     P = np.concatenate(P)
     Q = np.concatenate(Q)
     Pb, Qb = P + n_keep, Q + n_keep
+    # With background_height 0 a vertex at height 0 coincides with its
+    # bottom twin: the wall triangle through both has no area. Dropping it
+    # keeps the edges paired (the top edge then meets the bottom one).
+    zt = z[ki, kj]
     wall_tris = np.concatenate(
-        [np.stack([Q, P, Pb], axis=1), np.stack([Q, Pb, Qb], axis=1)]
+        [np.stack([Q, P, Pb], axis=1)[zt[P] != 0], np.stack([Q, Pb, Qb], axis=1)[zt[Q] != 0]]
     )
 
     # --- Vertices: top kept vertices, then the same at z=0 ---

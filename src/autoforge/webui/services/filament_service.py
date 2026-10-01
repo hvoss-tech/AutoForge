@@ -1,4 +1,5 @@
 from __future__ import annotations
+import io
 import json
 import csv
 import os
@@ -207,7 +208,12 @@ class FilamentService:
         return rows
 
     def _parse_csv(self, content: str) -> list[Filament]:
-        reader = csv.DictReader(content.splitlines())
+        # A UTF-8 BOM (Excel's CSV export) stuck to the first header: "Brand"
+        # was then not found and every filament imported without a brand.
+        content = content.lstrip("\ufeff")
+        # StringIO, not splitlines(): a quoted cell spanning lines lost its
+        # line break.
+        reader = csv.DictReader(io.StringIO(content, newline=""))
         rows = self._normalize_csv_row(reader)
         parsed = []
         for row in rows:
@@ -225,12 +231,15 @@ class FilamentService:
             parsed.append(Filament(**record))
         return parsed
 
-    def _match_key(self, f: Filament) -> tuple[str, str]:
-        return (f.brand.strip().lower(), f.name.strip().lower())
+    def _match_key(self, f: Filament) -> tuple[str, str, str]:
+        # The type is part of the identity: "Acme Black" in PLA and in PETG
+        # are two filaments (as in catalog_matches), and keying on brand +
+        # name alone merged them into one entry.
+        return (f.brand.strip().lower(), f.name.strip().lower(), f.filament_type.strip().lower())
 
     def merge_import(self, filaments: list[Filament]) -> list[Filament]:
         """Add filaments into the existing library. An incoming filament
-        whose (brand, name) matches an existing one overwrites it in place
+        whose (brand, name, type) matches an existing one overwrites it in place
         (keeping its uuid, so active-filament references and slider
         assignments referencing that uuid keep working) instead of adding a
         duplicate entry — this is what re-importing the same CSV/updated
@@ -240,12 +249,19 @@ class FilamentService:
             imported = []
             for f in filaments:
                 key = self._match_key(f)
+                if key not in existing_by_key:
+                    # A file without a type column (or a library entry
+                    # without a type) still updates its one brand + name
+                    # match instead of adding a duplicate.
+                    loose = [k for k in existing_by_key if k[:2] == key[:2] and (not k[2] or not key[2])]
+                    if len(loose) == 1:
+                        key = loose[0]
                 if key in existing_by_key:
                     f.uuid = existing_by_key[key]
                 elif not f.uuid:
                     f.uuid = str(uuid.uuid4())
-                # A later row with the same brand+name (in this same file)
-                # updates this entry instead of adding a duplicate.
+                # A later row with the same brand, name and type (in this
+                # same file) updates this entry instead of adding a duplicate.
                 existing_by_key[key] = f.uuid
                 self._filaments[f.uuid] = f
                 imported.append(f)

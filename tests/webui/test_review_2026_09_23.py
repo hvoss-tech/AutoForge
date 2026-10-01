@@ -174,7 +174,10 @@ def test_job_cancelled_before_its_thread_runs_keeps_previous_result(client, monk
         def __getattr__(self, name):
             return getattr(threading, name)
 
-    monkeypatch.setattr(opt_api, "threading", _ThreadProxy())
+    # Job threads start from api/workers.py (start_worker).
+    import autoforge.webui.api.workers as workers
+
+    monkeypatch.setattr(workers, "threading", _ThreadProxy())
 
     r = client.post("/api/optimize/start", json={"input_image": "b.png", "iterations": 10})
     assert r.status_code == 200, r.text

@@ -52,7 +52,7 @@ from autoforge.Helper.Heightmaps.FastTSPHeightMap import (
     run_init_threads,
 )
 
-from autoforge.Helper.ImageHelper import resize_image, imread, to_bgr_or_bgra_uint8
+from autoforge.Helper.ImageHelper import image_to_uint8, resize_image, imread, imwrite, to_bgr_or_bgra_uint8
 from autoforge.Helper.OtherHelper import set_seed, perform_basic_check, get_device
 from autoforge.Helper.OutputHelper import (
     generate_stl,
@@ -876,7 +876,9 @@ def _load_priority_mask(
         pm_resized = cv2.resize(pm, (tgt_w, tgt_h), interpolation=cv2.INTER_LINEAR)
         pm_float = pm_resized.astype(np.float32) / 255.0
         focus_map_full = torch.tensor(pm_float, dtype=torch.float32, device=device)
-        cv2.imwrite(
+        # ImageHelper.imwrite: cv2.imwrite writes nothing to a non-ASCII
+        # path on Windows.
+        imwrite(
             os.path.join(args.output_folder, "priority_mask_resized.png"),
             (pm_float * 255).astype(np.uint8),
         )
@@ -1349,9 +1351,9 @@ def _post_optimize_and_export(
                 step=(post_opt_step := post_opt_step + 1),
             )
 
-            comp_disc_np = comp_disc.cpu().numpy().astype(np.uint8)
+            comp_disc_np = image_to_uint8(comp_disc)
             comp_disc_np = cv2.cvtColor(comp_disc_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(
+            imwrite(
                 os.path.join(args.output_folder, "final_model.png"), comp_disc_np
             )
 
