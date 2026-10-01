@@ -4,7 +4,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-HOST="${WEBUI_HOST:-0.0.0.0}"
+# This machine only by default (the webui has no login); set
+# WEBUI_HOST=0.0.0.0 to reach it from other devices on your network.
+HOST="${WEBUI_HOST:-127.0.0.1}"
 PORT="${WEBUI_PORT:-8000}"
 BUILD_FRONTEND="${BUILD_FRONTEND:-auto}"
 

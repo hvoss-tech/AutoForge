@@ -4,6 +4,7 @@ import { refreshLibrary } from '../services/filamentService'
 import { describeApiError } from '../lib/apiError'
 import { X, Upload, FileJson, FileText, AlertTriangle, Library } from 'lucide-react'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from './ui/dialog'
+import { downloadBlob } from '../lib/download'
 
 // 'hueforge' is HueForge's own personal library, read by the server from
 // where HueForge keeps it (see GET /api/filaments/hueforge-library).
@@ -53,15 +54,10 @@ const EXAMPLE_JSON = JSON.stringify(
 )
 
 function downloadExample(kind: 'csv' | 'json') {
-  const blob = new Blob([kind === 'csv' ? EXAMPLE_CSV : EXAMPLE_JSON], { type: kind === 'csv' ? 'text/csv' : 'application/json' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `filaments-example.${kind}`
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  URL.revokeObjectURL(url)
+  downloadBlob(
+    new Blob([kind === 'csv' ? EXAMPLE_CSV : EXAMPLE_JSON], { type: kind === 'csv' ? 'text/csv' : 'application/json' }),
+    `filaments-example.${kind}`,
+  )
 }
 
 export const ImportModal: React.FC = () => {

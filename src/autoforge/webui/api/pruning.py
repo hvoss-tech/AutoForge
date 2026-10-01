@@ -126,6 +126,10 @@ async def start_pruning(settings: PruningSettings):
                                         "or run optimization first.")
                 return
             claimed_optimizer = pipeline_result["optimizer"]
+            # The current CUDA device is per thread (see activate_device).
+            from autoforge.Helper.DeviceUtils import activate_device
+
+            activate_device(pipeline_result.get("device"))
             snapshot = None
             if hasattr(claimed_optimizer, "solution_snapshot"):
                 snapshot = claimed_optimizer.solution_snapshot()
@@ -491,7 +495,11 @@ async def start_pruning(settings: PruningSettings):
                 # Cancelled between phases. The frontend stays on the result
                 # pruning started from, so the solution is rolled back to it
                 # below (_roll_back) rather than left half-pruned.
-                if not outputs.get("pruning_completed", True):
+                # A cancel that arrived after the last phase, while the result
+                # was being saved, counts too: the job is "cancelled" already.
+                if not outputs.get("pruning_completed", True) or (
+                    cancel_event is not None and cancel_event.is_set()
+                ):
                     cancelled_midway = True
                     break
 
@@ -540,11 +548,13 @@ async def start_pruning(settings: PruningSettings):
                 # alias_pipeline_result for why this must not go through
                 # set_pipeline_result's "release every older result" path.
                 optimizer.prune_step_callback = None
-                svc.alias_pipeline_result(prune_job_id, job_id)
-                svc.update_status(
-                    prune_job_id, "completed", progress=100.0, phase=None,
+                if not svc.complete_prune(
+                    prune_job_id, job_id, progress=100.0, phase=None,
                     **_live_counts(), **_pass_fields(),
-                )
+                ):
+                    # Cancelled in the last moment: the frontend stays on
+                    # `job_id`, so it gets its result back as it was.
+                    _roll_back()
         except Exception as e:
             import traceback
             traceback.print_exc()

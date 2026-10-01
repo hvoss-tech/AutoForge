@@ -21,12 +21,31 @@ def _decode(data: bytes):
     return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_UNCHANGED) if data else None
 
 
+_CHUNK = 1024 * 1024
+
+
+def _too_large() -> HTTPException:
+    return HTTPException(413, f"Image is too large (max {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).")
+
+
 @router.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
     svc = get_image_service()
-    data = await file.read()
-    if len(data) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"Image is too large (max {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).")
+    # Checked while reading, not after: `await file.read()` loaded the whole
+    # upload into memory first, however large it was.
+    if file.size is not None and file.size > _MAX_UPLOAD_BYTES:
+        raise _too_large()
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > _MAX_UPLOAD_BYTES:
+            raise _too_large()
+        chunks.append(chunk)
+    data = b"".join(chunks)
     # Reject what OpenCV can't decode right away: a corrupt or non-image file
     # used to be accepted and only fail later, as a confusing auto-preview or
     # optimization error.

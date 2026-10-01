@@ -307,6 +307,9 @@ async def start_optimization(settings: OptimizationSettings):
                 # "Download" button and no error visible anywhere in the UI.
                 logger.error("Export failed for job %s: %s", job.job_id, exc)
                 capture_exception(exc, {"phase": "export", "job_id": job.job_id})
+                # Nothing can use a failed job's result; give its device
+                # memory back instead of holding it until the next run.
+                svc.clear_pipeline_result(job.job_id)
                 svc.update_status(job.job_id, "failed", error=friendly_error_message(exc))
                 return
 

@@ -422,7 +422,7 @@ def run_init_threads(
     eps=1e-6,
     random_seed=None,
     num_threads=4,
-    num_runs=32,
+    num_runs=1,
     init_method="kmeans",
     cluster_layers=None,
     material_colors=None,
@@ -431,6 +431,14 @@ def run_init_threads(
     progress=None,
 ):
     background_tuple = (np.asarray(background_tuple) * 255).tolist()
+    if num_runs > 1:
+        # Every round currently produces the identical clustering and
+        # ordering (the refinement k-means is seeded with a constant and the
+        # ordering is deterministic; see auto_forge's --num_init_rounds), so
+        # extra rounds only cost time - and on 4 worker processes, a CUDA
+        # context each. Revisit once rounds really differ.
+        print(f"num_init_rounds={num_runs}: extra rounds give identical results; running one.")
+        num_runs = 1
     if random_seed is None:
         random_seed = np.random.randint(1e6)
 

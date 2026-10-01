@@ -5,7 +5,8 @@ rem haven't already. Mirrors run_webui.sh - see that file for the
 rem Linux/macOS equivalent.
 cd /d "%~dp0"
 
-if "%WEBUI_HOST%"=="" set "WEBUI_HOST=0.0.0.0"
+rem This machine only by default (no login); set WEBUI_HOST=0.0.0.0 for network access.
+if "%WEBUI_HOST%"=="" set "WEBUI_HOST=127.0.0.1"
 if "%WEBUI_PORT%"=="" set "WEBUI_PORT=8000"
 if "%BUILD_FRONTEND%"=="" set "BUILD_FRONTEND=true"
 

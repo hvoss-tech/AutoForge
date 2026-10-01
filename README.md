@@ -56,6 +56,7 @@ The easiest way to use AutoForge is the web UI, a local app with drag-and-drop i
    - Windows: double-click `run_webui.bat`
 
    This starts the server and opens the web UI in your browser automatically (usually at `http://localhost:8000`).
+   It only listens on this computer by default, since the web UI has no login. To open it from other devices on your network, start it with `WEBUI_HOST=0.0.0.0 ./run_webui.sh` (Windows: `set WEBUI_HOST=0.0.0.0` before `run_webui.bat`).
 
    To make some parts of the picture come out closer than the rest (a face, the eyes, lettering), click **Focus** in the image panel and paint over them; a slider sets how much more they count (2× to 100×, default 10×). After a run, the **Differences** view shows where the print strays furthest from the picture.
 
@@ -63,7 +64,7 @@ The easiest way to use AutoForge is the web UI, a local app with drag-and-drop i
 
    To find a filament you own without measuring it yourself, click **Catalog** in the filament library. It searches every filament on [filamentcolors.xyz](https://filamentcolors.xyz) that has a measured TD (search by brand, color name, type or hex code; filter by type, brand or color family; or pick a color to see the closest matches first), and **Add** puts it straight into your library.
 
-   The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports (unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace) so bugs can get fixed faster. No image data, filament data, or personal information is sent. To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
+   The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports (unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace) so bugs can get fixed faster. No image data, filament data or other personal information is sent, except that error messages and stack traces can contain file paths (for example the install folder, which may include your user name, or an image's file name). To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
 
 4. **Update to the latest release** whenever you want, from the project folder:
    - Linux/macOS: `./update.sh`
@@ -156,7 +157,7 @@ This will generate separate STL files for each color, allowing you to print face
 - `--processing_reduction_factor` Reduction factor for the processing size compared to the output size (default: 2 - half resolution).
 - `--nozzle_diameter` Diameter of the printer nozzle in millimeters (default: 0.4).  
   **Note:** Details smaller than half this value will be ignored.
-- `--early_stopping` Number of steps without improvement before stopping (default: 10000).
+- `--early_stopping` Number of steps without improvement before stopping (default: 3000).
 - `--priority_mask` *(Optional)* Path to a greyscale image the size of the input that marks the parts that matter most: white areas are matched more closely, black areas still count, just less.
 - `--priority_mask_strength` How many times more a white pixel of `--priority_mask` counts than a black one (default: 10; must be at least 1). Raise it if the marked areas still come out off, lower it for a gentler nudge.
 

@@ -25,6 +25,7 @@ router = APIRouter()
 
 _GITHUB_REPO = "hvoss-techfak/AutoForge"
 _UPDATE_CACHE_TTL = 3600  # seconds — avoid hitting GitHub's API on every page load
+_UPDATE_ERROR_TTL = 300
 _update_cache: dict = {"checked_at": 0.0, "data": None}
 
 
@@ -73,8 +74,31 @@ def _current_version() -> str:
     return "unknown"
 
 
-def _version_tuple(v: str) -> tuple[int, ...]:
-    return tuple(int(re.sub(r"\D", "", part) or 0) for part in v.split("."))
+def _parse_version(v: str) -> tuple[tuple[int, ...], str]:
+    """(release numbers, pre-release/local suffix): "2.2.0-beta.1" ->
+    ((2, 2, 0), "-beta.1"). Stripping the non-digits of every dot segment
+    instead read that as (2, 2, 0, 1) - newer than the 2.2.0 release."""
+    match = re.match(r"^\s*v?(\d+(?:\.\d+)*)(.*)$", v)
+    if not match:
+        return (0,), v
+    release = tuple(int(p) for p in match.group(1).split("."))
+    # Trailing zeros don't make a version newer: 2.1 == 2.1.0.
+    while len(release) > 1 and release[-1] == 0:
+        release = release[:-1]
+    return release, match.group(2).strip()
+
+
+def _is_newer(latest: str, current: str) -> bool:
+    """Whether ``latest`` is a newer *release* than ``current``. A
+    pre-release tag never counts as an update."""
+    latest_rel, latest_suffix = _parse_version(latest)
+    current_rel, current_suffix = _parse_version(current)
+    if latest_suffix:
+        return False
+    if latest_rel != current_rel:
+        return latest_rel > current_rel
+    # The same numbers: the release is newer than a pre-release of it.
+    return bool(current_suffix)
 
 
 @router.get("/health")
@@ -111,7 +135,7 @@ def _check_latest_release() -> dict:
         result["latest_version"] = latest_tag or None
         result["release_url"] = data.get("html_url", result["release_url"])
         if latest_tag and current != "unknown":
-            result["update_available"] = _version_tuple(latest_tag) > _version_tuple(current)
+            result["update_available"] = _is_newer(latest_tag, current)
     except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
         result["error"] = str(e)
     return result
@@ -126,7 +150,10 @@ async def check_for_update():
 
     now = time.time()
     cached = _update_cache["data"]
-    if cached is not None and (now - _update_cache["checked_at"]) < _UPDATE_CACHE_TTL:
+    # A failed check (offline, rate limit) is retried after a few minutes,
+    # not kept for the full hour.
+    ttl = _UPDATE_ERROR_TTL if cached is not None and cached.get("error") else _UPDATE_CACHE_TTL
+    if cached is not None and (now - _update_cache["checked_at"]) < ttl:
         return cached
 
     result = await asyncio.to_thread(_check_latest_release)

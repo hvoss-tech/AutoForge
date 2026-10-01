@@ -96,6 +96,15 @@ async def render_preview(data: dict):
             filament_lookup[uuid_] = f
 
     with _seq_lock:
+        # Only targets that can still be rendered keep an entry: these maps
+        # gained one per job, forever.
+        live = {INIT_JOB_SENTINEL, effective_job_id}
+        live.update(svc.pipeline_result_job_ids())
+        for stale in [k for k in _latest_seq if k not in live]:
+            _latest_seq.pop(stale, None)
+            lock = _render_locks.get(stale)
+            if lock is not None and not lock.locked():
+                _render_locks.pop(stale, None)
         _latest_seq[effective_job_id] = seq = _latest_seq.get(effective_job_id, 0) + 1
         render_lock = _render_locks[effective_job_id]
 

@@ -499,6 +499,8 @@ def prune_num_colors(
     preview_callback=None,
     pruning_batch_size: int = 0,
 ) -> torch.Tensor:
+    if max_colors_allowed < 0:
+        raise ValueError(f"The color limit must be at least 0 colors besides the base, got {max_colors_allowed}.")
     num_materials = optimizer.material_colors.shape[0]
     disc_global, _ = optimizer.get_discretized_solution(best=True)
 
@@ -668,9 +670,13 @@ def prune_num_colors(
 
     final_colors = layer_colors(best_dg)
 
-    assert len(final_colors) <= max_colors_allowed, (
-        f"Color pruning failed: {len(final_colors)} > {max_colors_allowed}"
-    )
+    # A real check, not an assert: asserts vanish under `python -O`, and a
+    # bare AssertionError told the user nothing.
+    if len(final_colors) > max_colors_allowed:
+        raise ValueError(
+            f"Color pruning could not get below {len(final_colors)} colors besides the base "
+            f"(limit {max_colors_allowed}); raise the color limit."
+        )
 
     print(
         f"PRUNING: Color - final loss={best_loss:.4f}, final colors={len(final_colors)} besides the base"
@@ -696,6 +702,8 @@ def prune_num_swaps(
     """Reduce the number of color boundaries until it is <= max_swaps_allowed.
     If necessary, merges are forced even when they worsen the loss.
     """
+    if max_swaps_allowed < 0:
+        raise ValueError(f"The swap limit must be at least 0, got {max_swaps_allowed}.")
 
     num_materials = optimizer.material_colors.shape[0]
     disc_global, _ = optimizer.get_discretized_solution(best=True)
@@ -873,9 +881,11 @@ def prune_num_swaps(
 
     # safety check
     final_swaps = count_swaps(find_color_bands(best_dg))
-    assert final_swaps <= max_swaps_allowed, (
-        f"Swap pruning failed: {final_swaps} swaps > {max_swaps_allowed}"
-    )
+    if final_swaps > max_swaps_allowed:
+        raise ValueError(
+            f"Swap pruning could not get below {final_swaps} swaps (limit {max_swaps_allowed}); "
+            "raise the swap limit."
+        )
 
     return best_dg
 
@@ -1804,7 +1814,9 @@ def remove_height_spikes(
     # But after fixes we need to re-extract.  We'll recompute unfold each pass
     # on the current data; it's still sub-millisecond for 1500x1500.
     total_spikes = 0
-    cur = disc_height.contiguous()
+    # A copy: .contiguous() returned the caller's own tensor whenever it was
+    # already contiguous, and the fixes below were written into it.
+    cur = disc_height.clone().contiguous()
 
     for _ in range(num_passes):
         # Re-extract windows from current data

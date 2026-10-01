@@ -10,7 +10,7 @@ from autoforge.Helper.FilamentHelper import load_materials_data
 from autoforge.Helper.HeightfieldMesh import heightfield_mesh
 
 
-def extract_filament_swaps(disc_global, disc_height_image, background_layers):
+def extract_filament_swaps(disc_global, disc_height_image, background_layers, base_material_index=None):
     """
     Given the discrete global material assignment (disc_global) and the discrete height image,
     extract the list of material indices (one per swap point) and the corresponding slider
@@ -45,6 +45,17 @@ def extract_filament_swaps(disc_global, disc_height_image, background_layers):
     filament_indices.append(prev)
     slider = slider_values[-1] + 1
     slider_values.append(slider)
+
+    # A first layer in the base filament is no swap: the base just carries
+    # on (the rule generate_swap_instructions applies), so the project file
+    # must not list that filament again on top of the Background entry.
+    if (
+        base_material_index is not None
+        and int(disc_global[0]) == int(base_material_index)
+        and len(filament_indices) > 2
+    ):
+        filament_indices = filament_indices[1:]
+        slider_values = slider_values[1:]
 
     return filament_indices, slider_values
 
@@ -136,7 +147,8 @@ def generate_project_file(
 
     # Extract the swap points from the discrete solution
     filament_indices, slider_values = extract_filament_swaps(
-        disc_global, disc_height_image, background_layers
+        disc_global, disc_height_image, background_layers,
+        getattr(args, "background_material_index", None),
     )
 
     # Build the filament_set list. For each swap point, we look up the corresponding material from CSV.
@@ -367,6 +379,12 @@ def generate_swap_instructions(
     return instructions
 
 
+def _rgb_to_hex(rgb) -> str:
+    """``rrggbb`` of a 0-1 RGB triple, rounded like every other conversion
+    (truncating turned a #808080 filament into 7f7f7f)."""
+    return "".join(f"{int(round(float(c) * 255)):02x}" for c in rgb[:3])
+
+
 def generate_flatforge_stls(
     disc_global,
     disc_height_image,
@@ -421,9 +439,7 @@ def generate_flatforge_stls(
     most_transparent_idx = int(np.argmax(material_TDs_np))
     clear_material_name = material_names[most_transparent_idx].replace(" ", "_").replace("/", "-")
     clear_rgb = material_colors_np[most_transparent_idx]
-    clear_color_hex = "{:02x}{:02x}{:02x}".format(
-        int(clear_rgb[0] * 255), int(clear_rgb[1] * 255), int(clear_rgb[2] * 255)
-    )
+    clear_color_hex = _rgb_to_hex(clear_rgb)
     print(f"Selected clear material: {material_names[most_transparent_idx]} (TD: {material_TDs_np[most_transparent_idx]:.2f})")
     
     heights = np.asarray(disc_height_image).astype(np.int64)
@@ -464,7 +480,16 @@ def generate_flatforge_stls(
         and again as a highlight). A single solid spanning the lowest to the
         highest of its layers used to swallow every other material printed in
         between, so the per-color STLs overlapped. At a pixel of height z, the
-        band [a, b) is filled from layer a up to min(b, z)."""
+        band [a, b) is filled from layer a up to min(b, z).
+
+        Every piece is bounded by the shared surfaces min(z, k) at the
+        vertices (k a band boundary), interpolated across each cell like the
+        single STL's surface: band [a, b) lies between min(z, a) and
+        min(z, b), the clear part between z and the top. Consecutive pieces
+        therefore share their boundary surfaces exactly and the pieces
+        together fill the same solid as the single STL plus the clear cap -
+        a flat band bottom at a (as before) left a void wherever a cell's
+        corners straddled a band boundary."""
         pieces = []
         for material, first, end in bands:
             if material != material_idx:
@@ -473,7 +498,7 @@ def generate_flatforge_stls(
             if not np.any(band_mask & valid_mask):
                 continue
             top_mm = np.minimum(heights, end).astype(float) * layer_height
-            bottom_mm = np.full((H, W), first * layer_height, dtype=float)
+            bottom_mm = np.minimum(heights, first).astype(float) * layer_height
             mesh_data = _create_flatforge_box_mesh(
                 top_mm, bottom_mm, background_height,
                 maximum_x_y_size, valid_mask, band_mask
@@ -494,9 +519,7 @@ def generate_flatforge_stls(
         material_name = material_names[mat_idx].replace(" ", "_").replace("/", "-")
         # Get color hex from material_colors_np
         rgb = material_colors_np[mat_idx]
-        color_hex = "#{:02x}{:02x}{:02x}".format(
-            int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
-        )
+        color_hex = "#" + _rgb_to_hex(rgb)
 
         print(f"Generating FlatForge STL for {material_name}...")
         create_color_stl(mat_idx, material_name, color_hex)
@@ -581,10 +604,11 @@ def _create_flatforge_box_mesh(max_height_map, min_height_map, z_offset,
     """
     H, W = max_height_map.shape
     
-    # Only process pixels that are both valid and have this material
-    active_mask = valid_mask & material_mask
-    
-    if not np.any(active_mask):
+    # A cell is meshed when all four corners are valid (the single STL's
+    # rule) and any corner has this material: with per-vertex top/bottom
+    # surfaces a cell whose corners only partly reach a band still holds a
+    # (wedge-shaped) part of it.
+    if not np.any(valid_mask & material_mask):
         return None
     
     # Create coordinate grids
@@ -609,10 +633,15 @@ def _create_flatforge_box_mesh(max_height_map, min_height_map, z_offset,
     # Build quad mesh only for active pixels
     # A quad is valid if all four corners are active
     quad_valid = (
-        active_mask[:-1, :-1]
-        & active_mask[:-1, 1:]
-        & active_mask[1:, 1:]
-        & active_mask[1:, :-1]
+        valid_mask[:-1, :-1]
+        & valid_mask[:-1, 1:]
+        & valid_mask[1:, 1:]
+        & valid_mask[1:, :-1]
+    ) & (
+        material_mask[:-1, :-1]
+        | material_mask[:-1, 1:]
+        | material_mask[1:, 1:]
+        | material_mask[1:, :-1]
     )
     
     valid_i, valid_j = np.nonzero(quad_valid)

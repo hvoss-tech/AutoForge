@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from autoforge.Helper.DeviceUtils import (
+    activate_device,
     describe_device,
     mps_is_available,
     resolve_device,
@@ -71,5 +72,6 @@ def get_device(args=None) -> torch.device:
     ):
         # Explicit --mps on a machine that also has a CUDA GPU: honor it.
         device = torch.device("mps")
+    activate_device(device)
     print("Using device:", describe_device(device))
     return device

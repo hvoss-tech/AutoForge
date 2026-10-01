@@ -4,7 +4,9 @@ from pathlib import Path
 from pydantic_settings import BaseSettings
 
 class WebUIConfig(BaseSettings):
-    host: str = "0.0.0.0"
+    # Only this machine by default; WEBUI_HOST=0.0.0.0 (run_webui.sh) or
+    # AUTOFORGE_WEBUI_HOST opens it to the network - there is no login.
+    host: str = "127.0.0.1"
     port: int = 8000
     checkpoints_dir: str = "checkpoints"
     uploads_dir: str = "uploads"

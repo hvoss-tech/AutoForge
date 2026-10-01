@@ -1,3 +1,6 @@
+import { downloadBlob, releaseReplacedObjectUrl } from '../lib/download'
+import { addMissingFilaments, filamentLabel } from '../lib/projectLoad'
+import { acceptsStatusFor, finishedResultCounts, isFailureTransition, pruningPollStep } from '../lib/jobTracking'
 import { create } from 'zustand'
 import type { Filament, ColorSliderConfig, OptimizationSettings, JobStatus, ProjectState, PruningSettings, InitState, Snapshot } from '../types'
 import { jobStatusFromControlResponse } from '../lib/jobControl'
@@ -191,16 +194,6 @@ export function readAutoSaveLibrary(): boolean {
   return readStorage(AUTO_SAVE_LIBRARY_KEY) !== '0'
 }
 
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  URL.revokeObjectURL(url)
-}
 
 /** What a saved project file holds (also bundled into the export zip). */
 export function projectFileData(state: Pick<AppState, 'projectName' | 'inputImage' | 'settings' | 'colorSliders' | 'activeFilaments'>) {
@@ -297,7 +290,7 @@ export const defaultSettings: OptimizationSettings = {
   mps: false,
   run_name: null,
   tensorboard: false,
-  num_init_rounds: 16,
+  num_init_rounds: 1,
   num_init_cluster_layers: -1,
   disable_visualization_for_gradio: 1,
   best_of: 1,
@@ -820,7 +813,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     queueCaptureSnapshot(describeSettingsChange(before as unknown as Record<string, unknown>, settings as unknown as Record<string, unknown>))
   },
   setCurrentJob: (job) => {
+    // A late report about another job (a poll that resolved after the UI
+    // moved on) must not replace the job on screen; see acceptsStatusFor.
+    if (!acceptsStatusFor(get().currentJob, job)) return
     const prevStatus = get().currentJob?.status
+    if (isFailureTransition(prevStatus, job)) {
+      // Here, not in the socket handler only: a failure first seen by a
+      // poll used to raise no toast at all. Only the summary line(s) -
+      // friendly_error_message() (backend) puts the raw exception after a
+      // blank line, which belongs in the panel's "Show details".
+      const summary = job?.error?.split('\n\n')[0]
+      get().pushToast(summary ? `Optimization failed: ${summary}` : 'Optimization failed.')
+    }
     if (job) markJobTracked()
     set({ currentJob: job });
     if (job && (job.status === 'running' || job.status === 'paused') && job.loss !== null && job.loss !== undefined) {
@@ -849,10 +853,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       // cheap extra insurance against that assumption changing later.
       if (get().settings.auto_initial_prune && !job.job_id.startsWith('prune-')) {
         const baseUuid = effectiveBaseFilamentUuid(get().resolvedBase)
-        const current = resultCounts(
+        // The server's counts of the finished result; the sliders still
+        // show the last training preview (see finishedResultCounts).
+        const current = finishedResultCounts(job, resultCounts(
           buildPrintPlan(get().colorSliders, [], { ...get().settings, base_filament_uuid: baseUuid }),
           baseUuid,
-        )
+        ))
         const limits = suggestPruningLimits(current)
         set({ pruningBaseline: current })
         get().startPruning({
@@ -869,7 +875,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   setSliderLayerRange: (range) => set({ sliderLayerRange: range }),
-  setInputImage: (image) => { set({ inputImage: image }); queueCaptureSnapshot('Input image changed') },
+  setInputImage: (image) => {
+    releaseReplacedObjectUrl(get().inputImage, image)
+    set({ inputImage: image })
+    queueCaptureSnapshot('Input image changed')
+  },
   setPreviewImage: (image) => set({ previewImage: image }),
   bumpPreviewVersion: () => set((state) => ({ previewVersion: state.previewVersion + 1, meshVersion: state.meshVersion + 1 })),
   bumpImageVersion: () => set((state) => ({ previewVersion: state.previewVersion + 1 })),
@@ -979,19 +989,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       const libraryRes = await fetch('/api/filaments')
       const library: Filament[] = await libraryRes.json().catch(() => [])
       const libraryUuids = new Set(library.map((f) => f.uuid))
-      let libraryChanged = false
-      for (const f of parsed.activeFilaments) {
-        try {
-          if (!libraryUuids.has(f.uuid)) {
-            await fetch('/api/filaments', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(f),
-            })
-            libraryChanged = true
-          }
-        } catch (_) {}
+      const { libraryChanged, failed } = await addMissingFilaments(parsed.activeFilaments, libraryUuids, async (f) => {
+        const response = await fetch('/api/filaments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(f),
+        })
+        const detail = response.ok ? undefined : describeApiError(await response.json().catch(() => null), response.status)
+        return { ok: response.ok, status: response.status, detail }
+      })
+      // Refused filaments stay out of the active list (the server would
+      // reject the whole list for one bad entry), and the user is told which.
+      const refused = new Set(failed.map(({ filament }) => filament.uuid))
+      const usable = parsed.activeFilaments.filter((f) => !refused.has(f.uuid))
+      if (failed.length > 0) {
+        get().pushToast(
+          `Skipped ${failed.length} filament${failed.length > 1 ? 's' : ''} from the project the server refused: ` +
+            failed.map(({ filament, detail }) => `${filamentLabel(filament)} (${detail})`).join('; '),
+          'warning',
+        )
       }
+      parsed.activeFilaments = usable
       try {
         await syncActiveFilamentsToServer(parsed.activeFilaments)
       } catch (e) {
@@ -1082,6 +1100,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
     // The focus-area mask was painted over the old picture's shapes.
     const settings = { ...get().settings, input_image: filename, priority_mask: '' }
+    // The previous upload's local preview holds that whole file in memory.
+    releaseReplacedObjectUrl(get().inputImage, displayUrl)
     set({
       settings,
       inputImage: displayUrl,
@@ -1272,10 +1292,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     const sourceJobId = state.currentJob.job_id
     stopPruningPoll()
     const generation = pruningPollGeneration
+    let networkErrors = 0
+    const lost = () => {
+      // The server forgot the job (restarted) or stayed unreachable: stop,
+      // instead of polling forever behind a "running" overlay.
+      set((s) => ({ pruningJob: s.pruningJob ? { ...s.pruningJob, status: 'cancelled' } : null }))
+      get().pushToast('Lost track of the pruning run (the server may have restarted).', 'warning')
+    }
     const poll = async () => {
       try {
         const res = await fetch(`/api/optimize/status/${jobId}`)
         if (generation !== pruningPollGeneration) return
+        networkErrors = 0
+        if (pruningPollStep({ status: res.status }, 0) === 'lost') {
+          lost()
+          return
+        }
         if (res.ok) {
           const job = await res.json()
           set({ pruningJob: job })
@@ -1292,6 +1324,12 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       } catch {
         // Keep polling; backend may briefly be unavailable between prune stages
+        networkErrors += 1
+        if (generation !== pruningPollGeneration) return
+        if (pruningPollStep(null, networkErrors) === 'lost') {
+          lost()
+          return
+        }
       }
       if (generation !== pruningPollGeneration) return
       pruningPollTimer = setTimeout(poll, 1000)
@@ -1304,6 +1342,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     const response = await fetch(`/api/optimize/pause/${jobId}`, { method: 'POST' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const status = jobStatusFromControlResponse(await response.json().catch(() => null), 'paused')
+    if (status !== 'paused') {
+      // The prune had already finished: show its real final state.
+      try {
+        const res = await fetch(`/api/optimize/status/${jobId}`)
+        if (res.ok) {
+          set({ pruningJob: await res.json() })
+          return
+        }
+      } catch (_) {}
+    }
     set((state) => ({
       pruningJob: state.pruningJob ? { ...state.pruningJob, status } : null,
     }))
@@ -1313,6 +1361,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     const response = await fetch(`/api/optimize/resume/${jobId}`, { method: 'POST' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const status = jobStatusFromControlResponse(await response.json().catch(() => null), 'running')
+    if (status !== 'running') {
+      // The prune had already finished: show its real final state.
+      try {
+        const res = await fetch(`/api/optimize/status/${jobId}`)
+        if (res.ok) {
+          set({ pruningJob: await res.json() })
+          return
+        }
+      } catch (_) {}
+    }
     set((state) => ({
       pruningJob: state.pruningJob ? { ...state.pruningJob, status } : null,
     }))
@@ -1591,6 +1649,7 @@ async function applySnapshotBody(index: number, target: Snapshot, store: AppStat
   if (imageChanged && !destinationHasResult) await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
 
   UNDO_INDEX = index
+  releaseReplacedObjectUrl(useAppStore.getState().inputImage, restoredImageUrl)
   useAppStore.setState((prev) => ({
     historyIndex: index,
     activeFilaments: target.activeFilaments ?? prev.activeFilaments,

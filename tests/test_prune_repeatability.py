@@ -371,5 +371,7 @@ def test_fine_tune_only_accepts_an_improvement():
     import inspect
 
     source = inspect.getsource(FilamentOptimizer.fine_tune_height_offsets)
-    assert "if best_loss < pre_loss:" in source
-    assert "self.best_params[\"height_offsets\"] = orig_offsets" in source
+    # Kept only when it beats the start; otherwise the original offsets go
+    # back (in a finally, so also after an exception - see C-9).
+    assert "improved = best_loss < pre_loss" in source
+    assert "best_offsets if improved else orig_offsets" in source

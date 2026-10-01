@@ -6,19 +6,8 @@ import { withEffectiveBaseColor } from '../lib/baseColor'
 import { describeApiError } from '../lib/apiError'
 import { onUiCommand } from '../lib/uiEvents'
 import { exportFileName } from '../lib/project'
+import { downloadBlob } from '../lib/download'
 
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  // Revoking right after click() can cancel a large download before the
-  // browser has read the blob.
-  setTimeout(() => URL.revokeObjectURL(url), 60_000)
-}
 
 const itemClass =
   'w-full flex items-center gap-2 px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-700 text-left disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent'
@@ -259,7 +248,7 @@ export const FileMenu: React.FC = () => {
             <Layers className="w-3.5 h-3.5" /> HueForge project (.hfp)
           </button>
           <p className="px-3 pt-1 pb-1 text-[11px] text-gray-400">
-            Swap instructions and image follow your edits; the .zip, STL and .hfp are the optimizer's output.
+            Swap instructions, image and the .zip follow your edits; the separate .hfp is the optimizer's output.
           </p>
         </div>
       )}

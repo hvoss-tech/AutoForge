@@ -23,12 +23,13 @@ def load_materials(args):
             - colors_list (list): List of color hex strings.
     """
     df = load_materials_pandas(args)
+    # An empty CSV cell is NaN in pandas; str() turned it into "nan".
     material_names = [
-        str(brand) + " - " + str(name)
+        " - ".join(part for part in (_text(brand), _text(name)) if part)
         for brand, name in zip(df["Brand"].tolist(), df["Name"].tolist())
     ]
     material_TDs = (df["Transmissivity"].astype(float)).to_numpy()
-    colors_list = df["Color"].tolist()
+    colors_list = [normalize_hex(color) for color in df["Color"].tolist()]
     # Use float64 for material colors.
     material_colors = np.array(
         [hex_to_rgb(color) for color in colors_list], dtype=np.float64
@@ -47,11 +48,6 @@ def load_materials_pandas(args):
             traceback.print_exc()
             print("Error reading filament CSV file:", e)
             sys.exit(1)
-        # rename all columns that start with a whitespace
-        df.columns = [col.strip() for col in df.columns]
-        # if TD in columns rename to Transmissivity
-        if "TD" in df.columns:
-            df.rename(columns={"TD": "Transmissivity"}, inplace=True)
     else:
         # read json
         with open(json_filename, "r") as f:
@@ -65,6 +61,11 @@ def load_materials_pandas(args):
             sys.exit(1)
         # list to dataframe
         df = pd.DataFrame(data)
+    # Same column spellings for both sources: a JSON library using "TD" (or
+    # padded keys) used to fail with KeyError 'Transmissivity'.
+    df.columns = [str(col).strip() for col in df.columns]
+    if "TD" in df.columns and "Transmissivity" not in df.columns:
+        df.rename(columns={"TD": "Transmissivity"}, inplace=True)
     return df
 
 def load_materials_data(args):
@@ -84,17 +85,38 @@ def load_materials_data(args):
     return records
 
 
+def _text(value) -> str:
+    """A table cell as text; missing / NaN cells are empty."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    return str(value).strip()
+
+
+def normalize_hex(hex_str) -> str:
+    """``#RRGGBB`` for the hex spellings libraries use (``RRGGBB``, ``#RGB``,
+    ``#RRGGBBAA``); ValueError for anything else."""
+    text = str(hex_str).strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    elif len(text) == 8:
+        text = text[:6]
+    if len(text) != 6 or any(c not in "0123456789abcdefABCDEF" for c in text):
+        raise ValueError(f"{hex_str!r} is not a hex color like #RRGGBB")
+    return "#" + text.upper()
+
+
 def hex_to_rgb(hex_str):
     """
     Convert a hex color string to a normalized RGB list.
 
     Args:
-        hex_str (str): The hex color string (e.g., '#RRGGBB').
+        hex_str (str): The hex color string ('#RRGGBB'; '#RGB', '#RRGGBBAA'
+            and a missing '#' are accepted too).
 
     Returns:
         list: A list of three floats representing the RGB values normalized to [0, 1].
     """
-    hex_str = hex_str.lstrip("#")
+    hex_str = normalize_hex(hex_str).lstrip("#")
     return [int(hex_str[i : i + 2], 16) / 255.0 for i in (0, 2, 4)]
 
 

@@ -2,7 +2,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlsplit
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -30,11 +30,41 @@ class SPAStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
         response = await super().get_response(path, scope)
         request_path = scope.get("path", "") or ""
-        if request_path in ("", "/", "/index.html"):
-            response.headers["Cache-Control"] = "no-cache"
-        else:
+        # Only Vite's content-hashed bundle files may be cached forever; a
+        # 404 or an unhashed file (favicon, ...) marked immutable stayed
+        # cached for a year.
+        if response.status_code == 200 and request_path.startswith("/assets/"):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif response.status_code == 200:
+            response.headers["Cache-Control"] = "no-cache"
         return response
+
+
+class SameOriginMiddleware:
+    """Refuse HTTP and websocket requests that a browser sent from another
+    site: their Origin header names a host other than the one requested.
+    Requests without an Origin (curl, scripts, same-origin GETs) pass."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket") and self._cross_origin(scope):
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            else:
+                await JSONResponse(status_code=403, content={"detail": "Cross-origin request refused"})(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    def _cross_origin(scope) -> bool:
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        origin = headers.get("origin")
+        if not origin:
+            return False
+        # "null": sandboxed iframes, file:// pages - never this app.
+        return origin == "null" or urlsplit(origin).netloc.lower() != headers.get("host", "").lower()
 
 
 @asynccontextmanager
@@ -77,12 +107,13 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="AutoForge WebUI", version="1.0.0", lifespan=lifespan)
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # No CORS middleware: the SPA is served from this same origin (and the
+    # dev server proxies /api and /ws), so nothing legitimate is
+    # cross-origin. `allow_origins=["*"]` let any web page open in the
+    # browser drive the API. Browsers still send some cross-site requests
+    # without asking (form posts, plain POSTs, websockets), so a request
+    # whose Origin is another site is refused outright.
+    app.add_middleware(SameOriginMiddleware)
 
     @app.exception_handler(Exception)
     async def _unhandled_exception_handler(request: Request, exc: Exception):

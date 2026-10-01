@@ -21,6 +21,7 @@ import copy
 import json
 import sys
 import os
+import shutil
 import traceback
 from typing import Optional, Tuple, List
 
@@ -71,13 +72,12 @@ from autoforge.Modules.Optimizer import FilamentOptimizer
 if os.environ.get("AF_TEXPR_FUSER", "0") != "1":
     torch._C._jit_set_texpr_fuser_enabled(False)
 
-# check if we can use torch.set_float32_matmul_precision('high')
-if torch.__version__ >= "2.0.0":
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception as e:
-        print("Warning: Could not set float32 matmul precision to high. Error:", e)
-        pass
+# No version check: comparing version strings sorted "10.0" below "2.0", and
+# every supported torch has this call (the try covers one that doesn't).
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception as e:
+    print("Warning: Could not set float32 matmul precision to high. Error:", e)
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +87,23 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Populated arguments structure. Some parameters may be adjusted later
         (e.g., num_init_cluster_layers when -1 to infer from max_layers).
     """
+    return build_parser().parse_args()
+
+
+def cli_defaults() -> dict:
+    """Every CLI option's default, by its attribute name. The webui builds
+    its run settings on top of these, so a new CLI option (and its default)
+    reaches webui runs too instead of falling back to whatever getattr
+    default the code that reads it happens to use."""
+    return {
+        action.dest: action.default
+        for action in build_parser()._actions
+        if action.dest not in ("help", "config") and action.default is not argparse.SUPPRESS
+    }
+
+
+def build_parser() -> configargparse.ArgParser:
+    """The CLI's argument parser (see parse_args)."""
     parser = configargparse.ArgParser()
     parser.add_argument("--config", is_config_file=True, help="Path to config file")
 
@@ -232,7 +249,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--early_stopping",
         type=int,
-        default=2000,
+        default=3000,
         help="Number of steps without improvement before stopping",
     )
 
@@ -297,7 +314,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--edge_bleed",
         type=float,
-        default=0.1,
+        default=0.25,
         help="Edge bleed strength (0-1): every layer's presence at a pixel blends with the mean of its 8 neighbours' by "
         "this weight, so at a height step the taller side thins and shows its lower layers and the lower side takes on "
         "some of the taller one's (0 = no bleed)",
@@ -305,7 +322,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pixel_height_smoothness",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Pixel height refine: cost per layer of height difference to each neighbour, traded against colour error (keeps the height map printable; 0 = colour only)",
     )
     parser.add_argument(
@@ -655,8 +672,7 @@ def parse_args() -> argparse.Namespace:
         help="How many times more a fully white pixel of --priority_mask counts than a black one (>= 1; default 10).",
     )
 
-    args = parser.parse_args()
-    return args
+    return parser
 
 
 def _compute_dominant_image_color(
@@ -1560,26 +1576,7 @@ def start(args) -> float:
     # at this benchmark's small image size, needed ~300 attempts to beat
     # this loop's 60, and pushed total time past what the extra loss
     # reduction was worth. Kept the simpler, cheaper, already-validated loop.)
-    with torch.no_grad():
-        if optimizer.height_assign and not optimizer.constrained:
-            # The last gradient steps moved the heights off the assignment.
-            optimizer.assign_heights_step()
-        if optimizer.constrained:
-            # The same 60 draws (live and running-average parameters, in the
-            # order the loop below takes them), judged in one pass: the
-            # parameters don't change between them.
-            draws = [np.random.randint(0, 1000000) for _ in range(120)]
-            ema = getattr(optimizer, "_ema", None) is not None
-            optimizer._maybe_update_best_discrete(
-                (draws[0::2], draws[1::2]) if ema else (draws[:60], None)
-            )
-        else:
-            for _ in range(60):
-                optimizer._maybe_update_best_discrete()
-        optimizer.search_background()
-        if args.constrained_opt:
-            optimizer.constrained_local_search(compound=True)
-        optimizer.end_check_scope()
+    optimizer.finish_training()
     optimizer.finalize_background(args, material_names)
     if optimizer.bg_logits is not None:
         try:
@@ -1640,6 +1637,12 @@ def main() -> None:
                 # count instead of the requested --max_layers.
                 run_args = copy.copy(args)
                 run_args.output_folder = run_folder
+                # A fixed seed is the first run's; the others count up from it
+                # (the same seed every run made runs 2..N exact repeats).
+                # Seed 0 already draws a fresh seed per run in set_seed().
+                if args.random_seed != 0:
+                    run_args.random_seed = args.random_seed + i
+                print(f"Run {i + 1} seed: {run_args.random_seed if run_args.random_seed != 0 else 'random'}")
                 os.makedirs(run_args.output_folder, exist_ok=True)
                 run_loss = start(run_args)
                 print(f"Run {i + 1} finished with loss: {run_loss}")
@@ -1681,7 +1684,9 @@ def main() -> None:
             src_file = os.path.join(best_run_folder, file)
             dst_file = os.path.join(final_output_folder, file)
             if os.path.isfile(src_file):
-                os.rename(src_file, dst_file)
+                os.replace(src_file, dst_file)
+        # Every run's files lived in temp/; the best one's are now in place.
+        shutil.rmtree(temp_output_folder, ignore_errors=True)
 
 
 if __name__ == "__main__":

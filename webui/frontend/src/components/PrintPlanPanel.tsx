@@ -3,6 +3,7 @@ import { Copy, Download } from 'lucide-react'
 import { useAppStore } from '../store/appStore'
 import { withEffectiveBaseColor } from '../lib/baseColor'
 import { buildPrintPlan, printPlanText } from '../lib/printPlan'
+import { downloadBlob } from '../lib/download'
 
 const Stat: React.FC<{ label: string; value: string; hint?: string; testId: string }> = ({ label, value, hint, testId }) => (
   <div className="px-3 py-2 rounded bg-gray-800 min-w-24" title={hint} data-testid={testId}>
@@ -51,14 +52,7 @@ export const PrintPlanPanel: React.FC = () => {
   }
 
   const download = () => {
-    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }))
-    const a = document.createElement('a')
-    a.href = url
-    a.download = 'swap_instructions.txt'
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
+    downloadBlob(new Blob([text], { type: 'text/plain' }), 'swap_instructions.txt')
   }
 
   return (

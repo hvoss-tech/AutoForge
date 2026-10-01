@@ -1,6 +1,8 @@
 import asyncio
 import json
+import logging
 import os
+import shutil
 import re
 import tempfile
 import zipfile
@@ -235,11 +237,16 @@ async def _export_zip_response(job_id: str, name: str | None, project: dict[str,
     prefix = _export_prefix(name)
     fd, zip_path = tempfile.mkstemp(suffix=".zip")
     os.close(fd)
+    edit_dir = tempfile.mkdtemp(prefix="autoforge_edit_")
     try:
-        added = await asyncio.to_thread(_write_export_zip, zip_path, job_dir, prefix, project)
+        await asyncio.to_thread(wait_for_pending_mesh, job_id)
+        replace = await asyncio.to_thread(_edited_replacements, job_id, job_dir, project, edit_dir)
+        added = await asyncio.to_thread(_write_export_zip, zip_path, job_dir, prefix, project, replace)
     except BaseException:
         os.remove(zip_path)
         raise
+    finally:
+        shutil.rmtree(edit_dir, ignore_errors=True)
     if added == 0:
         os.remove(zip_path)
         raise HTTPException(404, "No output files found for this job")
@@ -274,7 +281,50 @@ def _export_arcname(filename: str, prefix: str) -> str:
     return f"{prefix}_{renamed}"
 
 
-def _write_export_zip(zip_path: str, job_dir: str, prefix: str, project: dict[str, Any] | None = None) -> int:
+def _edited_replacements(job_id: str, job_dir: str, project: dict[str, Any] | None, edit_dir: str) -> dict[str, str | None]:
+    """Bundle entries to swap for a slider-edited result: {file name: path
+    to use instead, or None to leave it out}.
+
+    Slider edits write EDITED_PNG/EDITED_PLY next to the optimizer's files.
+    When there are any, the bundle carries the edited image and mesh, and
+    swap instructions and a .hfp regenerated from the edited stack (the
+    project's colorSliders) - not the optimizer's, which name the colours
+    the user replaced. If the result is no longer live (pruned since, or a
+    server restart), those two can't be regenerated and are left out rather
+    than shipped stale."""
+    edited_png = os.path.join(job_dir, EDITED_PNG)
+    if not os.path.exists(edited_png):
+        return {}
+    replace: dict[str, str | None] = {"final_model.png": edited_png}
+    edited_ply = os.path.join(job_dir, EDITED_PLY)
+    if os.path.exists(edited_ply):
+        replace["final_model_colored.ply"] = edited_ply
+    replace["swap_instructions.txt"] = None
+    replace["project_file.hfp"] = None
+    sliders = (project or {}).get("colorSliders")
+    result = get_optimization_service().get_pipeline_result(job_id)
+    if sliders and result:
+        from ..helpers.edited_export import write_edited_outputs
+        from ..services.filament_service import get_filament_service
+
+        filaments = {f.uuid: f.model_dump() for f in get_filament_service().list()}
+        for f in (project or {}).get("activeFilaments") or []:
+            if isinstance(f, dict) and f.get("uuid"):
+                filaments.setdefault(str(f["uuid"]), f)
+        try:
+            replace.update(write_edited_outputs(result, sliders, filaments, edit_dir))
+        except Exception:
+            logging.getLogger(__name__).exception("Could not regenerate the edited instructions for %s", job_id)
+    return replace
+
+
+def _write_export_zip(
+    zip_path: str,
+    job_dir: str,
+    prefix: str,
+    project: dict[str, Any] | None = None,
+    replace: dict[str, str | None] | None = None,
+) -> int:
     # Runs in a worker thread: the STL alone can be a few hundred MB, and
     # zipping it on the event loop froze every other request (and the
     # websocket) for the whole time. Level 1 is ~4x faster than the default
@@ -283,9 +333,10 @@ def _write_export_zip(zip_path: str, job_dir: str, prefix: str, project: dict[st
     # took longer than the compression itself.
     added = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        replace = replace or {}
         for filename in _export_files_for(job_dir):
-            path = os.path.join(job_dir, filename)
-            if os.path.exists(path):
+            path = replace.get(filename, os.path.join(job_dir, filename))
+            if path is not None and os.path.exists(path):
                 zf.write(path, arcname=_export_arcname(filename, prefix))
                 added += 1
         if added and project is not None:

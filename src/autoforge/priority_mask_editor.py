@@ -31,6 +31,10 @@ import os
 import cv2
 import numpy as np
 
+# The ImageHelper wrappers: OpenCV's own file I/O can't open non-ASCII
+# paths on Windows.
+from autoforge.Helper.ImageHelper import imread, imwrite
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -149,12 +153,12 @@ def main():
     args = parse_args()
     if not os.path.exists(args.input):
         raise FileNotFoundError(f"Input image '{args.input}' not found")
-    ref = cv2.imread(args.input, cv2.IMREAD_COLOR)
+    ref = imread(args.input, cv2.IMREAD_COLOR)
     if ref is None:
         raise RuntimeError("Failed to load input image.")
     init_mask = None
     if args.initial and os.path.exists(args.initial):
-        init_mask = cv2.imread(args.initial, cv2.IMREAD_GRAYSCALE)
+        init_mask = imread(args.initial, cv2.IMREAD_GRAYSCALE)
 
     editor = PriorityMaskEditor(
         ref, init_mask, brush_radius=args.brush, alpha=args.alpha
@@ -173,11 +177,11 @@ def main():
         cv2.imshow(win_name, overlay)
         key = cv2.waitKey(16) & 0xFF
         if key in (ord("q"), 27):  # q or ESC
-            cv2.imwrite(out_path, editor.get_mask_uint8())
+            imwrite(out_path, editor.get_mask_uint8())
             print(f"Saved mask to {out_path}")
             break
         elif key == ord("s"):
-            cv2.imwrite(out_path, editor.get_mask_uint8())
+            imwrite(out_path, editor.get_mask_uint8())
             print(f"Saved mask to {out_path}")
         elif key == ord("+") or key == ord("="):
             editor.brush_radius = min(editor.brush_radius + 5, 1000)

@@ -244,6 +244,9 @@ class FilamentService:
                     f.uuid = existing_by_key[key]
                 elif not f.uuid:
                     f.uuid = str(uuid.uuid4())
+                # A later row with the same brand+name (in this same file)
+                # updates this entry instead of adding a duplicate.
+                existing_by_key[key] = f.uuid
                 self._filaments[f.uuid] = f
                 imported.append(f)
             self._refresh_active_locked()
@@ -380,12 +383,18 @@ class FilamentService:
 
     def set_active(self, filament: Filament) -> Filament:
         with self._lock:
+            # Keyed by uuid: two uuid-less filaments overwrote each other.
+            if not filament.uuid:
+                filament.uuid = str(uuid.uuid4())
             self._active[filament.uuid] = filament
             self._save_library()
             return filament
 
     def replace_active(self, filaments: list[Filament]) -> list[Filament]:
         with self._lock:
+            for f in filaments:
+                if not f.uuid:
+                    f.uuid = str(uuid.uuid4())
             self._active = {f.uuid: f for f in filaments}
             self._save_library()
             return list(self._active.values())

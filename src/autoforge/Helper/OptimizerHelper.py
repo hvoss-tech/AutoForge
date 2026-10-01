@@ -197,19 +197,26 @@ def batched_layer_material_indices(
 
 
 # Weight of the 8 neighbours' mean in every layer's effective presence (see
-# bleed_layer_effect): the default, and the value every composite of this
-# process uses (--edge_bleed; FilamentOptimizer sets it from its args).
-EDGE_BLEED = 0.1
+# bleed_layer_effect): the default, and the value the composites use
+# (--edge_bleed; FilamentOptimizer sets it from its args).
+EDGE_BLEED = 0.25
 _edge_bleed = EDGE_BLEED
+# Per thread: the webui runs a job's training, its pruning and slider
+# renders of (possibly other) results on different threads, and a single
+# process-wide value let one of them switch the bleed under another mid-run.
+# A thread that never set one (a helper/worker thread) uses the value set
+# last anywhere, as before.
+_edge_bleed_local = threading.local()
 
 
 def set_edge_bleed(strength: float) -> None:
     global _edge_bleed
     _edge_bleed = float(strength)
+    _edge_bleed_local.value = float(strength)
 
 
 def get_edge_bleed() -> float:
-    return _edge_bleed
+    return getattr(_edge_bleed_local, "value", _edge_bleed)
 
 
 @torch.jit.script

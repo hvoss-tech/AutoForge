@@ -208,7 +208,7 @@ def refine_pixel_heights(
     weights = _pixel_weights(optimizer, (H, W))
     stride = block + 2
     kernel = torch.ones(1, 1, stride, stride, device=z.device)
-    smooth = float(getattr(optimizer.args, "pixel_height_smoothness", 2.0))
+    smooth = float(getattr(optimizer.args, "pixel_height_smoothness", 1.0))
     # Pull toward the height map pruning handed over (quadratic, so it is
     # the large departures that cost), stored on the first refine of a prune.
     anchor_w = float(getattr(optimizer.args, "pixel_height_anchor", 0.0))
@@ -1104,7 +1104,7 @@ def refine_plateaus(optimizer, min_size: int = 2, shifts=(-3, -2, -1, 1, 2, 3), 
     dev = z.device
     target_lab = srgb_to_lab(optimizer.target)
     weights = _pixel_weights(optimizer, (H, W))
-    smooth = float(getattr(optimizer.args, "pixel_height_smoothness", 2.0))
+    smooth = float(getattr(optimizer.args, "pixel_height_smoothness", 1.0))
     spike_thr = float(getattr(optimizer.args, "spike_threshold_layers", 1))
     kk = torch.arange(L + 1, device=dev).view(1, 1, -1)
     layer = torch.arange(L, device=dev).view(-1, 1, 1)

@@ -30,20 +30,28 @@ export function useJobWebSocket(jobId: string | null) {
   // a fresh reconnect budget.
   const retryNonce = useAppStore((s) => s.connectionRetryNonce)
 
+  // Aborts the poll requests still in flight: one resolving after the hook
+  // moved to another job used to apply the old job's status.
+  const pollAbortRef = useRef<AbortController | null>(null)
+
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current) {
       clearInterval(pollTimerRef.current)
       pollTimerRef.current = null
     }
+    pollAbortRef.current?.abort()
+    pollAbortRef.current = null
   }, [])
 
   const startPolling = useCallback(
     (polledJobId: string, interval: number = POLL_FALLBACK_INTERVAL) => {
       stopPolling()
+      const abort = new AbortController()
+      pollAbortRef.current = abort
       pollTimerRef.current = setInterval(async () => {
         try {
-          const response = await fetch(`/api/optimize/status/${polledJobId}`)
-          if (!mountedRef.current) return
+          const response = await fetch(`/api/optimize/status/${polledJobId}`, { signal: abort.signal })
+          if (!mountedRef.current || abort.signal.aborted) return
           // The server is back but doesn't know this job: it was restarted,
           // and the run died with the old process. Polling on would leave
           // the progress bar frozen forever.
@@ -56,12 +64,14 @@ export function useJobWebSocket(jobId: string | null) {
           }
           if (!response.ok) return
           const data: JobStatus = await response.json()
+          if (abort.signal.aborted || data.job_id !== polledJobId) return
           setServerConnection('ok')
           setCurrentJob(data)
           if (['completed', 'failed', 'cancelled'].includes(data.status)) {
             stopPolling()
           }
         } catch {
+          if (abort.signal.aborted) return
           // Unreachable: keep polling (it may come back), but say so — a
           // progress bar that silently stops moving looked like a slow run.
           if (mountedRef.current) setServerConnection('lost')
@@ -138,17 +148,8 @@ export function useJobWebSocket(jobId: string | null) {
         // not reset it on every open.
         reconnectAttemptsRef.current = 0
         setServerConnection('ok')
-        const previousStatus = useAppStore.getState().currentJob?.status
-        if (data.status === 'failed' && previousStatus !== 'failed') {
-          // Only the summary line(s) — friendly_error_message() (backend)
-          // puts the full raw exception after a blank line, which belongs
-          // in Preview3DPanel's collapsible "Show details", not stretching
-          // a toast across the screen.
-          const summary = data.error?.split('\n\n')[0]
-          useAppStore.getState().pushToast(
-            summary ? `Optimization failed: ${summary}` : 'Optimization failed.'
-          )
-        }
+        // The failure toast is raised by setCurrentJob, so a failure first
+        // seen by a poll gets one too.
         setCurrentJob(data)
         if (['completed', 'failed', 'cancelled'].includes(data.status)) {
           intentionalClose = true

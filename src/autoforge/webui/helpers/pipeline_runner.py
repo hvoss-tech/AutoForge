@@ -18,12 +18,14 @@ import numpy as np
 import torch
 
 from autoforge.Helper.AmpUtils import safe_autocast
+from autoforge.Helper.DeviceUtils import activate_device
 from autoforge.Helper.FilamentHelper import hex_to_rgb
 from autoforge.Helper.ImageHelper import imread, resize_image, to_bgr_or_bgra_uint8
 from autoforge.Helper.OtherHelper import get_device, set_seed
 from autoforge.Helper.OutputHelper import generate_stl
 from autoforge.Modules.Optimizer import FilamentOptimizer
 from autoforge.auto_forge import (
+    cli_defaults,
     _auto_select_background_color,
     _prepare_background_and_materials,
     _compute_pixel_sizes,
@@ -59,78 +61,24 @@ def friendly_error_message(exc: BaseException) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Defaults mirroring configargparse in auto_forge.py
+# Defaults: the CLI's own (auto_forge.build_parser), so every option the
+# pipeline reads has the same default here as on the command line. A
+# hand-copied table drifted: options added to the CLI later (height_assign,
+# delta_grid, the stack search knobs, ...) were missing, and the code reading
+# them fell back to getattr defaults that turned them off for webui runs.
 # ---------------------------------------------------------------------------
-_DEFAULTS = {
+_WEBUI_OVERRIDES = {
+    # Set per run from the request / the job's own paths.
     "input_image": "",
-    "csv_file": "",
-    "json_file": "",
-    "output_folder": "output",
-    "iterations": 6000,
-    # Stack search + pixel height refine during training (see
-    # FilamentOptimizer.intermediate_search): from step 2000, every 1000.
-    "intermediate_search_interval": 1000,
-    "intermediate_search_start": 2000,
-    "intermediate_search_rounds": 15,
-    "intermediate_search_patience": 5,
-    "intermediate_search_pin": 0.0,
-    "warmup_fraction": 1.0,
-    "learning_rate_warmup_fraction": 0.01,
-    "init_tau": 1.0,
-    "final_tau": 0.01,
-    "learning_rate": 0.015,
-    "layer_height": 0.04,
-    "max_layers": 75,
-    "min_layers": 0,
-    "background_height": 0.24,
-    "background_color": "#000000",
-    "auto_background_color": True,
-    "visualize": False,
-    "stl_output_size": 150,
-    "processing_reduction_factor": 2,
-    "nozzle_diameter": 0.4,
-    "early_stopping": 3000,
-    "perform_pruning": False,
-    "fast_pruning": True,
-    "fast_pruning_percent": 0.25,
-    "spike_removal": True,
-    "spike_threshold_layers": 1,
-    "pixel_height_smoothness": 1.0,
-    "edge_bleed": 0.25,
-    "pruning_max_colors": 100,
-    "pruning_max_swaps": 100,
-    "pruning_max_layer": 75,
-    "pruning_batch_size": 8,
-    "random_seed": 0,
-    "device": None,
-    "mps": False,
     "run_name": "",
-    "tensorboard": False,
-    "num_init_rounds": 32,
-    "num_init_threads": 4,
-    "num_init_cluster_layers": -1,
-    "disable_visualization_for_gradio": 0,
-    "best_of": 1,
-    "discrete_check": 100,
-    "flatforge": False,
-    "cap_layers": 0,
-    "init_heightmap_method": "kmeans",
-    "priority_mask": "",
-    "priority_mask_strength": 10.0,
+    # No matplotlib window in a server, and pruning is its own webui step.
+    "visualize": False,
+    "perform_pruning": False,
     # Colour/swap limits held during the optimization (see run_limit_args).
     "max_colors": None,
     "max_swaps": None,
-    "constrained_opt": False,
-    "optimize_background": True,
-    "constraint_rho": 0.0,
-    "constraint_start": 0.1,
-    "constraint_full": 0.6,
-    "constraint_dual_lr": 0.01,
-    "constraint_swap_margin": 1.0,
-    "constraint_linear_moves": False,
-    "constraint_pin": True,
-    "constraint_search_rounds": 3,
 }
+_DEFAULTS = {**cli_defaults(), **_WEBUI_OVERRIDES}
 
 
 def run_limit_args(ns: argparse.Namespace) -> None:
@@ -223,6 +171,8 @@ def build_pipeline_state(
 
     if device is None:
         device = get_device(args)
+    else:
+        activate_device(device)
 
     os.makedirs(args.output_folder, exist_ok=True)
 
@@ -427,22 +377,12 @@ def run_pipeline(
         pause_event=pause_event,
     )
 
+    # The same finish as the CLI (FilamentOptimizer.finish_training).
+    optimizer.finish_training(
+        should_stop=(lambda: cancel_event.is_set()) if cancel_event is not None else None,
+        report=report,
+    )
     cancelled = cancel_event is not None and cancel_event.is_set()
-    if not cancelled and optimizer.bg_logits is not None:
-        report("Choosing the base filament", 0.0)
-        with torch.no_grad():
-            optimizer.search_background(progress=lambda f: report("Choosing the base filament", f))
-    if not cancelled and getattr(args, "constrained_opt", False):
-        # Same finish as the CLI: a last search over stacks within the
-        # limits, scored on the real loss (never leaves them).
-        report("Refining within the limits", 0.0)
-        optimizer.constrained_local_search(
-            compound=True,
-            should_stop=(lambda: cancel_event.is_set()) if cancel_event is not None else None,
-            progress=lambda f: report("Refining within the limits", f),
-        )
-        cancelled = cancel_event is not None and cancel_event.is_set()
-    optimizer.end_check_scope()
     if not cancelled:
         optimizer.finalize_background(args, state.get("material_names"))
         # Slider re-renders composite over this tensor.
@@ -571,6 +511,13 @@ def _run_optimization_loop(
                 )
                 break
 
+    # Free the captured training graphs and their private memory pool before
+    # the (full-resolution) export and pruning allocate - as the CLI does.
+    # `loss_val` aliases storage in that pool, so it goes first.
+    loss_val = None
+    del loss_val
+    optimizer.release_cuda_graph()
+
 
 # ---------------------------------------------------------------------------
 # Export: finalise and write all output files
@@ -645,6 +592,8 @@ def export_results(
 
     set_edge_bleed(float(getattr(args, "edge_bleed", EDGE_BLEED)))
     device: torch.device = result["device"]
+    # Pruning calls this from its own thread (the current device is per thread).
+    activate_device(device)
     material_colors_np: np.ndarray = result["material_colors_np"]
     material_TDs_np: np.ndarray = result["material_TDs_np"]
     material_names: list = result["material_names"]
@@ -672,7 +621,24 @@ def export_results(
     # from a worse solution than the one it was supposed to improve, which is
     # what made repeated pruning steadily degrade the result.
     refine_carried = False
+    assign_at_output = None
     if not getattr(optimizer, "_full_res_height_restored", False):
+        if getattr(optimizer, "height_assign", False) and optimizer.best_params is not None:
+            # --height_assign (the CLI default, see auto_forge's
+            # _post_optimize_and_export): the trained heights are per-pixel
+            # assignments for the best stack, so assign them again at the
+            # output resolution for that stack instead of carrying a delta.
+            # Read at the processing resolution, before the switch below.
+            from autoforge.Helper.OptimizerHelper import batched_layer_material_indices
+            from autoforge.auto_forge import _discretize_height_only_best
+
+            with torch.no_grad():
+                z_proc = _discretize_height_only_best(optimizer)
+                seed = optimizer.best_seed if optimizer.best_seed is not None and optimizer.best_seed >= 0 else 0
+                best_dg = batched_layer_material_indices(
+                    optimizer.best_params["global_logits"], optimizer.vis_tau, seed
+                )
+            assign_at_output = (z_proc, best_dg)
         full_init = torch.from_numpy(pixel_height_logits_init).to(device)
         optimizer.pixel_height_logits = full_init.clone()
         carried = _best_heights_at_output_res(
@@ -695,6 +661,25 @@ def export_results(
     )
     if focus_map_proc is not None and focus_map_full is not None:
         optimizer.focus_map = focus_map_full
+    # The smooth height field lives at the processing resolution and is
+    # already baked into best_params (get_current_parameters); the CLI drops
+    # it here too.
+    optimizer.pixel_delta = None
+    if assign_at_output is not None:
+        from autoforge.Helper.HeightAssign import heights_to_logits
+
+        z_proc, best_dg = assign_at_output
+        with torch.no_grad():
+            z0_full = torch.nn.functional.interpolate(
+                z_proc[None, None].float(), size=tuple(output_target.shape[:2]), mode="nearest"
+            )[0, 0]
+            z_full = optimizer.assigned_heights(best_dg, heights_to_logits(z0_full, optimizer.max_layers))
+            full_logits = heights_to_logits(z_full, optimizer.max_layers)
+        optimizer.best_params["pixel_height_logits"] = full_logits
+        optimizer.best_params["height_offsets"] = torch.zeros_like(optimizer.best_params["height_offsets"])
+        optimizer.pixel_height_logits = full_logits.clone()
+        # Every pixel already has its exact height for the stack.
+        refine_carried = False
 
     with torch.no_grad():
         with safe_autocast(device):

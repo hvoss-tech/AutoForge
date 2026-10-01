@@ -1,6 +1,6 @@
 from __future__ import annotations
 import re
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from typing import Optional, Any, Literal
 from datetime import datetime
 
@@ -89,7 +89,8 @@ class OptimizationSettings(CamelCaseModel):
     fast_pruning: bool = True
     fast_pruning_percent: float = Field(0.25, gt=0, le=1)
     spike_removal: bool = True
-    spike_threshold_layers: int = 1
+    # 0 or less silently turned spike removal off.
+    spike_threshold_layers: int = Field(1, ge=1)
     # Pixel height refine: cost per layer of height difference to each
     # neighbour, traded against colour error (0 = colour only).
     pixel_height_smoothness: float = Field(1.0, ge=0)
@@ -117,19 +118,32 @@ class OptimizationSettings(CamelCaseModel):
     mps: bool = False
     run_name: Optional[str] = None
     tensorboard: bool = False
-    num_init_rounds: int = Field(16, ge=1)
+    # Extra rounds give identical results (see auto_forge --num_init_rounds).
+    num_init_rounds: int = Field(1, ge=1)
     num_init_cluster_layers: int = Field(-1, ge=-1)
     disable_visualization_for_gradio: int = 1
     best_of: int = Field(1, ge=1)
     discrete_check: int = Field(100, ge=1)
     flatforge: bool = False
-    cap_layers: int = 0
+    cap_layers: int = Field(0, ge=0)
     # Same choices as the CLI; anything else used to silently run as kmeans.
     init_heightmap_method: Literal["kmeans", "depth"] = "kmeans"
     priority_mask: str = ""
     # How many times more a painted focus-area pixel counts (--priority_mask_strength).
     priority_mask_strength: float = Field(10.0, ge=1.0, le=1000.0)
     visualize: bool = False
+
+    @model_validator(mode="after")
+    def _check_ranges_between_fields(self):
+        # Rejected up front with a message, instead of a run that anneals the
+        # temperature upwards or a pruning pass that can never meet its limits.
+        if self.final_tau > self.init_tau:
+            raise ValueError(f"final_tau ({self.final_tau:g}) must not be larger than init_tau ({self.init_tau:g}).")
+        if self.min_layers > self.pruning_max_layer:
+            raise ValueError(
+                f"min_layers ({self.min_layers}) must not be larger than pruning_max_layer ({self.pruning_max_layer})."
+            )
+        return self
 
     def base_height_error(self) -> Optional[str]:
         """The CLI refuses a base that isn't a whole number of layers
@@ -183,9 +197,11 @@ class JobStatus(CamelCaseModel):
 
 
 class PruningSettings(CamelCaseModel):
-    pruning_max_colors: int = 100
-    pruning_max_swaps: int = 100
-    pruning_max_layer: int = 75
+    # Colors count the base; a negative swap limit reached pruning's final
+    # check as a cryptic failure.
+    pruning_max_colors: int = Field(100, ge=1)
+    pruning_max_swaps: int = Field(100, ge=0)
+    pruning_max_layer: int = Field(75, ge=1)
     job_id: Optional[str] = None
     # Keep pruning the same result until a pass stops finding an
     # improvement. Pruning is a greedy search that restarts from whatever it

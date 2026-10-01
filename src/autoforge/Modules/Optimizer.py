@@ -101,6 +101,39 @@ def _fused_cont_available(material_colors: torch.Tensor) -> bool:
     )
 
 
+def _call_preview_callback(owner, *args, **kwargs) -> None:
+    """Call ``owner.preview_callback`` exactly once, with only the keywords
+    it accepts (older callbacks take fewer), never letting its exception
+    reach the pruning phase. Retrying on TypeError instead re-ran a callback
+    whose own body raised TypeError (duplicate side effects), and the bare
+    fallback call could abort the phase. Module level so test stubs that
+    borrow FilamentOptimizer's pruning methods can use it too."""
+    callback = getattr(owner, "preview_callback", None)
+    if callback is None:
+        return
+    cached = getattr(owner, "_preview_callback_kwargs", None)
+    if cached is None or cached[0] is not callback:
+        import inspect
+
+        try:
+            params = inspect.signature(callback).parameters.values()
+            if any(p.kind is p.VAR_KEYWORD for p in params):
+                accepted = None  # **kwargs: everything
+            else:
+                accepted = {p.name for p in params if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+        except (TypeError, ValueError):
+            accepted = None
+        cached = (callback, accepted)
+        owner._preview_callback_kwargs = cached
+    accepted = cached[1]
+    if accepted is not None:
+        kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+    try:
+        callback(*args, **kwargs)
+    except Exception:
+        traceback.print_exc()
+
+
 class FilamentOptimizer:
     def __init__(
         self,
@@ -1207,8 +1240,10 @@ class FilamentOptimizer:
             self.optimizer.zero_grad(set_to_none=False)
 
     def _validated_params(self):
-        params = [self.params["global_logits"], self.height_offsets] + (
-            [self.bg_logits] if self.bg_logits is not None else []
+        params = (
+            [self.params["global_logits"], self.height_offsets]
+            + ([self.pixel_delta] if self.pixel_delta is not None else [])
+            + ([self.bg_logits] if self.bg_logits is not None else [])
         )
         return [p for p in params if p.requires_grad]
 
@@ -1444,6 +1479,50 @@ class FilamentOptimizer:
         for st in self.optimizer.state.values():
             st["step"] += 1
         return True
+
+    def finish_training(self, should_stop=None, report=None) -> None:
+        """The end of training, shared by the CLI and the webui (the webui's
+        own copy had drifted and skipped the first two steps):
+
+        - with --height_assign, re-assign the heights the last gradient steps
+          moved off the assignment;
+        - score the final state: the discrete checks only run every
+          --discrete_check steps, so the last stretch of training was never
+          a candidate. Several draws, since a single unlucky one can make a
+          better final state look worse than an earlier checkpoint;
+        - choose the base filament (--optimize_background) and, under
+          colour/swap limits, run the final search within them.
+
+        ``should_stop()`` (optional) skips what is left once it returns True;
+        ``report(phase, fraction)`` (optional) reports the last two steps.
+        """
+        report = report or (lambda phase, fraction: None)
+        stop = should_stop or (lambda: False)
+        with torch.no_grad():
+            if not stop():
+                if self.height_assign and not self.constrained:
+                    self.assign_heights_step()
+                if self.constrained:
+                    # The same 60 draws (live and running-average parameters,
+                    # in the order the unconstrained loop takes them), judged
+                    # in one pass: the parameters don't change between them.
+                    draws = [np.random.randint(0, 1000000) for _ in range(120)]
+                    ema = getattr(self, "_ema", None) is not None
+                    self._maybe_update_best_discrete((draws[0::2], draws[1::2]) if ema else (draws[:60], None))
+                else:
+                    for _ in range(60):
+                        self._maybe_update_best_discrete()
+            if not stop() and self.bg_logits is not None:
+                report("Choosing the base filament", 0.0)
+                self.search_background(progress=lambda f: report("Choosing the base filament", f))
+            if not stop() and getattr(self.args, "constrained_opt", False):
+                report("Refining within the limits", 0.0)
+                self.constrained_local_search(
+                    compound=True,
+                    should_stop=should_stop,
+                    progress=lambda f: report("Refining within the limits", f),
+                )
+            self.end_check_scope()
 
     def release_cuda_graph(self) -> None:
         """Drop the captured graph and its private memory pool.
@@ -1875,7 +1954,7 @@ class FilamentOptimizer:
 
         Args:
             best (bool, optional): Whether to use the best solution. Defaults to False.
-            custom_height_logits (torch.Tensor, optional): Custom height logits to use. We currently use this for the full size image. Defaults to None.
+            custom_height_logits (torch.Tensor, optional): Pixel height logits to use instead of the solution's (the solution's height offsets are applied on top unless apply_height_offset is False). Defaults to None.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Discrete global assignment and pixel-height map.
@@ -1883,15 +1962,20 @@ class FilamentOptimizer:
         if best and self.best_params is None:
             return None, None
 
-        current_params = self.best_params.copy() if best else self.params
+        # A copy either way: the custom logits must never be written into
+        # the live training dict (self.params) or the stored best solution.
+        current_params = dict(self.best_params if best else self.params)
         if custom_height_logits is not None:
-            current_params["pixel_height_logits"] = self._apply_height_offset(
-                custom_height_logits
-            ) if apply_height_offset else custom_height_logits
+            # discretize_solution applies the solution's height offsets to
+            # pixel_height_logits itself (offsetting them here as well added
+            # them twice); already-effective logits get zero offsets instead.
+            current_params["pixel_height_logits"] = custom_height_logits
+            if not apply_height_offset:
+                current_params["height_offsets"] = torch.zeros_like(current_params["height_offsets"])
 
         if best:
             disc_global, disc_height_image = self.discretize_solution(
-                self.best_params,
+                current_params,
                 self.vis_tau,
                 self.h,
                 self.max_layers,
@@ -2102,15 +2186,7 @@ class FilamentOptimizer:
         def _prune_callback(_optimizer, _percent):
             # Update the matplotlib preview during pruning steps
             self._draw_prune_preview()
-            if self.preview_callback is not None:
-                try:
-                    self.preview_callback(_optimizer, _percent, phase=self._current_prune_phase)
-                except TypeError:
-                    # Callers that don't accept the `phase` kwarg (e.g. a
-                    # plain matplotlib-only callback) still work.
-                    self.preview_callback(_optimizer, _percent)
-                except Exception:
-                    pass
+            self._call_preview_callback(_optimizer, _percent, phase=self._current_prune_phase)
 
         if _wait_if_paused():
             return False
@@ -2486,19 +2562,11 @@ class FilamentOptimizer:
         changes the color/swap/layer counts at all, so the loss is the only
         place their progress is visible.
         """
-        callback = self.preview_callback
-        if callback is None:
-            return
         phase = getattr(self, "_current_prune_phase", None)
-        for kwargs in ({"phase": phase, "loss": loss}, {"phase": phase}, {}):
-            try:
-                callback(self, float(percent), **kwargs)
-                return
-            except TypeError:
-                # Older callbacks accept fewer keywords; fall back in turn.
-                continue
-            except Exception:
-                return
+        _call_preview_callback(self, self, float(percent), phase=phase, loss=loss)
+
+    def _call_preview_callback(self, *args, **kwargs) -> None:
+        _call_preview_callback(self, *args, **kwargs)
 
     def polish_height_offsets(
         self, num_steps: int = 50, progress_callback=None
@@ -2688,65 +2756,82 @@ class FilamentOptimizer:
         steps_since_best = 0
         patience = max(10, num_steps // 4)
 
-        with torch.enable_grad():
-            ft_offsets = orig_offsets.clone().requires_grad_(True)
-            ft_optimizer = CAdamW([ft_offsets], lr=lr)
-            tbar = tqdm(range(num_steps), desc="Fine-tuning height", leave=True)
-            for step_idx in tbar:
-                if progress_callback is not None:
-                    progress_callback(100.0 * step_idx / max(num_steps, 1), best_loss)
-                ft_optimizer.zero_grad()
+        def score(offsets: torch.Tensor) -> float:
+            self.best_params["height_offsets"] = offsets.detach()
+            dg_step, _ = self.get_discretized_solution(best=True)
+            return _compute_loss_for_heightmap(self, dg_step)
 
-                effective_logits = self._apply_height_offset(pixel_logits, ft_offsets)
+        # try/finally: an exception (an OOM in the full-resolution backward)
+        # must not leave best_params on a half-tuned tensor.
+        try:
+            with torch.enable_grad():
+                ft_offsets = orig_offsets.clone().requires_grad_(True)
+                ft_optimizer = CAdamW([ft_offsets], lr=lr)
+                tbar = tqdm(range(num_steps), desc="Fine-tuning height", leave=True)
+                stopped_early = False
+                for step_idx in tbar:
+                    if progress_callback is not None:
+                        progress_callback(100.0 * step_idx / max(num_steps, 1), best_loss)
+                    ft_optimizer.zero_grad()
 
-                self.best_params["height_offsets"] = ft_offsets.detach()
-                dg_step, _ = self.get_discretized_solution(best=True)
-                s_loss = _compute_loss_for_heightmap(self, dg_step)
+                    effective_logits = self._apply_height_offset(pixel_logits, ft_offsets)
 
-                if s_loss < best_loss:
-                    best_loss = s_loss
-                    best_offsets = ft_offsets.detach().clone()
-                    steps_since_best = 0
-                else:
-                    steps_since_best += 1
-                tbar.set_description(
-                    f"Pre_Loss: {pre_loss:.4f} Best: {best_loss:.4f}"
-                )
-                if steps_since_best > patience:
-                    break
+                    s_loss = score(ft_offsets)
 
-                loss = loss_fn(
-                    {
-                        "pixel_height_logits": effective_logits,
-                        "global_logits": fixed_global_logits,
-                    },
-                    target=self.target,
-                    tau_height=1.0,
-                    tau_global=1.0,
-                    h=self.h,
-                    max_layers=self.max_layers,
-                    material_colors=self.material_colors,
-                    material_TDs=self.material_TDs,
-                    background=self.background,
-                    add_penalty_loss=10.0,
-                    focus_map=self.focus_map,
-                    alpha=self.alpha,
-                    compute_dtype=self.composite_compute_dtype,
-                    # The only backward in the pipeline that runs at full
-                    # *output* resolution, so it sets the whole run's VRAM
-                    # high-water mark: the fused kernel (recompute backward,
-                    # nothing per layer kept) where it runs, else the
-                    # layer-chunked composite.
-                    low_memory=not _fused_cont_available(self.material_colors),
-                )
-                loss.backward()
-                ft_optimizer.step()
+                    if s_loss < best_loss:
+                        best_loss = s_loss
+                        best_offsets = ft_offsets.detach().clone()
+                        steps_since_best = 0
+                    else:
+                        steps_since_best += 1
+                    tbar.set_description(
+                        f"Pre_Loss: {pre_loss:.4f} Best: {best_loss:.4f}"
+                    )
+                    if steps_since_best > patience:
+                        stopped_early = True
+                        break
 
-        if best_loss < pre_loss:
-            self.best_params["height_offsets"] = best_offsets
+                    loss = loss_fn(
+                        {
+                            "pixel_height_logits": effective_logits,
+                            "global_logits": fixed_global_logits,
+                        },
+                        target=self.target,
+                        tau_height=1.0,
+                        tau_global=1.0,
+                        h=self.h,
+                        max_layers=self.max_layers,
+                        material_colors=self.material_colors,
+                        material_TDs=self.material_TDs,
+                        background=self.background,
+                        add_penalty_loss=10.0,
+                        focus_map=self.focus_map,
+                        alpha=self.alpha,
+                        compute_dtype=self.composite_compute_dtype,
+                        # The only backward in the pipeline that runs at full
+                        # *output* resolution, so it sets the whole run's VRAM
+                        # high-water mark: the fused kernel (recompute backward,
+                        # nothing per layer kept) where it runs, else the
+                        # layer-chunked composite.
+                        low_memory=not _fused_cont_available(self.material_colors),
+                    )
+                    loss.backward()
+                    ft_optimizer.step()
+
+                # Each step scores the offsets it starts from, so the last step's
+                # result has not been scored yet.
+                if num_steps > 0 and not stopped_early:
+                    s_loss = score(ft_offsets)
+                    if s_loss < best_loss:
+                        best_loss = s_loss
+                        best_offsets = ft_offsets.detach().clone()
+        finally:
+            improved = best_loss < pre_loss
+            self.best_params["height_offsets"] = best_offsets if improved else orig_offsets
+
+        if improved:
             self.best_discrete_loss = best_loss
             return True
-        self.best_params["height_offsets"] = orig_offsets
         return False
 
     CHECK_SCOPE_MAX_PIXELS = 65536

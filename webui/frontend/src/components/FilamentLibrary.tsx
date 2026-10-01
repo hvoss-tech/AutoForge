@@ -8,6 +8,7 @@ import { EditFilamentModal } from './EditFilamentModal'
 import { sortFilaments, type FilamentSort } from '../lib/library'
 import { onUiCommand } from '../lib/uiEvents'
 import { useFlash } from '../hooks/usePersistentState'
+import { downloadBlob } from '../lib/download'
 
 interface BrandGroup {
   name: string
@@ -103,15 +104,7 @@ export const FilamentLibrary: React.FC<{ onCollapse?: () => void }> = ({ onColla
     try {
       const res = await fetch('/api/filaments')
       const all = await res.json()
-      const blob = new Blob([JSON.stringify(all, null, 2)], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = 'filament_library.json'
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      URL.revokeObjectURL(url)
+      downloadBlob(new Blob([JSON.stringify(all, null, 2)], { type: 'application/json' }), 'filament_library.json')
     } catch (e) {
       pushToast(`Failed to export filament library: ${e instanceof Error ? e.message : String(e)}`)
     }

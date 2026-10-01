@@ -59,7 +59,7 @@ const ADVANCED_FIELDS: Field[] = [
   { key: 'min_layers', label: 'Min layers', help: 'Lower limit of color layers.', type: 'number', step: 1, min: 0, integer: true },
   { key: 'processing_reduction_factor', label: 'Processing reduction', help: 'Works on a downscaled image during optimization. Higher is faster and uses less memory, with less detail.', type: 'number', step: 1, min: 1, integer: true },
   { key: 'nozzle_diameter', label: 'Nozzle diameter', unit: 'mm', help: 'Details finer than the nozzle cannot be printed and are smoothed away.', type: 'number', step: 0.05, min: 0.1 },
-  { key: 'num_init_rounds', label: 'Init rounds', help: 'Number of attempts when estimating the starting heights; the best is kept.', type: 'number', step: 1, min: 1, integer: true },
+  { key: 'num_init_rounds', label: 'Init rounds', help: 'Attempts at estimating the starting heights. Extra rounds currently give the same result, so only one is run.', type: 'number', step: 1, min: 1, integer: true },
   { key: 'num_init_cluster_layers', label: 'Cluster layers', help: 'Number of height levels used by color clustering (-1 = automatic).', type: 'number', step: 1, min: -1, integer: true },
 ]
 

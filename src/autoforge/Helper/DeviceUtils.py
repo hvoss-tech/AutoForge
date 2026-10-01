@@ -139,6 +139,19 @@ def resolve_device(spec: Optional[str] = None, args=None) -> torch.device:
     return torch.device("cpu")
 
 
+def activate_device(device: Optional[torch.device]) -> None:
+    """Make ``device`` the current CUDA device of the calling thread.
+
+    Triton kernels and CUDA graph capture run on the *current* device, not
+    on the device of their tensors, so ``--device cuda:1`` without this
+    launched the fused kernels on GPU 0 with pointers into GPU 1. The
+    current device is per thread: every thread that runs GPU work for a
+    run (the webui's job, pruning and render threads) has to call this."""
+    # A bare "cuda" means the current device already; set_device needs an index.
+    if device is not None and device.type == "cuda" and device.index is not None and cuda_is_available():
+        torch.cuda.set_device(device)
+
+
 def _device_is_usable(device: torch.device) -> bool:
     if device.type == "cuda":
         if not cuda_is_available():

@@ -4,9 +4,12 @@ webui/frontend/src/lib/telemetry.ts). Disabled whenever the frontend's
 /api/system/telemetry endpoint would report disabled — same config, same
 --no-telemetry / AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false switch.
 
-No image data, filament data, or file paths are sent — only the exception
-type, message, traceback, and a small context dict (e.g. job phase) callers
-pass in explicitly.
+No image data, filament data or other user information is sent - only the
+exception type, message, traceback, and a small context dict (e.g. job
+phase) callers pass in explicitly. The message and traceback can contain
+file paths (the install location, which may include the user's home folder
+and name, and file names such as an input image's), and the request path of
+a failed API call is sent as context.
 """
 import logging
 import traceback

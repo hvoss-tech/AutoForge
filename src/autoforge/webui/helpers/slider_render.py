@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 import torch
 
+from autoforge.Helper.DeviceUtils import activate_device
 from autoforge.Helper.FilamentHelper import hex_to_rgb
 from autoforge.Helper.OptimizerHelper import (
     _layer_opacity,
@@ -111,7 +112,8 @@ def _resolve_slider_materials(
             # anymore) — fall back to the slider's own td and a neutral
             # gray so the render still succeeds instead of erroring out.
             colors[i] = [0.5, 0.5, 0.5]
-            tds[i] = float(s.get("td", 5.0))
+            # `or`: a slider can carry td: null, which float() rejected.
+            tds[i] = float(s.get("td") or 5.0)
     return colors, tds
 
 
@@ -226,6 +228,8 @@ def compute_slider_render(
     """
     optimizer = pipeline_result["optimizer"]
     args = pipeline_result["args"]
+    # Renders run on worker threads; the current CUDA device is per thread.
+    activate_device(pipeline_result.get("device"))
     # The job's own edge bleed (another job may have set a different one).
     set_edge_bleed(float(getattr(args, "edge_bleed", EDGE_BLEED)))
     background: torch.Tensor = pipeline_result["background"]
@@ -284,13 +288,15 @@ def _cached_top_vertex_pixels(pipeline_result: dict[str, Any], hw: tuple[int, in
     """Which pixel each top mesh vertex shows. It depends only on the grid
     size and the alpha mask — never on heights or colors — so it is computed
     once per result instead of on every edit."""
-    key = (int(hw[0]), int(hw[1]), preview_mesh_max_dim(),
-           id(pipeline_result.get("alpha")), id(pipeline_result.get("alpha_proc")))
+    key = (int(hw[0]), int(hw[1]), preview_mesh_max_dim())
+    # The alpha arrays themselves, compared by identity: an id() alone could
+    # match a new array that reused a freed one's address.
+    sources = (pipeline_result.get("alpha"), pipeline_result.get("alpha_proc"))
     cached = pipeline_result.get("_top_vertex_pixels")
-    if cached is not None and cached[0] == key:
-        return cached[1]
+    if cached is not None and cached[0] == key and all(a is b for a, b in zip(cached[1], sources)):
+        return cached[2]
     idx = top_vertex_pixel_indices(int(hw[0]), int(hw[1]), alpha)
-    pipeline_result["_top_vertex_pixels"] = (key, idx)
+    pipeline_result["_top_vertex_pixels"] = (key, sources, idx)
     return idx
 
 

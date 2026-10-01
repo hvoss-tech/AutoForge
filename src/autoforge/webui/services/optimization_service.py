@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import uuid
 import threading
 from typing import Optional
@@ -183,6 +184,21 @@ class OptimizationService:
                 self._pipeline_results[new_job_id] = result
                 result[OWNER_KEY] = new_job_id
 
+    def complete_prune(self, prune_job_id: str, job_id: str, **kwargs) -> bool:
+        """Finish a prune atomically: hand ``job_id``'s result to the prune
+        job (see alias_pipeline_result) and mark it completed - or neither,
+        when the prune job already reached a terminal state (a cancel that
+        landed while the result was being saved). Done separately, the
+        alias went through while the "completed" update was dropped, leaving
+        the frontend on ``job_id``, which no longer owned its result."""
+        with self._lock:
+            js = self._jobs.get(prune_job_id)
+            if js is None or js.status in TERMINAL_STATUSES:
+                return False
+            self.alias_pipeline_result(prune_job_id, job_id)
+            self._update_status_locked(prune_job_id, "completed", **kwargs)
+            return True
+
     def clear_pipeline_result(self, job_id: str):
         with self._lock:
             result = self._pipeline_results.pop(job_id, None)
@@ -281,6 +297,16 @@ class OptimizationService:
             self._settings.pop(jid, None)
             self._cancel_events.pop(jid, None)
             self._pause_events.pop(jid, None)
+            # Its output folder too (STL, meshes: tens of MB each) - unless a
+            # live result still points at it.
+            if jid not in self._pipeline_results:
+                self._remove_job_dir(jid)
+
+    def _remove_job_dir(self, job_id: str) -> None:
+        root = os.path.realpath(self._checkpoints_dir)
+        path = os.path.realpath(os.path.join(root, job_id))
+        if path.startswith(root + os.sep) and os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
 
     def update_status(self, job_id: str, status: str, **kwargs) -> JobStatus | None:
         with self._lock:
