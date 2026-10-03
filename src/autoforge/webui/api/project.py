@@ -3,6 +3,7 @@ import os
 from fastapi import APIRouter, HTTPException
 from ..models import ProjectState
 from ..config import config
+from ..services.project_service import atomic_write_json
 
 router = APIRouter()
 
@@ -19,7 +20,7 @@ async def get_project_state():
     path = _state_file()
     if os.path.exists(path):
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 # A non-object top level (e.g. an old-format file that was a
@@ -38,6 +39,5 @@ async def save_project_state(state: ProjectState):
     _state = state
     path = _state_file()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(state.model_dump(), f, indent=2)
+    atomic_write_json(path, state.model_dump())
     return {"status": "ok"}

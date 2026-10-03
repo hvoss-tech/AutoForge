@@ -53,3 +53,10 @@ export function pruningPollStep(
   if (response.jobStatus && ['completed', 'failed', 'cancelled'].includes(response.jobStatus)) return 'done'
   return 'continue'
 }
+
+/** Whether a finished prune may become the current job: only while the
+ * result it started from is still the one on screen. Undoing (or jumping in
+ * History) during a prune used to be overridden when the prune finished. */
+export function adoptsPrunedResult(currentJobId: string | undefined | null, sourceJobId: string): boolean {
+  return currentJobId === sourceJobId
+}

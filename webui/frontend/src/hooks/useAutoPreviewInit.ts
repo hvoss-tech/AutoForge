@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react'
-import { useAppStore } from '../store/appStore'
+import { useEffect, useRef, useState } from 'react'
+import { initRetryDelay, useAppStore } from '../store/appStore'
 
 /** Builds the auto-preview (heightmap init) whenever there's at least one
  * active filament and the *current* input image hasn't been initialised yet —
@@ -28,6 +28,10 @@ export function useAutoPreviewInit() {
   // An init that failed (bad image, out of memory) must not be retried in a
   // loop just because it left the status back at "idle".
   const failedFor = useRef<string | null>(null)
+  // After a 'busy' answer (another init — e.g. another tab's — is running),
+  // wait before asking again (see initRetryDelay). Re-posting at once looped
+  // as fast as the round trip for as long as that other build took.
+  const [retryTick, setRetryTick] = useState(0)
 
   useEffect(() => {
     if (!inputImage) return
@@ -41,6 +45,11 @@ export function useAutoPreviewInit() {
     if (hasResult) return
     if (initStatus === 'initializing' || initStatus === 'ready') return
     if (inputImage === lastInitImage.current && failedFor.current === inputImage) return
+    const wait = initRetryDelay()
+    if (wait > 0) {
+      const timer = setTimeout(() => setRetryTick((t) => t + 1), wait)
+      return () => clearTimeout(timer)
+    }
 
     lastInitImage.current = inputImage
     const image = inputImage
@@ -49,5 +58,6 @@ export function useAutoPreviewInit() {
       // exactly right there, so only a real failure blocks further attempts.
       failedFor.current = outcome === 'error' ? image : null
     })
-  }, [activeCount, inputImage, initSkipImage, initStatus, hasResult, runInit])
+  }, [activeCount, inputImage, initSkipImage, initStatus, hasResult, runInit, retryTick])
 }
+

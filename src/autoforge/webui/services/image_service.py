@@ -1,3 +1,4 @@
+import hashlib
 import os
 import uuid
 from pathlib import Path
@@ -21,10 +22,17 @@ class ImageService:
         ext = Path(filename).suffix.lower()
         if ext not in _IMAGE_EXTENSIONS:
             ext = ".png"
-        image_id = str(uuid.uuid4()) + ext
+        # Named by content: the same file uploaded again (the focus-area
+        # mask is re-uploaded after every stroke, often unchanged; the same
+        # photo opened twice) reuses its copy instead of adding one more to
+        # a folder nothing ever cleans up.
+        image_id = hashlib.sha256(data).hexdigest()[:32] + ext
         dest = os.path.join(config.uploads_path, image_id)
-        with open(dest, "wb") as f:
-            f.write(data)
+        if not os.path.isfile(dest):
+            tmp = f"{dest}.{uuid.uuid4().hex}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, dest)
         return image_id
 
     def get_path(self, image_id: str) -> str | None:

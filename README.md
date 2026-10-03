@@ -56,7 +56,7 @@ The easiest way to use AutoForge is the web UI, a local app with drag-and-drop i
    - Windows: double-click `run_webui.bat`
 
    This starts the server and opens the web UI in your browser automatically (usually at `http://localhost:8000`).
-   It only listens on this computer by default, since the web UI has no login. To open it from other devices on your network, start it with `WEBUI_HOST=0.0.0.0 ./run_webui.sh` (Windows: `set WEBUI_HOST=0.0.0.0` before `run_webui.bat`).
+   It only listens on this computer by default, since the web UI has no login. To open it from other devices on your network, start it with `WEBUI_HOST=0.0.0.0 ./run_webui.sh` (Windows: `set WEBUI_HOST=0.0.0.0` before `run_webui.bat`). Open it by IP address or by this computer's name; any other name (for example one from a reverse proxy) has to be listed in `AUTOFORGE_WEBUI_ALLOWED_HOSTS` (comma separated).
 
    To make some parts of the picture come out closer than the rest (a face, the eyes, lettering), click **Focus** in the image panel and paint over them; a slider sets how much more they count (2× to 100×, default 10×). After a run, the **Differences** view shows where the print strays furthest from the picture.
 
@@ -64,7 +64,7 @@ The easiest way to use AutoForge is the web UI, a local app with drag-and-drop i
 
    To find a filament you own without measuring it yourself, click **Catalog** in the filament library. It searches every filament on [filamentcolors.xyz](https://filamentcolors.xyz) that has a measured TD (search by brand, color name, type or hex code; filter by type, brand or color family; or pick a color to see the closest matches first), and **Add** puts it straight into your library.
 
-   The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports (unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace) so bugs can get fixed faster. No image data, filament data or other personal information is sent, except that error messages and stack traces can contain file paths (for example the install folder, which may include your user name, or an image's file name). To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
+   The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports (unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace) so bugs can get fixed faster. No image data, filament data or other personal information is sent, except that error messages and stack traces can contain file paths (the backend replaces your home folder in them with `~`, so your user name isn't sent from there; the browser's own stack traces only name the app's script files). To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
 
 4. **Update to the latest release** whenever you want, from the project folder:
    - Linux/macOS: `./update.sh`

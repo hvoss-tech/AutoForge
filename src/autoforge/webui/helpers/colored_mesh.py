@@ -70,14 +70,14 @@ def _sample_grid(full_H: int, full_W: int, max_grid_dim: Optional[int]) -> tuple
 
 
 def _valid_mask(alpha_mask: Optional[np.ndarray], H: int, W: int) -> np.ndarray:
-    valid_mask: np.ndarray = (
-        np.ones((H, W), dtype=bool)
-        if alpha_mask is None
-        else (alpha_mask >= 128).squeeze()
-    )
-    if valid_mask.ndim == 3 and valid_mask.shape[-1] >= 1:
+    if alpha_mask is None:
+        return np.ones((H, W), dtype=bool)
+    # Only a trailing channel axis is dropped: squeeze() also dropped the
+    # real axis of a one-pixel-high or -wide image.
+    valid_mask = np.asarray(alpha_mask) >= 128
+    if valid_mask.ndim == 3:
         valid_mask = valid_mask[:, :, 0]
-    return valid_mask.astype(bool)
+    return valid_mask.reshape(H, W).astype(bool)
 
 
 def _quad_valid(valid_mask: np.ndarray) -> np.ndarray:

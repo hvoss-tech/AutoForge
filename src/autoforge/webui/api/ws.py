@@ -1,6 +1,7 @@
 import json
 import asyncio
 import logging
+import threading
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from ..services.optimization_service import get_optimization_service
 
@@ -13,16 +14,35 @@ _preview_connections: set[WebSocket] = set()
 _main_loop: asyncio.AbstractEventLoop | None = None
 
 
+# Per connection, the newest preview not yet handed to the socket. A slow
+# client used to get one queued send per preview (each a full base64 PNG),
+# piling up without bound; now a newer preview replaces an unsent one.
+_pending: dict[WebSocket, str] = {}
+_pending_lock = threading.Lock()
+
+
+async def _send_latest(ws: WebSocket) -> None:
+    with _pending_lock:
+        msg = _pending.pop(ws, None)
+    if msg is not None:
+        await ws.send_text(msg)
+
+
 def _send_to_all(msg: str):
     """Safely send a message to all connected preview clients (thread-safe)."""
-    global _main_loop
     # Iterate a copy: this runs on the optimizer's worker thread while the
     # event loop adds/discards connections, and iterating the live set then
     # raises "Set changed size during iteration", dropping the update.
     for ws in list(_preview_connections):
         try:
             if _main_loop and not _main_loop.is_closed():
-                future = asyncio.run_coroutine_threadsafe(ws.send_text(msg), _main_loop)
+                with _pending_lock:
+                    already_queued = ws in _pending
+                    _pending[ws] = msg
+                if already_queued:
+                    # The send scheduled for the older message takes this one.
+                    continue
+                future = asyncio.run_coroutine_threadsafe(_send_latest(ws), _main_loop)
                 # run_coroutine_threadsafe only schedules the coroutine — it
                 # returns immediately, so the try/except around it can never
                 # observe a failed send() (that happens later, on the event
@@ -40,6 +60,8 @@ def _drop_on_failure(future: "asyncio.Future", ws: WebSocket) -> None:
     mutating the set directly here is safe."""
     if future.cancelled() or future.exception() is not None:
         _preview_connections.discard(ws)
+        with _pending_lock:
+            _pending.pop(ws, None)
 
 
 def encode_png_b64(img) -> str:
@@ -124,9 +146,10 @@ async def ws_optimize(websocket: WebSocket, job_id: str):
             await asyncio.sleep(0.5)
     except WebSocketDisconnect:
         pass
-    finally:
+    except Exception:
+        # A send on a socket the client already dropped (no clean close).
         if not sent_terminal:
-            pass
+            logger.debug("Job status socket for %s closed", job_id, exc_info=True)
 
 
 @router.websocket("/ws/preview")
@@ -142,3 +165,5 @@ async def ws_preview(websocket: WebSocket):
         pass
     finally:
         _preview_connections.discard(websocket)
+        with _pending_lock:
+            _pending.pop(websocket, None)

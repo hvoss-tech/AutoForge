@@ -456,9 +456,12 @@ def refine_stack_palette(
     max_colors: int = 10**9,
     max_swaps: int = 10**9,
     sweeps: int = 4,
+    window: int = 0,
 ) -> torch.Tensor:
     """Coordinate descent over layer materials under ``palette_loss_fn``.
-    Returns the new stack (does not touch the optimizer's solution)."""
+    ``window`` > 0 only tries the materials within that many layers of each
+    layer (as refine_layer_materials). Returns the new stack (does not touch
+    the optimizer's solution)."""
     from autoforge.Helper.PruningHelper import find_color_bands
 
     dg, _ = optimizer.get_discretized_solution(best=True)

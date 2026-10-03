@@ -312,7 +312,13 @@ def _edited_replacements(job_id: str, job_dir: str, project: dict[str, Any] | No
             if isinstance(f, dict) and f.get("uuid"):
                 filaments.setdefault(str(f["uuid"]), f)
         try:
-            replace.update(write_edited_outputs(result, sliders, filaments, edit_dir))
+            # A base picked by hand turns auto-selection off (setBaseFilament);
+            # with it on, settings.background_color is not the base the run used.
+            settings = (project or {}).get("settings") or {}
+            edited_base = None if settings.get("auto_background_color", True) else settings.get("background_color")
+            replace.update(write_edited_outputs(
+                result, sliders, filaments, edit_dir, background_color=edited_base,
+            ))
         except Exception:
             logging.getLogger(__name__).exception("Could not regenerate the edited instructions for %s", job_id)
     return replace

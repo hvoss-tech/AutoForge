@@ -51,7 +51,7 @@ test = [
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
-autoforge = ["data/*.json"]
+autoforge = ["data/*.json", "default_materials.csv"]
 
 [project.scripts]
 autoforge = "autoforge.auto_forge:main"

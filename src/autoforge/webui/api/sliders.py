@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter
 from ..services.optimization_service import get_optimization_service
 from ..helpers.sliders import (
@@ -14,6 +16,12 @@ _DEFAULTS = {"sliders": [], "min_layer": 0, "max_layer": 75}
 
 @router.get("/from-optimizer")
 async def get_sliders_from_optimizer(job_id: str | None = None):
+    # Off the event loop: deriving the stack discretizes the solution on the
+    # GPU, which stalled every other request and websocket meanwhile.
+    return await asyncio.to_thread(_sliders_from_optimizer, job_id)
+
+
+def _sliders_from_optimizer(job_id: str | None = None):
     """Return the slider stack derived from a completed job.
 
     The response shape is ``{"sliders": [...], "min_layer": int, "max_layer":

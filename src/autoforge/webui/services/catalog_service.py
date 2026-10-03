@@ -144,7 +144,7 @@ def get_catalog_service() -> CatalogService:
                 from ..config import config
 
                 _service = CatalogService(
-                    library_path=config.library_dir,
+                    library_path=config.library_path,
                     min_check_interval=config.filamentcolors_check_interval_hours * 3600.0,
                 )
     return _service

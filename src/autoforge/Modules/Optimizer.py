@@ -1387,18 +1387,32 @@ class FilamentOptimizer:
         if g0["weight_decay"] != 0.0 or not g0["correct_bias"]:
             return False
         steps = set()
+        trained = self._trained_params()
+        if not trained:
+            return False
         for g in groups:
             for p in g["params"]:
+                if not any(p is t for t in trained):
+                    continue
                 st = opt.state.get(p, {})
                 if p.grad is None or "exp_avg" not in st:
                     return False
                 steps.add(st["step"])
         return len(steps) == 1 and getattr(self, "_ema", None) is not None
 
+    def _trained_params(self) -> list:
+        """The optimizer's parameters that are actually trained. With
+        --height_assign (the default) the height offsets and the smooth field
+        are frozen: they never get a gradient or optimizer state, and
+        requiring one for every parameter kept the update graph from ever
+        being captured on the default path."""
+        return [p for g in self.optimizer.param_groups for p in g["params"] if p.requires_grad]
+
     def _update_body(self) -> None:
         from autoforge.Helper import FusedComposite as fc
 
         opt = self.optimizer
+        trained = self._trained_params()
         neg_ss = self._upd_table.index_select(0, self._upd_j.view(1))  # [1]
         # Small contiguous fp32 parameters: the whole CAdamW step and the
         # running average in one kernel each (else ~20 small ops).
@@ -1408,11 +1422,13 @@ class FilamentOptimizer:
         fused_all = fc._HAS_TRITON and all(
             p.is_cuda and p.dtype == torch.float32 and p.is_contiguous() and p.numel() <= fc.CADAMW_MAX
             and (ema_of.get(p.data_ptr()) is None or ema_of[p.data_ptr()].numel() == p.numel())
-            for g in opt.param_groups for p in g["params"]
+            for p in trained
         )
         for group in opt.param_groups:
             beta1, beta2 = group["betas"]
             for p in group["params"]:
+                if not any(p is t for t in trained):
+                    continue
                 grad = p.grad
                 state = opt.state[p]
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
@@ -1431,6 +1447,14 @@ class FilamentOptimizer:
             self._dual_step()
         if not fused_all:
             self._ema_update()
+        else:
+            # The fused kernel averaged the trained parameters; the frozen
+            # ones get the same update _ema_update gives them.
+            trained_ptrs = {p.data_ptr() for p in trained}
+            rest = [(e, t) for t, e in zip(self._ema_tensors(), self._ema) if t.data_ptr() not in trained_ptrs]
+            if rest:
+                torch._foreach_mul_([e for e, _ in rest], self.EMA_DECAY)
+                torch._foreach_add_([e for e, _ in rest], [t.detach() for _, t in rest], alpha=1.0 - self.EMA_DECAY)
 
     @torch.no_grad()
     def _maybe_capture_update(self) -> None:
@@ -1449,7 +1473,7 @@ class FilamentOptimizer:
         opt = self.optimizer
         g0 = opt.param_groups[0]
         beta1, beta2 = g0["betas"]
-        k0 = next(iter(opt.state.values()))["step"]  # updates done so far
+        k0 = opt.state[self._trained_params()[0]]["step"]  # updates done so far
         warmup = int(self.args.iterations * self.args.learning_rate_warmup_fraction)
         n0 = self.num_steps_done + 1  # the next step's index (this one is done)
         table = []
@@ -1724,8 +1748,10 @@ class FilamentOptimizer:
         # deterministic_gumbel_softmax + argmax loop (see
         # batched_layer_material_indices): identical selection, one kernel
         # instead of ~max_layers tiny ones.
+        # A negative seed means "unseeded" and reads as 0, as in
+        # composite_image_disc; passed on as is it offset every layer's draw.
         discrete_global = batched_layer_material_indices(
-            global_logits, tau_global, rng_seed
+            global_logits, tau_global, rng_seed if rng_seed is not None and rng_seed >= 0 else 0
         )
         return discrete_global, discrete_height_image
 
@@ -1987,7 +2013,7 @@ class FilamentOptimizer:
             with torch.no_grad():
                 disc_global, disc_height_image = self.discretize_solution(
                     current_params,
-                    tau_height,
+                    tau_global,
                     self.h,
                     self.max_layers,
                     rng_seed=random.randrange(1, 1000000),
@@ -2704,6 +2730,7 @@ class FilamentOptimizer:
                 with open(
                     os.path.join(self.args.output_folder, "spike_removal_stats.txt"),
                     "a",
+                    encoding="utf-8",
                 ) as f:
                     f.write(
                         f"post_prune,threshold_layers={self.args.spike_threshold_layers},"

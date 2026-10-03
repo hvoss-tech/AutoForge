@@ -140,7 +140,11 @@ const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
     // Colors published while this file downloads are newer than the file.
     const loadStartSeq = currentColorSeq()
 
-    fetch(plyUrl)
+    // Aborted when the URL changes again: rapid version bumps used to leave
+    // several whole-mesh downloads running side by side, all but the last
+    // thrown away on arrival.
+    const abort = new AbortController()
+    fetch(plyUrl, { signal: abort.signal })
       .then(r => {
         // A 404/500 response body is JSON, not PLY bytes — reading it as
         // an arrayBuffer and handing it to the PLY parser produced the
@@ -206,14 +210,17 @@ const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
         invalidate()
       })
       .catch(err => {
-        if (!cancelled) {
+        if (!cancelled && !abort.signal.aborted) {
           console.error('Failed to load 3D model:', err)
           setError(err.message)
           setLoading(false)
         }
       })
 
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      abort.abort()
+    }
   }, [plyUrl, invalidate])
 
   useEffect(() => () => currentRef.current?.geom.dispose(), [])

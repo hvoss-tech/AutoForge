@@ -119,6 +119,9 @@ export const InputImagePanel: React.FC = () => {
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [zoom, setZoom] = useState<ZoomTransform>(IDENTITY_ZOOM)
   const [divider, setDivider] = useState(50)
+  // Removes a running divider drag's window listeners (see startDividerDrag).
+  const dividerDragCleanup = useRef<(() => void) | null>(null)
+  useEffect(() => () => dividerDragCleanup.current?.(), [])
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [flashing, flash] = useFlash()
   const headerRef = useRef<HTMLDivElement>(null)
@@ -323,9 +326,16 @@ export const InputImagePanel: React.FC = () => {
     const up = () => {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
+      dividerDragCleanup.current = null
     }
+    // pointercancel too (a touch drag taken over by a scroll), and on
+    // unmount: either used to leave the window listeners behind.
+    dividerDragCleanup.current?.()
+    dividerDragCleanup.current = up
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
   }
 
   const compareView = (

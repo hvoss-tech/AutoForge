@@ -28,6 +28,9 @@ def set_seed(args) -> Any:
 
 
 def perform_basic_check(args):
+    if not args.layer_height > 0:
+        print("Error: --layer_height must be greater than 0.", file=sys.stderr)
+        sys.exit(1)
     # Basic checks. With a tolerance: in floating point 0.28 / 0.04 is
     # 7.000000000000001, so an exact is_integer() rejected valid settings.
     ratio = args.background_height / args.layer_height

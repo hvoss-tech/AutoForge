@@ -8,6 +8,23 @@ from ..config import config
 MAX_SNAPSHOTS = 50
 
 
+def atomic_write_json(path: str, data) -> None:
+    """Write to a temp file and rename it into place: a crash in the middle
+    of an in-place write left truncated JSON, which the next start then
+    could not read (and silently dropped)."""
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class ProjectService:
     def __init__(self, snapshot_dir: str = ""):
         self._snapshots: dict[str, StateSnapshot] = {}
@@ -26,7 +43,7 @@ class ProjectService:
         for fname in sorted(os.listdir(self._snapshot_dir)):
             if fname.endswith(".json"):
                 try:
-                    with open(os.path.join(self._snapshot_dir, fname)) as f:
+                    with open(os.path.join(self._snapshot_dir, fname), encoding="utf-8") as f:
                         data = json.load(f)
                     snapshot = StateSnapshot(**data)
                     sid = data.get("_snapshot_id", os.path.splitext(fname)[0])
@@ -42,8 +59,7 @@ class ProjectService:
         path = self._snapshot_path(sid)
         data = snapshot.model_dump(by_alias=True)
         data["_snapshot_id"] = sid
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+        atomic_write_json(path, data)
         self._snapshots[sid] = snapshot
         # The client only ever keeps the newest MAX_SNAPSHOTS; without a cap
         # here the directory grew by one file per edit forever.

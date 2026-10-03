@@ -48,6 +48,11 @@ def _persist_loop(target: str) -> None:
             if write is None:
                 state["running"] = False
                 state["idle"].set()
+                # Nothing left to do for this target: forget it (the map
+                # gained an entry per job and kept it forever). A waiter
+                # holds the event itself; a new edit starts a fresh entry.
+                if _persist.get(target) is state:
+                    del _persist[target]
                 return
         try:
             write()

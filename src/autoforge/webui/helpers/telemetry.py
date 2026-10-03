@@ -7,9 +7,8 @@ webui/frontend/src/lib/telemetry.ts). Disabled whenever the frontend's
 No image data, filament data or other user information is sent - only the
 exception type, message, traceback, and a small context dict (e.g. job
 phase) callers pass in explicitly. The message and traceback can contain
-file paths (the install location, which may include the user's home folder
-and name, and file names such as an input image's), and the request path of
-a failed API call is sent as context.
+file paths; the user's home folder in them is replaced by ``~`` (see
+scrub_paths). The request path of a failed API call is sent as context.
 """
 import logging
 import traceback
@@ -63,6 +62,18 @@ def anon_distinct_id() -> str:
     return _anon_distinct_id()
 
 
+def scrub_paths(text: str) -> str:
+    """``text`` with the user's home folder replaced by ``~``: messages and
+    tracebacks carry absolute paths (the install location, input files),
+    and with them the user's account name."""
+    home = str(Path.home())
+    if not home or home in ("/", "\\"):
+        return text
+    for variant in {home, home.replace("\\", "/"), home.replace("/", "\\")}:
+        text = text.replace(variant, "~")
+    return text
+
+
 def _get_client():
     global _client, _client_built
     if _client_built:
@@ -90,12 +101,12 @@ def capture_exception(exc: BaseException, context: dict | None = None) -> None:
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         properties = {
             "$exception_type": type(exc).__name__,
-            "$exception_message": str(exc)[:_MAX_FIELD_LEN],
-            "$exception_stack_trace_raw": tb[-_MAX_FIELD_LEN:],
+            "$exception_message": scrub_paths(str(exc))[:_MAX_FIELD_LEN],
+            "$exception_stack_trace_raw": scrub_paths(tb)[-_MAX_FIELD_LEN:],
             "source": "backend",
         }
         if context:
-            properties.update(context)
+            properties.update({k: scrub_paths(v) if isinstance(v, str) else v for k, v in context.items()})
         client.capture(
             distinct_id=_anon_distinct_id(),
             event="$exception",

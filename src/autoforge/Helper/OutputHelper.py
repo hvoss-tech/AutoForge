@@ -243,7 +243,7 @@ def generate_project_file(
     }
 
     # Write out the project file as JSON
-    with open(project_filename, "w") as f:
+    with open(project_filename, "w", encoding="utf-8") as f:
         # allow_nan=False: a NaN that slipped through must fail here, loudly,
         # rather than produce a file HueForge cannot parse.
         json.dump(project_data, f, indent=4, allow_nan=False)
@@ -388,6 +388,19 @@ def _file_safe(name) -> str:
     return name
 
 
+def _unique_path(path: str, taken) -> str:
+    """``path``, or ``<stem>_2<ext>``, ``_3``... when an earlier file of this
+    export already has that name (two filaments with the same name and
+    colour wrote one STL over the other)."""
+    if path not in taken:
+        return path
+    stem, ext = os.path.splitext(path)
+    n = 2
+    while f"{stem}_{n}{ext}" in taken:
+        n += 1
+    return f"{stem}_{n}{ext}"
+
+
 def _rgb_to_hex(rgb) -> str:
     """``rrggbb`` of a 0-1 RGB triple, rounded like every other conversion
     (truncating turned a #808080 filament into 7f7f7f)."""
@@ -518,7 +531,7 @@ def generate_flatforge_stls(
         if not pieces:
             return None
 
-        filename = os.path.join(output_folder, f"{material_name}_{color_hex.lstrip('#')}.stl")
+        filename = _unique_path(os.path.join(output_folder, f"{material_name}_{color_hex.lstrip('#')}.stl"), stl_files)
         _save_stl_with_manifold_fix(np.concatenate(pieces, axis=0), filename)
         stl_files.append(filename)
         return filename
@@ -626,7 +639,9 @@ def _create_flatforge_box_mesh(max_height_map, min_height_map, z_offset,
     y = (H - 1 - i).astype(np.float32)
     
     # Scale to match maximum_x_y_size
-    original_max = max(W - 1, H - 1)
+    # max(..., 1): a one-pixel-wide map has no extent to scale (as in
+    # heightfield_mesh); dividing by zero here failed the whole export.
+    original_max = max(W - 1, H - 1, 1)
     scale = maximum_x_y_size / original_max
     x = x * scale
     y = y * scale

@@ -1050,12 +1050,23 @@ def cadamw_fused(p, grad, exp_avg, exp_avg_sq, ema, neg_step, beta1, beta2, eps,
     )
 
 
+def _mask_key(focus_map, alpha):
+    """What the cached loss weights were built from: the mask tensors
+    themselves and their in-place version counters. An ``id()`` alone matched
+    a new mask that reused a freed one's address, and missed in-place edits."""
+    return tuple((m, None if m is None else m._version) for m in (focus_map, alpha))
+
+
+def _same_key(a, b) -> bool:
+    return all(x[0] is y[0] and x[1] == y[1] for x, y in zip(a, b))
+
+
 def loss_weights(target: torch.Tensor, focus_map, alpha):
     """(target Lab fp32 [H,W,3], per-pixel weights [H,W], 1/(3 sum w)) as
     compute_loss weighs pixels, cached on the target tensor."""
-    key = (id(focus_map), id(alpha))
+    key = _mask_key(focus_map, alpha)
     cache = getattr(target, "_af_cont_loss", None)
-    if cache is None or cache[0] != key:
+    if cache is None or not _same_key(cache[0], key):
         from autoforge.Helper.ImageHelper import srgb_to_lab
         import torch.nn.functional as F
 
@@ -1214,9 +1225,9 @@ def _loss_inputs(optimizer):
     """(target Lab, per-pixel loss weights, their sum) for the optimizer's
     current target, cached on the target tensor."""
     t = optimizer.target
-    key = (id(optimizer.focus_map), id(optimizer.alpha))
+    key = _mask_key(optimizer.focus_map, optimizer.alpha)
     cache = getattr(t, "_af_fused_loss", None)
-    if cache is None or cache[0] != key:
+    if cache is None or not _same_key(cache[0], key):
         from autoforge.Helper.ImageHelper import srgb_to_lab
         from autoforge.Helper.PixelHeightRefine import _pixel_weights
 

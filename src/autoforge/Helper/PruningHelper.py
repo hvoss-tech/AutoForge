@@ -1060,14 +1060,33 @@ def prune_redundant_layers(
     from autoforge.Helper import FusedComposite as fc
 
     use_fused = fc.fused_available(optimizer.material_colors)
-    if use_fused:
-        with torch.no_grad():
-            best_loss = float(_fused_logits_loss(
-                optimizer, optimizer.best_params["pixel_height_logits"] + shared_height_offset,
-                optimizer.best_params["global_logits"], current_max_layers,
-            ))
-    else:
-        best_loss = get_initial_loss(current_max_layers, optimizer)
+
+    def _logits_loss(eff_logits, global_logits, n_layers) -> float:
+        """The loss every candidate and the baseline are judged by (one
+        scorer for both: the baseline used to come from the bf16 composite
+        while the candidates were scored in fp32)."""
+        with _gpu_lock, torch.no_grad():
+            if use_fused:
+                return float(_fused_logits_loss(optimizer, eff_logits, global_logits, n_layers))
+            comp = composite_image_disc(
+                eff_logits,
+                global_logits,
+                optimizer.vis_tau,
+                optimizer.vis_tau,
+                optimizer.h,
+                n_layers,
+                optimizer.material_colors,
+                optimizer.material_TDs,
+                optimizer.background,
+                rng_seed=optimizer.best_seed,
+            )
+            return compute_loss(comp, optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha).item()
+
+    best_loss = _logits_loss(
+        optimizer.best_params["pixel_height_logits"] + shared_height_offset,
+        optimizer.best_params["global_logits"],
+        current_max_layers,
+    )
 
     print(
         f"PRUNING: Layer - initial loss={best_loss:.4f}, initial layer={current_max_layers:d}"
@@ -1096,34 +1115,9 @@ def prune_redundant_layers(
             current_height=current_pixel_height,
         )
         eff_logits = cand_params["pixel_height_logits"] + shared_height_offset
-        if use_fused:
-            with _gpu_lock, torch.no_grad():
-                cand_loss = float(_fused_logits_loss(optimizer, eff_logits, cand_params["global_logits"], cand_max_layers))
-            return cand_loss, cand_params, cand_max_layers
-        with _gpu_lock, torch.no_grad():
-            # The height map genuinely differs per removed-layer candidate,
-            # so the [L,H,W] effective-thickness prefix can't be shared here
-            # (unlike prune_num_colors/prune_num_swaps/rng_seed_search).
-            # Measured: routing through the eager material_select_from_logits
-            # + _compose_candidate path (no shared-prefix reuse to amortize)
-            # is a net *regression* here - it trades composite_image_disc's
-            # compiled TorchScript loop for two eager Python loops, and that
-            # per-op dispatch overhead outweighs the one .item() sync/layer
-            # it would have saved. Keep the jit-scripted call (already
-            # sync-free as of the composite_image_disc fix above).
-            cand_comp = composite_image_disc(
-                eff_logits,
-                cand_params["global_logits"],
-                optimizer.vis_tau,
-                optimizer.vis_tau,
-                optimizer.h,
-                cand_max_layers,
-                optimizer.material_colors,
-                optimizer.material_TDs,
-                optimizer.background,
-                rng_seed=optimizer.best_seed,
-            )
-            cand_loss = compute_loss(cand_comp, optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha).item()
+        # The height map genuinely differs per removed-layer candidate, so
+        # the [L,H,W] effective-thickness prefix can't be shared here.
+        cand_loss = _logits_loss(eff_logits, cand_params["global_logits"], cand_max_layers)
         return cand_loss, cand_params, cand_max_layers
 
     # ----------------------------------------------------------
@@ -1430,63 +1424,47 @@ def remove_outlier_pixels(
 
 def prune_fireflies(optimizer, start_threshold=10, auto_set=True):
     """
-    Iteratively reduces the threshold, computes the loss for each,
-    and returns the pixel_height_logits with the best loss.
+    Iteratively reduces the outlier threshold, computes the loss for each,
+    and keeps the height logits with the lowest loss (the unchanged logits
+    when no threshold improves on them).
 
     Args:
         optimizer: Object that provides get_best_discretized_image() and has target attribute.
-        compute_loss (function): Function to compute loss; expects parameters comp and target.
         start_threshold (float): Initial threshold value.
         auto_set (bool): Automatically set the best pixel_height_logits in the optimizer.
 
     Returns:
         best_custom_height_logits (torch.Tensor): The processed depth map with best loss.
-        best_threshold (float): The threshold value that achieved the best loss.
-        best_loss (float): The best loss achieved.
     """
-    # Generate a series of threshold values between start_threshold and end_threshold.
     pixel_height_logits = optimizer.best_params["pixel_height_logits"]
-    best_custom_height_logits = pixel_height_logits
-    best_threshold = start_threshold
-    th = start_threshold
 
-    with torch.no_grad():
-        out_im = optimizer.get_best_discretized_image(
-            custom_height_logits=pixel_height_logits
-        )
-        best_loss = compute_loss(
-            comp=out_im,
-            target=optimizer.target,
-            focus_map=optimizer.focus_map,
-            alpha=optimizer.alpha,
-        )
-    new_loss = best_loss
-    while th > 0.1:
-        # Apply your outlier removal with the current threshold.
-        custom_height_logits = remove_outlier_pixels(pixel_height_logits, threshold=th)
-
-        # Evaluate the resulting image by computing the loss.
+    def loss_of(height_logits) -> float:
         with torch.no_grad():
-            out_im = optimizer.get_best_discretized_image(
-                custom_height_logits=custom_height_logits
-            )
-            loss = compute_loss(
+            out_im = optimizer.get_best_discretized_image(custom_height_logits=height_logits)
+            return float(compute_loss(
                 comp=out_im,
                 target=optimizer.target,
                 focus_map=optimizer.focus_map,
                 alpha=optimizer.alpha,
-            )
+            ))
 
-        # print(f"Threshold: {th:.3f}, Loss: {loss:.4f}")
-        # Track the best performing threshold.
-        if loss < best_loss * 1.05:
-            new_loss = best_loss
+    best_custom_height_logits = pixel_height_logits
+    best_threshold = None
+    # The best loss so far, updated as thresholds are tried: comparing every
+    # threshold against the starting loss * 1.05 kept the last one within 5%
+    # of the start, i.e. accepted up to 5% worse results.
+    best_loss = start_loss = loss_of(pixel_height_logits)
+    th = start_threshold
+    while th > 0.1:
+        custom_height_logits = remove_outlier_pixels(pixel_height_logits, threshold=th)
+        loss = loss_of(custom_height_logits)
+        if loss < best_loss:
+            best_loss = loss
             best_custom_height_logits = custom_height_logits
             best_threshold = th
-
         th *= 0.95
 
-    print(f"New loss: {new_loss:.4f}, Best threshold: {best_threshold:.3f}")
+    print(f"Firefly pruning: loss {start_loss:.4f} -> {best_loss:.4f}, best threshold: {best_threshold}")
     if auto_set:
         optimizer.best_params["pixel_height_logits"] = best_custom_height_logits
 
@@ -1595,58 +1573,26 @@ def optimise_swap_positions(
 
     num_materials = optimizer.material_colors.shape[0]
 
-    # Tried sharing the [L,H,W] effective-thickness prefix here too (height
-    # never changes in this function, only which material occupies which
-    # layer) via material_select_from_logits + _compose_candidate, mirroring
-    # rng_seed_search. Measured net *slower* on the benchmark input: this
-    # phase typically evaluates few candidates per boundary (narrow ranges
-    # after layer pruning has already collapsed the layer count), so the
-    # two eager per-layer Python loops cost more than the single shared
-    # prefix computation saves. See results.tsv discard entry. Keep the
-    # jit-scripted composite_image_disc path.
-    #
-    # get_best_discretized_image itself would recompute _apply_height_offset
-    # (gather + a bicubic interpolate up to full output resolution, see the
-    # prune_redundant_layers height-offset-term fix) on every candidate even
-    # though height never changes here - call composite_image_disc directly
-    # with a once-computed effective_logits instead.
+    # The heights never change here, only which material occupies which
+    # layer: compute the effective logits once.
     eff_logits = (
         optimizer.best_params["pixel_height_logits"]
         + _compute_height_offset_term(
             optimizer, optimizer.best_params["pixel_height_logits"].shape
         )
     )
-    # Shared effective-thickness prefix for the batched boundary-position
-    # search below (height is invariant here) - unlike the discarded
-    # per-candidate eager-loop attempt above, _eval_candidates_batch does
-    # *true* batched material selection (_material_select_batched, one
-    # tensor op across the whole candidate group per layer) rather than a
-    # Python loop per candidate, so it doesn't pay the same per-candidate
-    # dispatch overhead that made that attempt a net regression.
-    shared_eff_thick = _eff_thick_from_logits(
+    # Shared scoring handle for the batched boundary-position search below
+    # (height is invariant here): only the whole-layer heights when the fused
+    # kernel scores, the full [L,H,W] thickness otherwise.
+    shared_eff_thick = _scoring_handle(
         eff_logits, optimizer.max_layers, optimizer.h, optimizer.vis_tau
     )
 
-    def disc_loss(dg_test: torch.Tensor) -> float:
-        logits_for_disc = disc_to_logits(dg_test, num_materials, big_pos=1e5)
-        with _gpu_lock, torch.no_grad():
-            out = composite_image_disc(
-                eff_logits,
-                logits_for_disc,
-                optimizer.vis_tau,
-                optimizer.vis_tau,
-                optimizer.h,
-                optimizer.max_layers,
-                optimizer.material_colors,
-                optimizer.material_TDs,
-                optimizer.background,
-                rng_seed=optimizer.best_seed,
-                compute_dtype=optimizer.composite_compute_dtype,
-            )
-            return compute_loss(comp=out, target=optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha).item()
-
     best_dg, _ = optimizer.get_discretized_solution(best=True)
-    best_loss = disc_loss(best_dg)
+    # The baseline by the same scorer as the candidates: a baseline from
+    # composite_image_disc (bf16) against fp32 candidate scores let a
+    # slightly worse stack through as an "improvement".
+    best_loss, _ = _eval_candidates_batch(optimizer, [best_dg], eff_thick=shared_eff_thick)
     print(f"PRUNING: Swap position - initial loss={best_loss:.4f}")
 
     outer_tbar = tqdm(desc="Optimising swap positions", total=100, leave=False)
@@ -1804,15 +1750,8 @@ def remove_height_spikes(
     dtype = disc_height.dtype
     threshold = float(threshold_layers)
 
-    # Pre-compute the 3x3 unfold once (it's the same every pass)
-    img = disc_height.float().view(1, 1, H, W)
-    img_pad = F.pad(img, (1, 1, 1, 1), mode="replicate")
-    windows = F.unfold(img_pad, kernel_size=3, padding=0, stride=1)  # [1, 9, H*W]
-    del img, img_pad
-
-    # Static: window values are always the first 9 rows of the unfold result.
-    # But after fixes we need to re-extract.  We'll recompute unfold each pass
-    # on the current data; it's still sub-millisecond for 1500x1500.
+    # The windows are re-extracted every pass from the current data (a fix
+    # changes its neighbours' windows); sub-millisecond at 1500x1500.
     total_spikes = 0
     # A copy: .contiguous() returned the caller's own tensor whenever it was
     # already contiguous, and the fixes below were written into it.
@@ -1841,7 +1780,6 @@ def remove_height_spikes(
         if n_this == 0:
             break
         total_spikes += n_this
-        print("Removed",n_this,"spikes...")
 
         # Replacement: median of non-outlier values
         wins_masked = wins.clone()

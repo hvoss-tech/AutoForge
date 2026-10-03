@@ -132,7 +132,7 @@ def main():
             # write summary
 
             out_path = BASE_OUTPUT_DIR / f"out_dict_{ts}.json"
-            with open(out_path, "w") as fp:
+            with open(out_path, "w", encoding="utf-8") as fp:
                 json.dump(results, fp, indent=2)
     print(f"Results saved to {out_path}")
 

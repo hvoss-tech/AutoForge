@@ -40,7 +40,7 @@ class OptimizationService:
         if not os.path.exists(path):
             return
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, IOError, ValueError):
             return
@@ -87,7 +87,7 @@ class OptimizationService:
                     record["settings"] = self._settings[job_id].model_dump(by_alias=True)
                 data[job_id] = record
             tmp_path = self._history_file() + ".tmp"
-            with open(tmp_path, "w") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp_path, self._history_file())
 

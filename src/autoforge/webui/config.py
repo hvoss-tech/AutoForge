@@ -8,6 +8,12 @@ class WebUIConfig(BaseSettings):
     # AUTOFORGE_WEBUI_HOST opens it to the network - there is no login.
     host: str = "127.0.0.1"
     port: int = 8000
+    # Extra host names the server may be reached under (comma separated),
+    # e.g. a LAN name or a reverse proxy's. localhost, IP addresses and this
+    # machine's own name are always accepted; any other Host header is
+    # refused, which is what stops DNS rebinding (a web page whose domain
+    # resolves to 127.0.0.1) from driving the API.
+    allowed_hosts: str = ""
     checkpoints_dir: str = "checkpoints"
     uploads_dir: str = "uploads"
     library_dir: str = "filament_library"

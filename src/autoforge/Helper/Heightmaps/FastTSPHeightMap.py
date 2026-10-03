@@ -406,8 +406,22 @@ def init_height_map(
         ordering_metric,
         cluster_layers,
         sil_score,
-        labels.reshape(H, W),
+        background_first_labels(labels.reshape(H, W), bg_cluster),
     )
+
+
+def background_first_labels(labels: np.ndarray, bg_label: int) -> np.ndarray:
+    """``labels`` with ``bg_label`` and 0 swapped. The optimizer reads label 0
+    as the background (its height offset stays 0, see
+    FilamentOptimizer._apply_height_offset); a raw k-means id 0 is just
+    whichever cluster came first, which then never got a trainable offset."""
+    bg_label = int(bg_label)
+    if bg_label == 0:
+        return labels
+    out = labels.copy()
+    out[labels == bg_label] = 0
+    out[labels == 0] = bg_label
+    return out
 
 
 # How long an idle init worker process lives (see run_init_threads).

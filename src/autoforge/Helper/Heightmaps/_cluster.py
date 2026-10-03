@@ -9,6 +9,8 @@ more than the clustering itself.
 * ``weighted_kmeans``: small weighted k-means in NumPy (k-means++ seeding).
 * ``silhouette``: the mean silhouette coefficient (Euclidean).
 """
+import threading
+from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
@@ -125,29 +127,55 @@ def kmeans(
 
         device = accelerator_device() or torch.device("cpu")
     dt = torch.float64 if device.type == "cpu" else torch.float32
-    prec = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("highest")  # exact distances, no TF32
+    with _highest_matmul_precision():  # exact distances, no TF32
+        return _kmeans(pixels, k, seed, max_iter, tol, init_size, device, chunk, dt)
+
+
+# The matmul precision is process-wide. Two k-means running at once (the
+# webui's init and a job thread) each saved and restored it, and in the wrong
+# order that left "highest" set for good; a counted lock restores the
+# original once the last one is done.
+_precision_lock = threading.Lock()
+_precision_users = 0
+_precision_saved: Optional[str] = None
+
+
+@contextmanager
+def _highest_matmul_precision():
+    global _precision_users, _precision_saved
+    with _precision_lock:
+        if _precision_users == 0:
+            _precision_saved = torch.get_float32_matmul_precision()
+            torch.set_float32_matmul_precision("highest")
+        _precision_users += 1
     try:
-        # Cast on the host: MPS can't hold the float64 input even briefly.
-        x = torch.from_numpy(np.ascontiguousarray(pixels, dtype=np.float64 if dt == torch.float64 else np.float32)).to(device)
-        n = x.shape[0]
-        k = min(k, n)
-        gen = torch.Generator(device=device).manual_seed(int(seed) % (2**63))
-        sub = torch.randperm(n, generator=gen, device=device)[: min(n, max(init_size, 3 * k))]
-        c = _kmeanspp(x[sub], k, gen)
-        thr = tol * float(x.var(0).mean())
-        for _ in range(max_iter):
-            labels = _assign(x, c, chunk)
-            sums, cnt = _segment_sums(x, labels, k)
-            new = torch.where(cnt.view(-1, 1) > 0, sums / cnt.clamp(min=1).view(-1, 1), c.to(sums.dtype)).to(dt)
-            shift = float((new - c).pow(2).sum())
-            c = new
-            if shift <= thr:
-                break
-        labels = _assign(x, c, chunk)
-        return c.cpu().double().numpy(), labels.cpu().numpy()
+        yield
     finally:
-        torch.set_float32_matmul_precision(prec)
+        with _precision_lock:
+            _precision_users -= 1
+            if _precision_users == 0:
+                torch.set_float32_matmul_precision(_precision_saved)
+
+
+def _kmeans(pixels, k, seed, max_iter, tol, init_size, device, chunk, dt):
+    # Cast on the host: MPS can't hold the float64 input even briefly.
+    x = torch.from_numpy(np.ascontiguousarray(pixels, dtype=np.float64 if dt == torch.float64 else np.float32)).to(device)
+    n = x.shape[0]
+    k = min(k, n)
+    gen = torch.Generator(device=device).manual_seed(int(seed) % (2**63))
+    sub = torch.randperm(n, generator=gen, device=device)[: min(n, max(init_size, 3 * k))]
+    c = _kmeanspp(x[sub], k, gen)
+    thr = tol * float(x.var(0).mean())
+    for _ in range(max_iter):
+        labels = _assign(x, c, chunk)
+        sums, cnt = _segment_sums(x, labels, k)
+        new = torch.where(cnt.view(-1, 1) > 0, sums / cnt.clamp(min=1).view(-1, 1), c.to(sums.dtype)).to(dt)
+        shift = float((new - c).pow(2).sum())
+        c = new
+        if shift <= thr:
+            break
+    labels = _assign(x, c, chunk)
+    return c.cpu().double().numpy(), labels.cpu().numpy()
 
 
 def weighted_kmeans(

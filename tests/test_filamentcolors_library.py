@@ -148,8 +148,11 @@ def test_bundled_catalog_is_valid():
 
 
 def test_bundled_catalog_is_declared_as_package_data():
-    with open(os.path.join(REPO_ROOT, "pyproject.toml")) as f:
-        assert 'autoforge = ["data/*.json"]' in f.read()
+    import tomllib
+
+    with open(os.path.join(REPO_ROOT, "pyproject.toml"), "rb") as f:
+        data = tomllib.load(f)
+    assert "data/*.json" in data["tool"]["setuptools"]["package-data"]["autoforge"]
 
 
 # ------------------------------------------------------------- crawling

@@ -23,6 +23,7 @@ def load_materials(args):
             - colors_list (list): List of color hex strings.
     """
     df = load_materials_pandas(args)
+    _check_material_table(df)
     # An empty CSV cell is NaN in pandas; str() turned it into "nan".
     material_names = [
         " - ".join(part for part in (_text(brand), _text(name)) if part)
@@ -37,6 +38,34 @@ def load_materials(args):
     material_TDs = np.array(material_TDs, dtype=np.float64)
     return material_colors, material_TDs, material_names, colors_list
 
+def _check_material_table(df) -> None:
+    """Exit with a message naming the problem instead of failing later: a
+    missing TD became NaN and turned the whole loss into NaN, and an empty
+    or malformed colour only failed once the run had started."""
+    problems = []
+    for column in ("Brand", "Name", "Color", "Transmissivity"):
+        if column not in df.columns:
+            problems.append(f"missing column '{column}'")
+    if not problems:
+        for row, (color, td) in enumerate(zip(df["Color"].tolist(), df["Transmissivity"].tolist()), start=1):
+            label = f"material {row} ({_text(df['Brand'].iloc[row - 1])} {_text(df['Name'].iloc[row - 1])})".strip()
+            try:
+                normalize_hex(color)
+            except ValueError:
+                problems.append(f"{label}: color {color!r} is not a hex color like #RRGGBB")
+            try:
+                td_value = float(td)
+            except (TypeError, ValueError):
+                td_value = float("nan")
+            if not np.isfinite(td_value) or td_value <= 0:
+                problems.append(f"{label}: transmissivity (TD) {td!r} must be a positive number")
+    if len(df) == 0:
+        problems.append("no materials")
+    if problems:
+        print("Error: invalid material file:\n  " + "\n  ".join(problems), file=sys.stderr)
+        sys.exit(1)
+
+
 def load_materials_pandas(args):
     csv_filename = args.csv_file
     json_filename = args.json_file
@@ -50,9 +79,13 @@ def load_materials_pandas(args):
             sys.exit(1)
     else:
         # read json
-        with open(json_filename, "r") as f:
+        with open(json_filename, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
-        if "Filaments" in data.keys():
+        if isinstance(data, list):
+            # A bare list of filaments (our own export) works as well as
+            # HueForge's {"Filaments": [...]}.
+            pass
+        elif isinstance(data, dict) and "Filaments" in data:
             data = data["Filaments"]
         else:
             print(
@@ -135,11 +168,11 @@ def extract_colors_from_swatches(swatch_data):
 
     # convert to the same format as the hueforge csv files
     material_names = [str(brand) + " - " + str(name) for (brand, name) in out.keys()]
-    material_colors = np.array(
-        [hex_to_rgb("#" + color) for color, _ in out.values()], dtype=np.float64
-    )
+    # normalize_hex: the swatch's hex may or may not carry the "#" ("#" +
+    # "#ff0000" failed), and colors_list is "#RRGGBB" like load_materials'.
+    colors_list = [normalize_hex(color) for color, _ in out.values()]
+    material_colors = np.array([hex_to_rgb(color) for color in colors_list], dtype=np.float64)
     material_TDs = np.array([td for _, td in out.values()], dtype=np.float64)
-    colors_list = [color for color, _ in out.values()]
 
     return material_colors, material_TDs, material_names, colors_list
 
@@ -162,7 +195,7 @@ def swatch_data_to_table(swatch_data):
                 "Brand": brand,
                 "Name": name,
                 "TD": td,
-                "HexColor": f"#{hex_color}",
+                "HexColor": "#" + str(hex_color).lstrip("#"),
                 "Uuid": str(uuid.uuid4()),
             }
         )

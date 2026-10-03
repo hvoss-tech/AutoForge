@@ -108,10 +108,13 @@ async def import_csv(body: dict | None = None, contents: str | None = None, mode
         # A row the Filament model rejects (e.g. a color that isn't hex) —
         # parsing happens before the library is touched, so nothing changed.
         raise HTTPException(400, f"The CSV has an invalid row: {_first_error_line(e)}")
+    skipped = svc.last_import_skipped
     return {
         "status": "ok",
-        "message": f"Imported {len(result)} filaments" + (" (library replaced)" if mode == "replace" else ""),
+        "message": f"Imported {len(result)} filaments" + (" (library replaced)" if mode == "replace" else "")
+        + (f"; skipped {skipped} without a transmissivity (TD)" if skipped else ""),
         "count": len(result),
+        "skipped": skipped,
     }
 
 

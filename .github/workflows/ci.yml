@@ -55,9 +55,11 @@ jobs:
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libgl1
       - name: Install AutoForge (backend the e2e suite launches)
+        # Editable, as the Dockerfile and run_webui.sh run it: server.py finds
+        # the built frontend relative to its own source file.
         run: |
           python -m pip install --upgrade pip
-          pip install .
+          pip install -e .
       - name: Install frontend dependencies
         working-directory: webui/frontend
         run: npm ci

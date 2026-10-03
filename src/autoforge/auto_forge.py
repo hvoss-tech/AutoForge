@@ -782,7 +782,7 @@ def _auto_select_background_color(
             args.background_material_name = None
         try:
             with open(
-                os.path.join(args.output_folder, "auto_background_color.txt"), "w"
+                os.path.join(args.output_folder, "auto_background_color.txt"), "w", encoding="utf-8"
             ) as f:
                 f.write(f"dominant_image_color={dominant_hex}\n")
                 f.write(f"chosen_filament_color={chosen_hex}\n")
@@ -1150,7 +1150,7 @@ def _prune_sweep(optimizer: FilamentOptimizer, args) -> None:
         results.append({"max_colors": colors, "max_swaps": swaps, "loss": loss,
                         "colors": n_colors, "swaps": n_swaps})
         print(f"PRUNE_SWEEP {colors}:{swaps} loss={loss:.4f} colors={n_colors} swaps={n_swaps}")
-    with open(os.path.join(args.output_folder, "prune_sweep.json"), "w") as f:
+    with open(os.path.join(args.output_folder, "prune_sweep.json"), "w", encoding="utf-8") as f:
         json.dump(results, f)
 
 
@@ -1163,6 +1163,38 @@ def _discretize_height_only_best(optimizer: FilamentOptimizer) -> torch.Tensor:
         optimizer.best_params["pixel_height_logits"], optimizer.best_params["height_offsets"]
     )
     return _discretize_height_only(eff, optimizer.h, optimizer.max_layers)
+
+
+def best_heights_at_output_res(
+    best_proc: Optional[torch.Tensor],
+    proc_init: Optional[np.ndarray],
+    full_init: torch.Tensor,
+    alpha: Optional[np.ndarray],
+) -> torch.Tensor:
+    """The best solution's per-pixel height logits at the output resolution.
+
+    Training runs at the processing resolution from ``proc_init`` (the
+    full-resolution init, downscaled). What it changed per pixel - the smooth
+    height field and the intermediate stack search's single-pixel refines -
+    is carried over onto the full-resolution init (nearest neighbour; exact
+    when the two resolutions agree). Restoring the plain init instead threw
+    the refined heights away while keeping the stack chosen for them, so the
+    exported result came out in wrong colors. Shared by the CLI and the
+    webui (pipeline_runner.export_results)."""
+    if best_proc is None or proc_init is None:
+        return full_init.clone()
+    delta = best_proc.detach().float() - torch.from_numpy(np.asarray(proc_init)).to(best_proc.device).float()
+    if delta.shape != full_init.shape:
+        delta = torch.nn.functional.interpolate(
+            delta[None, None], size=tuple(full_init.shape[-2:]), mode="nearest"
+        )[0, 0]
+    out = full_init + delta.to(device=full_init.device, dtype=full_init.dtype)
+    if alpha is not None:
+        a = alpha[..., 0] if alpha.ndim == 3 else alpha
+        if a.shape == tuple(out.shape):
+            transparent = torch.from_numpy(a < 128).to(out.device)
+            out[transparent] = full_init[transparent]
+    return out
 
 
 def _post_optimize_and_export(
@@ -1178,6 +1210,7 @@ def _post_optimize_and_export(
     device: torch.device,
     focus_map_full: Optional[torch.Tensor],
     focus_map_proc: Optional[torch.Tensor],
+    processing_pixel_height_logits_init: Optional[np.ndarray] = None,
 ) -> float:
     """Finalize solution, optionally prune, and write all output artifacts.
 
@@ -1198,18 +1231,6 @@ def _post_optimize_and_export(
     )
 
     full_init = torch.from_numpy(pixel_height_logits_init).to(device)
-
-    def _with_delta(learned):
-        # The trained height field lives at solver resolution; carry it to
-        # the output resolution.
-        if optimizer.pixel_delta is None:
-            return full_init.clone()
-        delta = (learned - optimizer.pixel_height_logits).detach()
-        if delta.shape != full_init.shape:
-            delta = torch.nn.functional.interpolate(
-                delta[None, None], size=full_init.shape[-2:], mode="bicubic"
-            )[0, 0]
-        return full_init + delta
 
     # Under colour/swap limits the heights are trained, not assigned, but the
     # stack is final: assigning every pixel its height for that stack at the
@@ -1235,8 +1256,11 @@ def _post_optimize_and_export(
             z_proc[None, None].float(), size=full_init.shape[-2:], mode="nearest"
         )[0, 0]
     else:
-        optimizer.best_params["pixel_height_logits"] = _with_delta(
-            optimizer.best_params["pixel_height_logits"]
+        optimizer.best_params["pixel_height_logits"] = best_heights_at_output_res(
+            optimizer.best_params["pixel_height_logits"],
+            processing_pixel_height_logits_init,
+            full_init,
+            alpha,
         )
     optimizer.pixel_height_logits = full_init.clone()
     optimizer.pixel_delta = None
@@ -1334,10 +1358,10 @@ def _post_optimize_and_export(
             final_loss = PruningHelper.get_initial_loss(
                 optimizer.best_params["global_logits"].shape[0], optimizer
             )
-            with open(os.path.join(args.output_folder, "final_loss.txt"), "w") as f:
+            with open(os.path.join(args.output_folder, "final_loss.txt"), "w", encoding="utf-8") as f:
                 f.write(f"{final_loss}")
             _, n_swaps, _ = optimizer.solution_counts()
-            with open(os.path.join(args.output_folder, "final_counts.json"), "w") as f:
+            with open(os.path.join(args.output_folder, "final_counts.json"), "w", encoding="utf-8") as f:
                 # colors: filaments of the print, the base included.
                 json.dump({"colors": optimizer.print_colors(), "swaps": n_swaps}, f)
 
@@ -1402,7 +1426,7 @@ def _post_optimize_and_export(
                     optimizer.base_material,
                 )
                 with open(
-                    os.path.join(args.output_folder, "swap_instructions.txt"), "w"
+                    os.path.join(args.output_folder, "swap_instructions.txt"), "w", encoding="utf-8"
                 ) as f:
                     for line in swap_instructions:
                         f.write(line + "\n")
@@ -1582,7 +1606,7 @@ def start(args) -> float:
     optimizer.finalize_background(args, material_names)
     if optimizer.bg_logits is not None:
         try:
-            with open(os.path.join(args.output_folder, "auto_background_color.txt"), "a") as f:
+            with open(os.path.join(args.output_folder, "auto_background_color.txt"), "a", encoding="utf-8") as f:
                 f.write(f"optimized_filament_color={args.background_color}\n")
                 f.write(f"optimized_filament_index={args.background_material_index}\n")
         except Exception:
@@ -1604,6 +1628,7 @@ def start(args) -> float:
         device,
         focus_map_full,
         focus_map_proc,
+        processing_pixel_height_logits_init=processing_pixel_height_logits_init,
     )
 
     return final_loss

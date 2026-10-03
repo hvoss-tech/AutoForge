@@ -1,5 +1,7 @@
+import ipaddress
 import logging
 import os
+import socket
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from urllib.parse import urlsplit
@@ -40,22 +42,63 @@ class SPAStaticFiles(StaticFiles):
         return response
 
 
+def _host_name(host: str) -> str:
+    """The name part of a Host header ("[::1]:8000" -> "::1")."""
+    host = host.strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    if host.count(":") == 1:
+        return host.split(":", 1)[0]
+    return host
+
+
+def host_allowed(host: str) -> bool:
+    """Whether a request's Host header names this server. IP addresses,
+    localhost and this machine's own name always do; anything else only
+    when listed in ``config.allowed_hosts``. A DNS rebinding attack reaches
+    the server under the attacker's domain, so its Host is refused here."""
+    if not host:
+        return True
+    name = _host_name(host).rstrip(".")
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    own = socket.gethostname().lower()
+    if name in (own, f"{own}.local"):
+        return True
+    extra = {h.strip().lower() for h in config.allowed_hosts.split(",") if h.strip()}
+    return name in extra
+
+
 class SameOriginMiddleware:
     """Refuse HTTP and websocket requests that a browser sent from another
     site: their Origin header names a host other than the one requested.
-    Requests without an Origin (curl, scripts, same-origin GETs) pass."""
+    Requests without an Origin (curl, scripts, same-origin GETs) pass.
+    The Host itself has to be one of this server's names (see host_allowed),
+    or Origin and Host could both be an attacker's rebound domain."""
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] in ("http", "websocket") and self._cross_origin(scope):
+        if scope["type"] in ("http", "websocket") and (self._cross_origin(scope) or not self._host_ok(scope)):
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             else:
                 await JSONResponse(status_code=403, content={"detail": "Cross-origin request refused"})(scope, receive, send)
             return
         await self.app(scope, receive, send)
+
+    @staticmethod
+    def _host_ok(scope) -> bool:
+        for k, v in scope.get("headers", []):
+            if k.decode("latin-1").lower() == "host":
+                return host_allowed(v.decode("latin-1"))
+        return True
 
     @staticmethod
     def _cross_origin(scope) -> bool:
@@ -82,7 +125,7 @@ async def lifespan(app: FastAPI):
             "default_materials.csv",
         )
         if os.path.exists(default_csv):
-            with open(default_csv) as f:
+            with open(default_csv, encoding="utf-8") as f:
                 csv_content = f.read()
             imported = fs.import_csv(csv_content, _mark_user_import=False)
             if imported:

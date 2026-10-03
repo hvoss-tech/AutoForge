@@ -71,7 +71,7 @@ def _atomic_write_json(path: str, data):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = tempfile.NamedTemporaryFile(mode="w", dir=parent or None, delete=False, suffix=".tmp")
+    tmp = tempfile.NamedTemporaryFile(mode="w", dir=parent or None, delete=False, suffix=".tmp", encoding="utf-8")
     try:
         json.dump(data, tmp, indent=2)
         tmp.close()
@@ -91,6 +91,8 @@ class FilamentService:
         self._filaments: dict[str, Filament] = {}
         self._active: dict[str, Filament] = {}
         self._library_path = library_path
+        # Rows the last CSV import left out for lack of a TD.
+        self.last_import_skipped = 0
         self._load_library()
 
     def _library_file(self) -> str:
@@ -119,7 +121,7 @@ class FilamentService:
         if not os.path.exists(path):
             return entries
         try:
-            with open(path) as fh:
+            with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except (json.JSONDecodeError, IOError, UnicodeDecodeError):
             return entries
@@ -216,19 +218,29 @@ class FilamentService:
         reader = csv.DictReader(io.StringIO(content, newline=""))
         rows = self._normalize_csv_row(reader)
         parsed = []
+        skipped = 0
         for row in rows:
             record = normalize_filament_record(row)
-            td_str = record.get("td", "")
+            # A row without a usable TD used to import as TD 0, which renders
+            # and optimizes as a fully opaque filament - silently. It is left
+            # out (and counted) instead.
             try:
-                record["td"] = float(td_str) if td_str not in ("", None) else 0.0
+                td = float(record.get("td"))
             except (ValueError, TypeError):
-                record["td"] = 0.0
+                td = float("nan")
+            if not (td > 0 and td != float("inf")):
+                skipped += 1
+                continue
+            record["td"] = td
             # Leave uuid blank when the source doesn't have one —
             # merge_import()/replace_library() are responsible for
             # assigning one, since merge_import needs to know
             # "no uuid was given" to try matching by name instead.
             record["uuid"] = record.get("uuid") or ""
             parsed.append(Filament(**record))
+        if skipped and not parsed:
+            raise ValueError("No row has a transmissivity (TD) greater than 0.")
+        self.last_import_skipped = skipped
         return parsed
 
     def _match_key(self, f: Filament) -> tuple[str, str, str]:
@@ -370,7 +382,7 @@ class FilamentService:
     def _mark_user_imported(self):
         path = self._imported_marker_file()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write("1")
 
     def _hueforge_offered_marker_file(self) -> str:
@@ -386,7 +398,7 @@ class FilamentService:
         with self._lock:
             path = self._hueforge_offered_marker_file()
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write("1")
 
     def has_custom_library(self) -> bool:
@@ -439,5 +451,7 @@ def get_filament_service() -> FilamentService:
         with _init_lock:
             if _service is None:
                 from ..config import config
-                _service = FilamentService(library_path=config.library_dir)
+                # The absolute path, like every other service: a relative one
+                # moved with the process's working directory.
+                _service = FilamentService(library_path=config.library_path)
     return _service

@@ -1,6 +1,6 @@
 import { downloadBlob, releaseReplacedObjectUrl } from '../lib/download'
 import { addMissingFilaments, filamentLabel } from '../lib/projectLoad'
-import { acceptsStatusFor, finishedResultCounts, isFailureTransition, pruningPollStep } from '../lib/jobTracking'
+import { acceptsStatusFor, adoptsPrunedResult, finishedResultCounts, isFailureTransition, pruningPollStep } from '../lib/jobTracking'
 import { create } from 'zustand'
 import type { Filament, ColorSliderConfig, OptimizationSettings, JobStatus, ProjectState, PruningSettings, InitState, Snapshot } from '../types'
 import { jobStatusFromControlResponse } from '../lib/jobControl'
@@ -56,12 +56,28 @@ function stopPruningPoll() {
 }
 const MAX_TOASTS = 5
 
+// `keepalive` only while the page unloads (where it is what lets the last
+// edit's requests out at all): browsers cap all in-flight keepalive bodies
+// at 64 KiB together, and with a long filament list the snapshot plus the
+// project state of an ordinary edit went over it and were silently refused.
+let pageUnloading = false
+
 // POST /api/init/run requests from this page still waiting for an answer.
 // While one is out, the server's init status describes the *previous* image
 // until the new init actually starts, so status polls must not act on it.
 let initRequestsInFlight = 0
 export function isInitRequestInFlight(): boolean {
   return initRequestsInFlight > 0
+}
+
+/** How long to wait before asking for the auto-preview again after the
+ * server said another one is still being built. */
+export const INIT_BUSY_RETRY_MS = 1500
+// Set *before* runInit puts the status back to 'idle' on a busy answer, so
+// useAutoPreviewInit's effect, which that status change re-runs, sees it.
+let initBusyUntil = 0
+export function initRetryDelay(now: number = Date.now()): number {
+  return Math.max(0, initBusyUntil - now)
 }
 
 export type ToastLevel = 'error' | 'warning' | 'info'
@@ -135,6 +151,20 @@ async function refreshCurrentJob(jobId: string): Promise<void> {
     const response = await fetch(`/api/optimize/status/${jobId}`)
     if (response.ok) useAppStore.getState().setCurrentJob(await response.json())
   } catch (_) {}
+}
+
+/** Which of these uploads/ file names the server doesn't have. */
+async function missingUploads(names: (string | null | undefined)[]): Promise<Set<string>> {
+  const missing = new Set<string>()
+  for (const name of names) {
+    if (!name) continue
+    try {
+      if (!(await fetch(`/uploads/${encodeURIComponent(name)}`, { method: 'HEAD' })).ok) missing.add(name)
+    } catch {
+      // Unreachable: can't tell, keep it.
+    }
+  }
+  return missing
 }
 
 // Replace the backend's active-filament list wholesale. /api/optimize/start
@@ -300,7 +330,7 @@ export const defaultSettings: OptimizationSettings = {
   init_heightmap_method: 'kmeans',
   priority_mask: '',
   priority_mask_strength: 10,
-  visualize: true,
+  visualize: false,
 }
 
 const defaultPruningSettings: PruningSettings = {
@@ -753,11 +783,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     // new entries every second that wiped the redo branch.
   },
   addActiveFilament: async (filament) => {
-    set((state) => {
-      const exists = state.activeFilaments.some((f) => f.uuid === filament.uuid)
-      if (exists) return state
-      return { activeFilaments: [...state.activeFilaments, filament] }
-    })
+    // Already active: nothing changes, so no request and no undo step (one
+    // used to be recorded for the no-op).
+    if (get().activeFilaments.some((f) => f.uuid === filament.uuid)) return
+    set((state) => ({ activeFilaments: [...state.activeFilaments, filament] }))
     try {
       const response = await fetch('/api/filaments/active', {
         method: 'POST',
@@ -1022,7 +1051,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().setActiveFilaments(parsed.activeFilaments)
     }
 
-    if (parsed.settings) get().setSettings({ ...state.settings, ...parsed.settings })
+    if (parsed.settings) {
+      const settings = { ...state.settings, ...parsed.settings }
+      // The project may come from another machine, whose uploads/ this
+      // server doesn't have: a missing focus mask failed the next Run ("mask
+      // not found") and a missing image showed a broken picture.
+      const missing = await missingUploads([settings.input_image, settings.priority_mask])
+      if (settings.priority_mask && missing.has(settings.priority_mask)) settings.priority_mask = ''
+      if (settings.input_image && missing.has(settings.input_image)) {
+        get().pushToast("The project's image isn't on this server; upload it again.", 'warning')
+        settings.input_image = ''
+        parsed.inputImage = null
+      }
+      get().setSettings(settings)
+      // The previous project's heightmap bounds must not clamp this one's bands.
+      set({ sliderLayerRange: { min: 0, max: settings.max_layers || 75 } })
+    }
     if (Array.isArray(parsed.colorSliders)) get().setSliders(parsed.colorSliders)
     if (parsed.inputImage !== undefined) get().setInputImage(parsed.inputImage)
     get().setProjectName(projectNameFromFile((data as { name?: unknown }).name, fileName ?? ''))
@@ -1155,6 +1199,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!response.ok) {
         const detail = describeApiError(await response.json().catch(() => null), response.status)
         console.error('[store] Init rejected:', detail)
+        const otherBuildRunning = detail.includes('Already initializing')
+        const busy = otherBuildRunning || detail.includes('reset while it was being prepared')
+        // Only another build still running is worth waiting for; a build
+        // superseded by a reset makes way for the new image's at once.
+        if (otherBuildRunning) initBusyUntil = Date.now() + INIT_BUSY_RETRY_MS
         if (isOnlyRequest()) set({ initState: { status: 'idle', preview_image: null } })
         // "Already initializing" is a benign race (see the comment on
         // ActiveFilamentsPanel's effect); a 409 for a build superseded by a
@@ -1164,7 +1213,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         // off) the build that actually matters. Neither is worth alarming
         // the user about; anything else (including an OOM from heightmap
         // init, which runs real GPU work) is not.
-        if (detail.includes('Already initializing') || detail.includes('reset while it was being prepared')) {
+        if (busy) {
           return 'busy'
         }
         get().pushToast(`Failed to prepare preview: ${detail}`)
@@ -1311,7 +1360,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (res.ok) {
           const job = await res.json()
           set({ pruningJob: job })
-          if (job.status === 'completed') {
+          // Only while the result the prune started from is still on
+          // screen: an undo or a History jump meanwhile moved the user to
+          // another step, which this prune must not replace.
+          if (job.status === 'completed' && adoptsPrunedResult(get().currentJob?.job_id, sourceJobId)) {
             // The pruned result is built from the same run's settings and
             // filaments. Without its own entry here it had none, so the
             // "Out of date" badge could never show for a pruned result.
@@ -1448,7 +1500,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const query = abandonsRedo ? `?discard_after=${UNDO_STACK[UNDO_INDEX].timestamp}` : ''
     fetch(`/api/state/snapshot${query}`, {
       method: 'POST',
-      keepalive: true,
+      keepalive: pageUnloading,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(snapshot),
     }).catch(() => {})
@@ -1543,7 +1595,14 @@ function flushPendingSnapshot() {
 // last edit entirely (it's also what persists the project state). The
 // requests use `keepalive`, so they still go out while the page unloads.
 if (typeof window !== 'undefined') {
-  window.addEventListener('pagehide', flushPendingSnapshot)
+  window.addEventListener('pagehide', () => {
+    pageUnloading = true
+    flushPendingSnapshot()
+  })
+  // A page restored from the back/forward cache is live again.
+  window.addEventListener('pageshow', () => {
+    pageUnloading = false
+  })
 }
 
 // Undo/redo/History clicks run strictly one after another. Each one awaits
@@ -1561,7 +1620,7 @@ function persistProjectState(state: Pick<AppState, 'colorSliders' | 'settings' |
   // GET /api/project/state is what a reload starts from.
   fetch('/api/project/state', {
     method: 'POST',
-    keepalive: true,
+    keepalive: pageUnloading,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       color_sliders: state.colorSliders,

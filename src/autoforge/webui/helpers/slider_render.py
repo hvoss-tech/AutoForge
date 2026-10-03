@@ -42,6 +42,10 @@ from autoforge.webui.helpers.colored_mesh import (
     top_vertex_pixel_indices,
 )
 
+# Layers composited per pass (see composite_from_slider_stack).
+_LAYER_CHUNK = 25
+
+
 def _atomic_write_bytes(path: str, data: bytes) -> None:
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     with open(tmp, "wb") as f:
@@ -137,32 +141,34 @@ def composite_from_slider_stack(
     layer_TDs = material_TDs[idx_t].clamp(1e-8, 1e8)  # [L]
 
     z_int = disc_height_image.to(torch.int64).clamp(0, max_layers)  # [H,W]
-    layer_idx = torch.arange(max_layers, device=device).view(-1, 1, 1)
-    p_print = (layer_idx < z_int.unsqueeze(0)).to(material_colors.dtype)  # [L,H,W]
-
-    p_print_bleed = bleed_layer_effect(p_print, get_edge_bleed())
-    eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
 
     run_start = material_run_starts(layer_colors, layer_TDs)
     reach, slow_reach, cov_w = layer_coverage_params(
         layer_colors, layer_TDs, run_start, background, h
     )
-    zero_hw = torch.zeros_like(z_int, dtype=torch.float32)
-    opac, _, _ = _layer_opacity(
-        eff_thick, reach, slow_reach, cov_w, run_start, 0, h, zero_hw, zero_hw
-    )
 
-    opac_fb = torch.flip(opac, dims=[0])
-    colors_fb = torch.flip(layer_colors, dims=[0])
-    trans_fb = 1.0 - opac_fb
-    trans_prev = torch.cat([torch.ones_like(trans_fb[:1]), trans_fb[:-1]], dim=0)
-    remain_fb = torch.cumprod(trans_prev, dim=0)
-
-    comp_layers = (remain_fb * opac_fb).unsqueeze(-1) * colors_fb.view(-1, 1, 1, 3)
-    comp = comp_layers.sum(dim=0)
-
-    rem_after = remain_fb[-1] * trans_fb[-1]
-    comp = comp + rem_after.unsqueeze(-1) * background
+    # Bottom to top in chunks of layers, carrying only [H,W] state across a
+    # chunk (the walk of composite_image_disc): the one-shot version held
+    # several [L,H,W] tensors at once, about 1 GB at full output resolution.
+    H, W = int(z_int.shape[0]), int(z_int.shape[1])
+    comp = background.to(torch.float32).view(1, 1, 3).expand(H, W, 3)
+    carry_thick = torch.zeros((H, W), dtype=torch.float32, device=device)
+    carry_cov = torch.zeros_like(carry_thick)
+    bleed = get_edge_bleed()
+    for lo in range(0, max_layers, _LAYER_CHUNK):
+        hi = min(lo + _LAYER_CHUNK, max_layers)
+        layer_idx = torch.arange(lo, hi, device=device).view(-1, 1, 1)
+        p_print = (layer_idx < z_int.unsqueeze(0)).to(material_colors.dtype)  # [k,H,W]
+        eff_thick = torch.clamp(bleed_layer_effect(p_print, bleed), 0.0, 1.0) * h
+        opac, carry_thick, carry_cov = _layer_opacity(
+            eff_thick, reach[lo:hi], slow_reach[lo:hi], cov_w[lo:hi], run_start[lo:hi],
+            lo, h, carry_thick, carry_cov,
+        )
+        opac = opac.flip(0)  # top to bottom within the chunk
+        trans = 1.0 - opac
+        rem_local = torch.cumprod(torch.cat([torch.ones_like(trans[:1]), trans[:-1]], dim=0), dim=0)
+        contrib = ((rem_local * opac).unsqueeze(-1) * layer_colors[lo:hi].flip(0).view(-1, 1, 1, 3)).sum(0)
+        comp = contrib + (rem_local[-1] * trans[-1]).unsqueeze(-1) * comp
 
     return comp * 255.0
 

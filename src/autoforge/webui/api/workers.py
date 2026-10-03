@@ -17,9 +17,16 @@ _threads: dict[str, threading.Thread] = {}
 
 def start_worker(job_id: str, target) -> threading.Thread:
     thread = threading.Thread(target=target, daemon=True, name=f"autoforge-job-{job_id}")
-    thread.start()
+    # Registered before it starts: registered after, running_worker() could
+    # miss a thread that was already running.
     with _lock:
         _threads[job_id] = thread
+    try:
+        thread.start()
+    except BaseException:
+        with _lock:
+            _threads.pop(job_id, None)
+        raise
     return thread
 
 
@@ -27,7 +34,7 @@ def running_worker() -> str | None:
     """The id of a job whose thread is still running, or None."""
     with _lock:
         for job_id, thread in list(_threads.items()):
-            if thread.is_alive():
+            if thread.is_alive() or thread.ident is None:  # running, or about to start
                 return job_id
             del _threads[job_id]
     return None

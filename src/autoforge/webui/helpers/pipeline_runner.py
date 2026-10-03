@@ -25,6 +25,7 @@ from autoforge.Helper.OtherHelper import get_device, set_seed
 from autoforge.Helper.OutputHelper import generate_stl
 from autoforge.Modules.Optimizer import FilamentOptimizer
 from autoforge.auto_forge import (
+    best_heights_at_output_res,
     cli_defaults,
     _auto_select_background_color,
     _prepare_background_and_materials,
@@ -99,6 +100,10 @@ def _make_settings(overrides: dict) -> argparse.Namespace:
     ns = argparse.Namespace(**(_DEFAULTS.copy()))
     for k, v in overrides.items():
         setattr(ns, k, v)
+    # Never from the request: the matplotlib window would be built on a job
+    # thread (a crash on macOS, figures leaked per run elsewhere) and redrawn
+    # every 100 steps. The frontend used to send visualize: true.
+    ns.visualize = False
     run_limit_args(ns)
     return ns
 
@@ -523,36 +528,8 @@ def _run_optimization_loop(
 # Export: finalise and write all output files
 # ---------------------------------------------------------------------------
 
-def _best_heights_at_output_res(
-    best_proc: Optional[torch.Tensor],
-    proc_init: Optional[np.ndarray],
-    full_init: torch.Tensor,
-    alpha: Optional[np.ndarray],
-) -> torch.Tensor:
-    """The best solution's per-pixel height logits at the output resolution.
-
-    Training runs at the processing resolution from ``proc_init`` (the
-    full-resolution init, downscaled). What it changed per pixel - the
-    intermediate stack search refines single pixels' heights - is carried
-    over onto the full-resolution init (nearest neighbour; exact when the two
-    resolutions agree). Restoring the plain init instead, as this used to,
-    was only right while training left the per-pixel logits alone: it threw
-    the refined heights away while keeping the stack chosen for them, so the
-    exported result and every preview after it came out in wrong colors.
-    """
-    if best_proc is None or proc_init is None:
-        return full_init.clone()
-    delta = best_proc.detach().float() - torch.from_numpy(proc_init).to(best_proc.device).float()
-    if delta.shape != full_init.shape:
-        delta = torch.nn.functional.interpolate(
-            delta[None, None], size=tuple(full_init.shape[-2:]), mode="nearest"
-        )[0, 0]
-    out = full_init + delta.to(full_init.dtype)
-    if alpha is not None:
-        a = alpha[..., 0] if alpha.ndim == 3 else alpha
-        if a.shape == tuple(out.shape):
-            out[torch.from_numpy(a < 128).to(out.device)] = full_init[torch.from_numpy(a < 128).to(out.device)]
-    return out
+# Shared with the CLI (auto_forge.best_heights_at_output_res).
+_best_heights_at_output_res = best_heights_at_output_res
 
 
 def export_results(
@@ -738,7 +715,7 @@ def export_results(
             final_loss = get_initial_loss(
                 optimizer.best_params["global_logits"].shape[0], optimizer
             )
-            with open(os.path.join(args.output_folder, "final_loss.txt"), "w") as f:
+            with open(os.path.join(args.output_folder, "final_loss.txt"), "w", encoding="utf-8") as f:
                 f.write(f"{final_loss}")
 
             # ---- Preview PNG ----
@@ -835,7 +812,7 @@ def export_results(
                 swap_path = os.path.join(
                     args.output_folder, "swap_instructions.txt"
                 )
-                with open(swap_path, "w") as f:
+                with open(swap_path, "w", encoding="utf-8") as f:
                     for line in swap_instructions:
                         f.write(line + "\n")
 
@@ -858,7 +835,7 @@ def export_results(
 
                 active_filaments = result.get("active_filaments") or []
                 materials_csv_path = os.path.join(args.output_folder, "materials.csv")
-                with open(materials_csv_path, "w", newline="") as f:
+                with open(materials_csv_path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow(
                         ["Brand", "Name", "Color", "Transmissivity", "Type", "Owned", "Uuid"]

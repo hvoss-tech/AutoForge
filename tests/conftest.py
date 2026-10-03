@@ -60,6 +60,19 @@ def _no_filamentcolors_network():
     mp.undo()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _test_client_hosts():
+    """TestClient sends ``Host: testserver`` and the httpx clients of the
+    concurrency tests ``Host: t``; the webui refuses host names it doesn't
+    know (DNS rebinding), so the test ones are allowed explicitly."""
+    from autoforge.webui.config import config
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(config, "allowed_hosts", "testserver,t")
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def _deterministic_rng():
     """Give every test the same starting RNG state.

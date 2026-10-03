@@ -87,7 +87,7 @@ if [ "${NO_BROWSER:-false}" != "true" ]; then
         ready=false
         for _ in $(seq 1 150); do
             if command -v curl &>/dev/null; then
-                curl -fsS -o /dev/null "$HEALTH_URL" && { ready=true; break; }
+                curl -fs -o /dev/null "$HEALTH_URL" && { ready=true; break; }
             elif command -v wget &>/dev/null; then
                 wget -q -O /dev/null "$HEALTH_URL" && { ready=true; break; }
             else
@@ -111,7 +111,12 @@ if [ -f "$SCRIPT_DIR/.venv/.autoforge-torch-index" ] || [ -f "$SCRIPT_DIR/.venv/
     export UV_NO_SYNC=1
 fi
 
+# EXTRA_UVICORN_ARGS="--log-level debug --reload" passes extra options on to
+# uvicorn. An environment variable can't hold a bash array, so the string is
+# split on whitespace.
+read -r -a EXTRA_ARGS <<< "${EXTRA_UVICORN_ARGS:-}"
+
 exec uv run uvicorn autoforge.webui.server:app \
     --host "$HOST" \
     --port "$PORT" \
-    "${EXTRA_UVICORN_ARGS[@]}"
+    "${EXTRA_ARGS[@]}"
