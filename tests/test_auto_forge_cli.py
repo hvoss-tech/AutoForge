@@ -27,7 +27,7 @@ def test_defaults_match_documented_values(monkeypatch):
     assert args.max_layers == 75
     assert args.learning_rate == 0.015
     assert args.spike_threshold_layers == 1
-    assert args.spike_removal_passes == 4
+    assert args.spike_removal_passes == -1
 
 
 def test_overrides_are_typed(monkeypatch):
