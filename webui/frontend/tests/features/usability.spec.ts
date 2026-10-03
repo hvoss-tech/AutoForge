@@ -160,10 +160,11 @@ test.describe('Print plan', () => {
     await setSliders(page, [band(2, a.uuid), band(5, a.uuid), band(9, b.uuid), band(12, a.uuid)])
     await openApp(page)
 
-    await expect(byTestId(page, 'tab-print-plan')).toContainText('2 swaps')
+    // The base is band 0, so starting the first band is a swap too.
+    await expect(byTestId(page, 'tab-print-plan')).toContainText('3 swaps')
     await byTestId(page, 'tab-print-plan').click()
     await expect(byTestId(page, 'plan-colors')).toContainText('2')
-    await expect(byTestId(page, 'plan-swaps')).toContainText('2')
+    await expect(byTestId(page, 'plan-swaps')).toContainText('3')
     await expect(byTestId(page, 'plan-layers')).toContainText('12')
     await expect(byTestId(page, 'plan-height')).toContainText('0.72 mm')
     const rows = page.locator('[data-testid="plan-swap-row"]')
@@ -181,7 +182,7 @@ test.describe('Print plan', () => {
     // Edits are reflected immediately.
     await byTestId(page, 'tab-color-layers').click()
     await byTestId(page, 'toggle-2').click()
-    await expect(byTestId(page, 'tab-print-plan')).toContainText('0 swaps')
+    await expect(byTestId(page, 'tab-print-plan')).toContainText('1 swaps')
     void testInfo
   })
 

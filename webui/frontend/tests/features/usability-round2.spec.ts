@@ -342,6 +342,18 @@ test.describe('Project', () => {
     await byTestId(page, 'workflow-step-btn-export').click()
     await expect(byTestId(page, 'file-menu-dropdown')).toBeVisible()
   })
+
+  test('the run controls never cover the workflow steps on a 1280px screen', async ({ page }) => {
+    // The right-hand group (run reason, limits, Run) kept its full width and
+    // slid over the last workflow step, which then couldn't be clicked.
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await openApp(page)
+    await expect(byTestId(page, 'run-disabled-reason')).toBeVisible()
+    const steps = await byTestId(page, 'workflow-steps').boundingBox()
+    const reason = await byTestId(page, 'run-disabled-reason').boundingBox()
+    expect(steps!.x + steps!.width).toBeLessThanOrEqual(reason!.x)
+    await expect(byTestId(page, 'run-disabled-reason')).toHaveAttribute('title', 'Upload an input image first')
+  })
 })
 
 test.describe('Image', () => {

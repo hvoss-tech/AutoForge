@@ -166,7 +166,7 @@ const ProjectTitle: React.FC = () => {
   const dirty = hasUnsavedChanges(saved, fingerprint, hasContent)
 
   return (
-    <div className="flex items-center gap-1 min-w-[4.5rem] w-40 shrink">
+    <div className="flex items-center gap-1 min-w-[4.5rem] basis-40 shrink">
       <input
         value={projectName}
         onChange={(e) => setProjectName(e.target.value)}
@@ -599,7 +599,7 @@ export const TopBar: React.FC = () => {
       style={{ height: 'var(--topbar-height)' }}
       data-testid="top-bar"
     >
-      <div className="flex items-center gap-3 min-w-0">
+      <div className="flex items-center gap-3">
         <h1 className="text-sm font-bold text-gray-100 flex-shrink-0">AutoForge</h1>
         {/* Hidden during a run below very wide screens: the progress readout needs the room. */}
         {currentVersion && (
@@ -611,7 +611,10 @@ export const TopBar: React.FC = () => {
         <WorkflowSteps />
       </div>
 
-      <div className="flex items-center gap-2 flex-shrink-0">
+      {/* Truncates the run reason once the left side is down to its minimum:
+          at a fixed width this group slid over the workflow steps on a
+          1280px screen and swallowed clicks on the last step. */}
+      <div className="flex items-center gap-2 min-w-0">
         {isActive && currentJob && <JobProgress elapsedEta={elapsedEta} />}
 
         {hasResult && !isActive && <ResultStatus />}
@@ -654,7 +657,7 @@ export const TopBar: React.FC = () => {
           </span>
         ) : (
           !isActive && !canRun && (
-            <span className="text-xs text-gray-400" data-testid="run-disabled-reason">
+            <span className="text-xs text-gray-400 truncate min-w-0" title={runDisabledReason} data-testid="run-disabled-reason">
               {runDisabledReason}
             </span>
           )

@@ -2686,17 +2686,13 @@ class FilamentOptimizer:
             original_self_logits = self.pixel_height_logits
             pre_loss = _compute_loss_for_heightmap(self, dg_post)
 
-            # Work on continuous height map to avoid discretization and numpy round-trips.
-            eff_logits = self._apply_height_offset(
-                self.best_params["pixel_height_logits"],
-                self.best_params["height_offsets"],
-            )
-            height_map = torch.sigmoid(eff_logits) * float(self.max_layers)
-
+            # Clean the discrete map, the one that gets printed. On the
+            # continuous height a pixel 0.6 layers above its neighbours is
+            # no spike, yet it rounds up to one; those were left in.
             dh_clean, spikes = remove_height_spikes(
-                height_map,
+                dh_post.to(torch.float32),
                 threshold_layers=self.args.spike_threshold_layers,
-                num_passes=getattr(self.args, "spike_removal_passes", 4),
+                num_passes=getattr(self.args, "spike_removal_passes", -1),
             )
 
             normalized = dh_clean.clamp(0, self.max_layers) / float(self.max_layers)

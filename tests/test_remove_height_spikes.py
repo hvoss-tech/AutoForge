@@ -88,3 +88,66 @@ def test_center_not_outlier_not_changed(threshold_layers):
     assert spikes == 0
     assert torch.equal(cleaned, dh)
 
+
+
+def test_default_repeats_until_no_spike_is_left():
+    """Fixing one spike can expose the next one (here a staircase that peels
+    off one step per pass); four fixed passes used to leave the rest in."""
+    from autoforge.Helper.PixelHeightRefine import spike_mask
+
+    g = torch.Generator().manual_seed(0)
+    z = torch.randint(0, 6, (64, 64), generator=g).float()
+    cleaned, spikes = remove_height_spikes(z, threshold_layers=1)
+    assert spikes > 0
+    assert int(spike_mask(cleaned.long(), 1).sum()) == 0
+    # The cap still holds when given.
+    capped, _ = remove_height_spikes(z, threshold_layers=1, num_passes=1)
+    assert int(spike_mask(capped.long(), 1).sum()) > 0
+
+
+def test_post_remove_spikes_cleans_the_printed_map():
+    """Spike removal judged the continuous height, where 0.6 layers above
+    the neighbours is no spike - but it rounds to one in the print."""
+    from types import SimpleNamespace
+
+    from autoforge.Helper.PixelHeightRefine import spike_mask
+    from autoforge.Modules.Optimizer import FilamentOptimizer, _discretize_height_only
+
+    L = 10
+    z_cont = torch.full((9, 9), 4.0)
+    z_cont[4, 4] = 4.6  # rounds to 5: a one-layer spike once printed
+    logits = torch.logit(z_cont / L)
+
+    class Stub:
+        post_remove_spikes = FilamentOptimizer.post_remove_spikes
+
+        def __init__(self):
+            self.max_layers = L
+            self.h = 0.04
+            self.device = torch.device("cpu")
+            self.args = SimpleNamespace(spike_threshold_layers=1, output_folder="/nonexistent")
+            self.best_params = {"pixel_height_logits": logits, "height_offsets": torch.zeros(1)}
+            self.pixel_height_logits = logits
+
+        def _apply_height_offset(self, pixel_logits, height_offsets):
+            return pixel_logits
+
+        def _remove_height_offset(self, pixel_logits, height_offsets):
+            return pixel_logits
+
+        def get_discretized_solution(self, best=True):
+            return None, _discretize_height_only(self.best_params["pixel_height_logits"], self.h, L)
+
+    import autoforge.Helper.PruningHelper as ph
+
+    stub = Stub()
+    orig = ph._compute_loss_for_heightmap
+    ph._compute_loss_for_heightmap = lambda opt, dg: 1.0
+    try:
+        assert int(spike_mask(stub.get_discretized_solution()[1].long(), 1).sum()) == 1
+        assert stub.post_remove_spikes(allow_regression=True) is True
+    finally:
+        ph._compute_loss_for_heightmap = orig
+    _, z = stub.get_discretized_solution()
+    assert int(spike_mask(z.long(), 1).sum()) == 0
+    assert int(z[4, 4]) == 4

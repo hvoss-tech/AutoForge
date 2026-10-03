@@ -1088,8 +1088,8 @@ test.describe('Settings Modal', () => {
     await expect(page.locator('[data-testid="setting-nozzle_diameter"]')).toHaveValue('0.4')
   })
 
-  test('early_stopping default is 2000', async ({ page }) => {
-    await expect(page.locator('[data-testid="setting-early_stopping"]')).toHaveValue('2000')
+  test('early_stopping default is 3000', async ({ page }) => {
+    await expect(page.locator('[data-testid="setting-early_stopping"]')).toHaveValue('3000')
   })
 
   test('init_tau default is 1.0', async ({ page }) => {
@@ -1100,8 +1100,8 @@ test.describe('Settings Modal', () => {
     await expect(page.locator('[data-testid="setting-final_tau"]')).toHaveValue('0.01')
   })
 
-  test('num_init_rounds default is 16', async ({ page }) => {
-    await expect(page.locator('[data-testid="setting-num_init_rounds"]')).toHaveValue('16')
+  test('num_init_rounds default is 1', async ({ page }) => {
+    await expect(page.locator('[data-testid="setting-num_init_rounds"]')).toHaveValue('1')
   })
   })
 

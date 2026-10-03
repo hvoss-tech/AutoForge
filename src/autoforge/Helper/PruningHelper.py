@@ -1714,13 +1714,14 @@ def _compute_loss_for_heightmap(
 
 def remove_height_spikes(
     disc_height: torch.Tensor, threshold_layers: int = 3, max_outliers: int = 2,
-    num_passes: int = 4,
+    num_passes: int = -1,
 ) -> tuple[torch.Tensor, int]:
     """Remove tall spikes in a discrete height map using a 3x3 neighborhood.
 
-    Vectorized GPU implementation — no BFS / Python loop per pixel.  Multiple
-    passes approximate the old BFS propagation behaviour (fixing a spike may
-    reveal new spikes in its neighbourhood on the next pass).
+    Vectorized GPU implementation — no BFS / Python loop per pixel. Fixing a
+    spike can reveal new spikes in its neighbourhood, so passes repeat until
+    none is left. That always ends: a fix only ever lowers a pixel (every
+    non-outlier is below it), by at least one layer on an integer map.
 
     A spike occurs only when the *center* pixel of a 3x3 window is at least
     ``threshold_layers`` higher than the window median and the window has at most
@@ -1732,15 +1733,19 @@ def remove_height_spikes(
         threshold_layers: pixels whose value exceeds window median by this
                           amount are considered outliers.
         max_outliers:  spike only if window has at most this many outliers.
-        num_passes:    number of refinement passes (1 = one-shot, 4 ≈ old BFS).
+        num_passes:    maximum number of passes; < 1 repeats until no spike
+                       is left.
 
     Returns:
         cleaned_height, spike_count
     """
     if disc_height.ndim != 2:
         raise ValueError("disc_height must be 2D [H,W]")
-    if threshold_layers <= 0 or max_outliers <= 0 or num_passes < 1:
+    if threshold_layers <= 0 or max_outliers <= 0:
         return disc_height, 0
+    if num_passes < 1:
+        # Only a backstop: on an integer map the passes end long before.
+        num_passes = 10_000
 
     H, W = disc_height.shape
     if H < 3 or W < 3:

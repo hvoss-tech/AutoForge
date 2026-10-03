@@ -289,8 +289,8 @@ def build_parser() -> configargparse.ArgParser:
     parser.add_argument(
         "--spike_removal_passes",
         type=int,
-        default=4,
-        help="Number of spike removal passes (4 approximates old BFS; higher = smoother but slower)",
+        default=-1,
+        help="Maximum number of spike removal passes (-1 = repeat until no spike is left)",
     )
 
     parser.add_argument(

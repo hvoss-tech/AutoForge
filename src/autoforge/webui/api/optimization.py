@@ -59,6 +59,33 @@ def _derive_sliders(optimizer, filament_dicts):
         return None
 
 
+def _broadcast_final_result(result: dict, job_id: str) -> None:
+    """Push the finished result's slider stack, image and base to the UI.
+
+    The last training preview isn't the result: the pipeline keeps refining
+    the solution after training (stack search, pixel refinement, limits), so
+    the color layers stayed on a stack with a different number of bands than
+    the stored result, and the next slider render rebuilt the mesh from it.
+    """
+    try:
+        from ..helpers.sliders import derive_base_from_result, derive_sliders_from_result
+
+        slider_data = derive_sliders_from_result(result)
+        image = result["optimizer"].get_best_discretized_image()
+        if not (slider_data and slider_data["sliders"]) or image is None:
+            return
+        broadcast_preview(
+            encode_png_b64(image),
+            job_id=job_id,
+            sliders=slider_data["sliders"],
+            min_layer=slider_data["min_layer"],
+            max_layer=slider_data["max_layer"],
+            base=derive_base_from_result(result),
+        )
+    except Exception:
+        logger.exception("Could not send the final result of job %s", job_id)
+
+
 @router.post("/start")
 async def start_optimization(settings: OptimizationSettings):
     svc = get_optimization_service()
@@ -315,6 +342,10 @@ async def start_optimization(settings: OptimizationSettings):
                 svc.clear_pipeline_result(job.job_id)
                 svc.update_status(job.job_id, "failed", error=friendly_error_message(exc))
                 return
+
+            # Before "completed", so the snapshot taken on completion holds
+            # the result's own stack rather than the last training preview.
+            _broadcast_final_result(result, job.job_id)
 
             # What the result has, counted like the pruning dialog counts it
             # — with color/swap limits set, the UI shows them held.
