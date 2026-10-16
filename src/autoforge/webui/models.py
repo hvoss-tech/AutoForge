@@ -90,6 +90,38 @@ class HeightGuidanceSettings(CamelCaseModel):
     colors: list[HeightColorPick] = []
 
 
+class BorderSettings(CamelCaseModel):
+    """A border around the exported model, on the base layer in the
+    background filament (Helper/BorderMesh). It doesn't change the
+    optimization: the 3D view and the export add it to the finished model."""
+    shape: Literal["none", "rectangle", "oval", "circle", "outline"] = "none"
+    width: float = 5.0
+    corner_radius: float = 3.0
+    hanger: Literal["none", "top", "corners"] = "none"
+    hanger_diameter: float = 4.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clamp(cls, data: Any) -> Any:
+        # Clamped instead of rejected: the border rides along with every
+        # settings post, and one odd value must not block a run or a save.
+        from dataclasses import asdict
+
+        from autoforge.Helper.BorderMesh import BorderSpec
+
+        if isinstance(data, BaseModel):
+            data = data.model_dump()
+        if not isinstance(data, dict):
+            return {}
+        snake = {re.sub(r"[A-Z]", lambda m: "_" + m.group(0).lower(), k): v for k, v in data.items()}
+        return asdict(BorderSpec.from_dict(snake))
+
+    def spec(self):
+        from autoforge.Helper.BorderMesh import BorderSpec
+
+        return BorderSpec(**self.model_dump())
+
+
 class OptimizationSettings(CamelCaseModel):
     # Ranges are enforced here so a bad value is rejected up front with a
     # message naming the field, instead of starting a job that dies with
@@ -176,6 +208,7 @@ class OptimizationSettings(CamelCaseModel):
     # name, like priority_mask).
     height_guidance: Optional[HeightGuidanceSettings] = None
     height_regions: str = ""
+    border: BorderSettings = Field(default_factory=BorderSettings)
     visualize: bool = False
 
     @model_validator(mode="after")

@@ -34,6 +34,7 @@ dependencies = [
   "websockets>=15.0",
   "pydantic-settings>=2.0.0",
   "posthog>=3.7.0",
+  "manifold3d>=3.2",
 ]
 
 [project.optional-dependencies]

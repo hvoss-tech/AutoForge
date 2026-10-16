@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from ..config import config
 from ..helpers.mesh_persist import wait_for_pending_mesh
+from ..models import BorderSettings
 from ..services.optimization_service import get_optimization_service
 
 router = APIRouter()
@@ -43,6 +44,88 @@ def _resolve_or_404(job_id: str, filename: str, not_found_msg: str) -> str:
 async def download_stl(job_id: str):
     path = _resolve_or_404(job_id, "final_model.stl", "STL not found")
     return FileResponse(path, filename=f"{job_id}.stl")
+
+
+class BorderRequest(BaseModel):
+    border: BorderSettings | None = None
+
+
+@router.post("/stl/{job_id}")
+async def download_stl_with_border(job_id: str, body: BorderRequest):
+    """The STL with the border chosen in the 3D view merged in."""
+    path = _resolve_or_404(job_id, "final_model.stl", "STL not found")
+    return await _stl_response(job_id, path, body.border, f"{job_id}.stl")
+
+
+class BorderPreviewRequest(BaseModel):
+    border: BorderSettings
+    # The client's base height, used only when the server no longer knows
+    # the one the model was built with (an auto-preview already released).
+    background_height: float | None = None
+
+
+@router.post("/border-preview/{job_id}")
+async def border_preview(job_id: str, body: BorderPreviewRequest):
+    """The border mesh for the 3D view (helpers/border.border_preview).
+    ``job_id`` may be ``__init__``, the auto-preview."""
+    from autoforge.Helper.BorderMesh import BorderError
+    from ..helpers.border import INIT_JOB, border_preview as build
+
+    if job_id != INIT_JOB and _job_path(job_id, "final_model_colored.ply") is None:
+        raise HTTPException(404, "Unknown job")
+    try:
+        return await asyncio.to_thread(build, job_id, body.border.spec(), body.background_height)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except BorderError as e:
+        raise HTTPException(422, str(e))
+
+
+def _bordered_copy(job_id: str, path: str, border: BorderSettings | None, out_dir: str | None = None) -> str | None:
+    """A temp file (in ``out_dir``) with ``path`` - one of the job's STLs -
+    plus the border, or None when the border adds nothing. HTTPException 422
+    when it can't be added: an export that silently left it out would print
+    something other than what the 3D view showed."""
+    from autoforge.Helper.BorderMesh import BorderError
+    from ..helpers.border import write_bordered_stl
+
+    if border is None or not border.spec().active:
+        return None
+    fd, tmp = tempfile.mkstemp(suffix=".stl", dir=out_dir)
+    os.close(fd)
+    try:
+        write_bordered_stl(job_id, path, tmp, border.spec())
+    except BorderError as e:
+        os.remove(tmp)
+        raise HTTPException(422, f"Could not add the border: {e}")
+    except FileNotFoundError as e:
+        os.remove(tmp)
+        raise HTTPException(404, str(e))
+    except BaseException:
+        os.remove(tmp)
+        raise
+    return tmp
+
+
+def _border_replacements(job_id: str, job_dir: str, border: BorderSettings | None, out_dir: str) -> dict[str, str]:
+    """Bundle entries to swap for their bordered versions: the STL, or a
+    FlatForge run's base-layer STL."""
+    from ..helpers.border import background_stl
+
+    stl = os.path.join(job_dir, "final_model.stl")
+    if not os.path.exists(stl):
+        stl = background_stl(job_dir)
+    if stl is None:
+        return {}
+    bordered = _bordered_copy(job_id, stl, border, out_dir)
+    return {os.path.basename(stl): bordered} if bordered else {}
+
+
+async def _stl_response(job_id: str, path: str, border: BorderSettings | None, filename: str):
+    bordered = await asyncio.to_thread(_bordered_copy, job_id, path, border)
+    if bordered is None:
+        return FileResponse(path, filename=filename)
+    return FileResponse(bordered, filename=filename, background=BackgroundTask(os.remove, bordered))
 
 
 @router.get("/preview/{job_id}")
@@ -182,6 +265,21 @@ async def download_named_output(job_id: str, filename: str):
     Only a name this job's own `/stl-list` would list is served — anything
     else (including an attempt to reach outside this job's directory, or a
     non-STL internal file) 404s rather than resolving arbitrary paths."""
+    return FileResponse(_named_stl_path(job_id, filename), filename=filename)
+
+
+@router.post("/file/{job_id}/{filename}")
+async def download_named_output_with_border(job_id: str, filename: str, body: BorderRequest):
+    """A FlatForge run's STL by name; its base-layer STL carries the border."""
+    path = _named_stl_path(job_id, filename)
+    from ..helpers.border import background_stl
+
+    if background_stl(os.path.dirname(path)) == path:
+        return await _stl_response(job_id, path, body.border, filename)
+    return FileResponse(path, filename=filename)
+
+
+def _named_stl_path(job_id: str, filename: str) -> str:
     svc = get_optimization_service()
     job = svc.get_job(job_id)
     if not job or job.status != "completed":
@@ -198,7 +296,7 @@ async def download_named_output(job_id: str, filename: str):
     path = _job_path(job_id, filename)
     if path is None or not os.path.exists(path):
         raise HTTPException(404, "File not found")
-    return FileResponse(path, filename=filename)
+    return path
 
 
 class ExportRequest(BaseModel):
@@ -206,11 +304,17 @@ class ExportRequest(BaseModel):
     # The webui project file (what File › Save project writes), bundled as
     # `<name>_project.json` so the zip holds everything needed to reopen it.
     project: dict[str, Any] | None = None
+    # Merged into the STL; defaults to the project settings' border.
+    border: BorderSettings | None = None
 
 
 @router.post("/export/{job_id}")
 async def export_project_with_file(job_id: str, body: ExportRequest):
-    return await _export_zip_response(job_id, body.name, body.project)
+    border = body.border
+    if border is None:
+        saved = ((body.project or {}).get("settings") or {}).get("border")
+        border = BorderSettings.model_validate(saved) if saved else None
+    return await _export_zip_response(job_id, body.name, body.project, border)
 
 
 @router.get("/export/{job_id}")
@@ -218,7 +322,9 @@ async def export_project(job_id: str, name: str | None = None):
     return await _export_zip_response(job_id, name, None)
 
 
-async def _export_zip_response(job_id: str, name: str | None, project: dict[str, Any] | None):
+async def _export_zip_response(
+    job_id: str, name: str | None, project: dict[str, Any] | None, border: BorderSettings | None = None
+):
     """Zip up a completed job's output files — STL (or the per-material STLs
     a FlatForge run produced), colored PLY, preview PNG, swap instructions,
     project file — as one downloadable bundle, mirroring the CLI's
@@ -241,6 +347,7 @@ async def _export_zip_response(job_id: str, name: str | None, project: dict[str,
     try:
         await asyncio.to_thread(wait_for_pending_mesh, job_id)
         replace = await asyncio.to_thread(_edited_replacements, job_id, job_dir, project, edit_dir)
+        replace.update(await asyncio.to_thread(_border_replacements, job_id, job_dir, border, edit_dir))
         added = await asyncio.to_thread(_write_export_zip, zip_path, job_dir, prefix, project, replace)
     except BaseException:
         os.remove(zip_path)
