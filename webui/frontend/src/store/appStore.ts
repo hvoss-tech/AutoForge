@@ -23,6 +23,7 @@ import { effectiveBaseColor, effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { blobToDataUrl, dataUrlToBlob, embeddedImageName, heightmapSource, isImageDataUrl, isSavedHeightmap, type SavedHeightmap } from '../lib/projectFile'
 import { projectFileName, projectFingerprint, projectNameFromFile } from '../lib/project'
 import type { HeightGuidanceSettings } from '../lib/heightGuidance'
+import { DEFAULT_BORDER } from '../lib/border'
 
 // Module-level undo stack — NOT in Zustand store to avoid infinite loops via subscribe
 const UNDO_STACK: Snapshot[] = []
@@ -378,6 +379,7 @@ export const defaultSettings: OptimizationSettings = {
   priority_mask_strength: 10,
   height_guidance: null,
   height_regions: '',
+  border: DEFAULT_BORDER,
   visualize: false,
 }
 

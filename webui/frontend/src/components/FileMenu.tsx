@@ -7,6 +7,7 @@ import { describeApiError } from '../lib/apiError'
 import { onUiCommand } from '../lib/uiEvents'
 import { exportFileName } from '../lib/project'
 import { downloadBlob } from '../lib/download'
+import { describeBorder, normalizeBorder } from '../lib/border'
 
 
 const itemClass =
@@ -34,6 +35,14 @@ export const FileMenu: React.FC = () => {
   const pushToast = useAppStore((s) => s.pushToast)
   const [exporting, setExporting] = useState(false)
   const named = (suffix: string, fallback: string) => exportFileName(projectName, suffix, fallback)
+  // The border picked in the 3D view goes into every STL download.
+  const border = normalizeBorder(settings.border)
+  const borderSummary = describeBorder(border)
+  const withBorder: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ border }),
+  }
 
   // The .zip, STL and .hfp are written by an optimizer run; the auto-preview
   // has no printable model. The swap instructions and the image are made from
@@ -120,6 +129,7 @@ export const FileMenu: React.FC = () => {
         body: JSON.stringify({
           name: projectName,
           project: projectFileData(useAppStore.getState()),
+          border,
         }),
       })
     } finally {
@@ -220,7 +230,7 @@ export const FileMenu: React.FC = () => {
               flatforgeStlFiles.map((name) => (
                 <button
                   key={name}
-                  onClick={() => jobId && downloadFromServer(`/api/outputs/file/${jobId}/${encodeURIComponent(name)}`, named(name, name))}
+                  onClick={() => jobId && downloadFromServer(`/api/outputs/file/${jobId}/${encodeURIComponent(name)}`, named(name, name), withBorder)}
                   className={itemClass}
                   role="menuitem"
                   data-testid="download-stl-flatforge"
@@ -234,7 +244,7 @@ export const FileMenu: React.FC = () => {
               </button>
             )
           ) : (
-            <button onClick={() => jobId && downloadFromServer(`/api/outputs/stl/${jobId}`, named('model.stl', 'final_model.stl'))} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="download-stl">
+            <button onClick={() => jobId && downloadFromServer(`/api/outputs/stl/${jobId}`, named('model.stl', 'final_model.stl'), withBorder)} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="download-stl">
               <Box className="w-3.5 h-3.5" /> 3D model (.stl)
             </button>
           )}
@@ -247,6 +257,11 @@ export const FileMenu: React.FC = () => {
           <button onClick={() => jobId && downloadFromServer(`/api/outputs/project/${jobId}`, named('hueforge.hfp', 'final_model.hfp'))} disabled={!canExport} title={exportHint} className={itemClass} role="menuitem" data-testid="download-project">
             <Layers className="w-3.5 h-3.5" /> HueForge project (.hfp)
           </button>
+          {borderSummary && (
+            <p className="px-3 pt-1 text-[11px] text-cyan-300" data-testid="file-menu-border-note">
+              Border in the STL: {borderSummary}
+            </p>
+          )}
           <p className="px-3 pt-1 pb-1 text-[11px] text-gray-400">
             Swap instructions, image and the .zip follow your edits; the separate .hfp is the optimizer's output.
           </p>

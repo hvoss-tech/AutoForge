@@ -33,7 +33,10 @@ from typing import Any, Optional
 
 import numpy as np
 
-import manifold3d as mf
+try:
+    import manifold3d as mf
+except ImportError:  # pragma: no cover - an install from before the dependency
+    mf = None
 
 SHAPES = ("none", "rectangle", "oval", "circle", "outline")
 HANGERS = ("none", "top", "corners")
@@ -101,6 +104,13 @@ class BorderSpec:
             hanger=hanger if hanger in HANGERS else "none",
             hanger_diameter=number("hanger_diameter", HANGER_DIAMETER_RANGE),
         )
+
+
+def _require_manifold() -> None:
+    """A clear error instead of an AttributeError when manifold3d is missing
+    (an install that predates the dependency); the rest of the app works."""
+    if mf is None:
+        raise BorderError("Borders need the manifold3d package: pip install manifold3d")
 
 
 def _segments(radius: float) -> int:
@@ -208,6 +218,7 @@ def _signed_area(points: np.ndarray) -> float:
 
 def mesh_footprint(vertices: np.ndarray, faces: np.ndarray) -> mf.CrossSection:
     """Where the model stands on the bed: the region of its bottom face."""
+    _require_manifold()
     loops = _bottom_loops(vertices, faces)
     # Reversed: counter-clockwise around the picture, as CrossSection wants.
     contours = [vertices[loop[::-1], :2].astype(np.float64) for loop in loops]
@@ -301,6 +312,7 @@ def _hole_centers(footprint: mf.CrossSection, plate: mf.CrossSection, spec: Bord
 def border_outline(footprint: mf.CrossSection, spec: BorderSpec) -> Optional[mf.CrossSection]:
     """The whole base plate with the border: picture footprint, border and
     hanging tabs, minus the holes. None when ``spec`` adds nothing."""
+    _require_manifold()
     if not spec.active:
         return None
     footprint = footprint.simplify(1e-4)

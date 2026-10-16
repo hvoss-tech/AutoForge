@@ -1,4 +1,5 @@
 import type { GuidanceReport, HeightGuidanceSettings } from '../lib/heightGuidance'
+import type { BorderSettings } from '../lib/border'
 
 export interface Filament {
   brand: string
@@ -79,6 +80,8 @@ export interface OptimizationSettings {
   height_guidance: HeightGuidanceSettings | null
   /** The painted raise/lower regions (a file in uploads/), or ''. */
   height_regions: string
+  /** Border around the exported model (lib/border); not an optimizer input. */
+  border: BorderSettings
   visualize: boolean
 }
 

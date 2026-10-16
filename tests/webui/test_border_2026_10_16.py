@@ -172,3 +172,17 @@ def test_an_odd_border_value_never_blocks_the_settings(client):
 
     border = OptimizationSettings(border={"shape": "triangle", "width": 0, "hangerDiameter": "big"}).border
     assert (border.shape, border.width, border.hanger_diameter) == ("none", 1.0, 4.0)
+
+
+def test_without_manifold3d_only_the_border_fails(client, monkeypatch):
+    """An install that predates the dependency: the app (and its settings)
+    must keep working; the border answers with what to install."""
+    from autoforge.Helper import BorderMesh
+
+    monkeypatch.setattr(BorderMesh, "mf", None)
+    job, _ = _job()
+    r = client.post(f"/api/outputs/border-preview/{job.job_id}", json={"border": RECT})
+    assert r.status_code == 422 and "manifold3d" in r.json()["detail"]
+    r = client.post(f"/api/outputs/stl/{job.job_id}", json={"border": RECT})
+    assert r.status_code == 422 and "manifold3d" in r.json()["detail"]
+    assert client.get("/api/project/state").status_code == 200

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { acceptsPreviewFor, isInitRequestInFlight, useAppStore } from '../store/appStore'
 import { liveMeshUrl } from '../lib/pruning'
 import { Box, Loader2, AlertTriangle } from 'lucide-react'
@@ -6,6 +6,10 @@ import { ThreeDView } from './ThreeDView'
 import { isOwnRender, meshKeyForJob } from '../lib/meshColors'
 import { INIT_JOB_SENTINEL } from '../hooks/useSliderPreviewRender'
 import { getStackHandles, getStackSegments, filterActiveHandles } from '../lib/colorStack'
+import { BorderControls } from './BorderControls'
+import { useBorderPreview } from '../hooks/useBorderPreview'
+import { borderActive, normalizeBorder } from '../lib/border'
+import { effectiveBaseColor } from '../lib/baseColor'
 
 export const Preview3DPanel: React.FC = () => {
   const previewImage = useAppStore((s) => s.previewImage)
@@ -258,17 +262,34 @@ export const Preview3DPanel: React.FC = () => {
   const heightsPreviewMesh = useAppStore((s) => s.heightsPreviewMesh)
   const showQuickPreview = heightsMode && !!heightsPreviewMesh && !optimizationStarted
 
+  // The border is drawn around the result or the auto-preview, and taken
+  // from that model's own footprint (helpers/border on the server).
+  const settings = useAppStore((s) => s.settings)
+  const resolvedBase = useAppStore((s) => s.resolvedBase)
+  const border = useMemo(() => normalizeBorder(settings.border), [settings.border])
+  const [borderPanelOpen, setBorderPanelOpen] = useState(false)
+  const borderSource = stlFile && currentJob?.job_id ? currentJob.job_id : initMeshUrl ? INIT_JOB_SENTINEL : null
+  const borderPreview = useBorderPreview(borderSource, border, settings.background_height, borderActive(border) || borderPanelOpen)
+  const baseColor = effectiveBaseColor(settings, resolvedBase)
+
   const showNoFilamentsWarning = inputImage && activeFilaments.length === 0 && initState.status !== 'initializing' && !previewImage
 
   return (
-    <div className="flex flex-col h-full bg-gray-800 rounded-lg overflow-hidden">
-      <div className="px-3 py-2 border-b border-gray-700">
+    <div className="flex flex-col h-full bg-gray-800 rounded-lg">
+      <div className="px-3 py-1.5 border-b border-gray-700 flex items-center justify-between gap-2">
         <h3 className="text-xs font-semibold text-gray-300 flex items-center gap-1">
           <Box className="w-3.5 h-3.5" />
           3D Preview
         </h3>
+        <BorderControls
+          preview={borderPreview}
+          baseColor={baseColor}
+          available={!!borderSource && !showQuickPreview}
+          open={borderPanelOpen}
+          onOpenChange={setBorderPanelOpen}
+        />
       </div>
-      <div className="flex-1 relative overflow-hidden">
+      <div className="flex-1 relative overflow-hidden rounded-b-lg">
         {showQuickPreview ? (
           <div key="quick-preview-3d" data-testid="quick-preview-3d" className="w-full h-full relative">
             <ThreeDView coloredPlyUrl={heightsPreviewMesh!.url} className="w-full h-full" />
@@ -284,7 +305,7 @@ export const Preview3DPanel: React.FC = () => {
           </div>
         ) : stlFile ? (
           <div key="three-d-view" data-testid="three-d-view" className="w-full h-full">
-            <ThreeDView coloredPlyUrl={coloredPlyUrl} className="w-full h-full" />
+            <ThreeDView coloredPlyUrl={coloredPlyUrl} border={borderPreview.mesh} borderColor={baseColor} className="w-full h-full" />
           </div>
         ) : optimizationStarted && previewImage ? (
           <img
@@ -329,7 +350,7 @@ export const Preview3DPanel: React.FC = () => {
           </div>
         ) : initMeshUrl ? (
           <div key="init-three-d-view" data-testid="init-three-d-view" className="w-full h-full">
-            <ThreeDView coloredPlyUrl={initMeshUrl} className="w-full h-full" />
+            <ThreeDView coloredPlyUrl={initMeshUrl} border={borderPreview.mesh} borderColor={baseColor} className="w-full h-full" />
           </div>
         ) : stackSegments.length > 0 ? (
           <div key="color-stack-preview" data-testid="color-stack-preview" className="w-full h-full">

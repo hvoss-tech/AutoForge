@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Canvas, useThree } from '@react-three/fiber'
 import { OrbitControls, Html } from '@react-three/drei'
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
@@ -7,6 +7,7 @@ import { cn } from '../lib/utils'
 import { parseColoredMeshAsync } from '../lib/plyWorkerClient'
 import { colorsNewerThan, currentColorSeq, subscribeVertexColors, writeTopVertexColors } from '../lib/meshColors'
 import type { StackSegment } from '../lib/colorStack'
+import type { BorderMeshData } from '../lib/border'
 
 interface ThreeDViewProps {
   stlUrl?: string | null
@@ -15,6 +16,10 @@ interface ThreeDViewProps {
    * yet — a simple stacked-slab preview of the color sliders' filament
    * stack, so the panel shows something meaningful before the first run. */
   stackSegments?: StackSegment[]
+  /** A border (lib/border) drawn around the model, in the mesh's own
+   * coordinates, and the base filament color it prints in. */
+  border?: BorderMeshData | null
+  borderColor?: string
   className?: string
 }
 
@@ -62,25 +67,52 @@ const ColorStackPreview: React.FC<{ segments: StackSegment[] }> = ({ segments })
   )
 }
 
-function centerAndScaleGeom(geom: THREE.BufferGeometry): THREE.BufferGeometry {
-  geom.computeBoundingBox()
-  const box = geom.boundingBox
-  if (!box || !isFinite(box.max.x - box.min.x)) return geom
-  const center = new THREE.Vector3()
-  box.getCenter(center)
-  geom.translate(-center.x, -center.y, -center.z)
-  const size = new THREE.Vector3()
-  box.getSize(size)
-  const maxDim = Math.max(size.x, size.y, size.z, 0.001)
-  const targetSize = 4
-  const scale = targetSize / maxDim
-  if (isFinite(scale) && scale > 0) {
-    geom.scale(scale, scale, scale)
-  }
-  return geom
+/** Centers what's on screen (the model and its border) and scales it to
+ * ~4 units. A group transform, not baked into the geometry: the model's
+ * geometry stays in mm, the border's coordinates, and the view refits when
+ * a border is added or changed. */
+function fitTransform(boxes: (THREE.Box3 | null | undefined)[]): { position: [number, number, number]; scale: number } {
+  const box = new THREE.Box3()
+  for (const b of boxes) if (b && !b.isEmpty()) box.union(b)
+  if (box.isEmpty() || !isFinite(box.max.x - box.min.x)) return { position: [0, 0, 0], scale: 1 }
+  const center = box.getCenter(new THREE.Vector3())
+  const size = box.getSize(new THREE.Vector3())
+  const scale = 4 / Math.max(size.x, size.y, size.z, 0.001)
+  return { position: [-center.x * scale, -center.y * scale, -center.z * scale], scale }
 }
 
-const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
+const BorderGeometry: React.FC<{ border: BorderMeshData; color: string; onBox: (box: THREE.Box3 | null) => void }> = ({ border, color, onBox }) => {
+  const invalidate = useThree((s) => s.invalidate)
+  const geom = useMemo(() => {
+    const g = new THREE.BufferGeometry()
+    g.setAttribute('position', new THREE.BufferAttribute(border.positions, 3))
+    g.setIndex(new THREE.BufferAttribute(border.indices, 1))
+    // Flat plate with sharp edges: per-face normals read better than
+    // smoothed ones, which shade the rim as if it were rounded.
+    const flat = g.toNonIndexed()
+    g.dispose()
+    flat.computeVertexNormals()
+    flat.computeBoundingBox()
+    return flat
+  }, [border])
+  useEffect(() => {
+    onBox(geom.boundingBox)
+    invalidate()
+    return () => {
+      geom.dispose()
+      onBox(null)
+    }
+  }, [geom, onBox, invalidate])
+  useEffect(() => invalidate(), [color, invalidate])
+  return (
+    <mesh geometry={geom}>
+      <meshStandardMaterial color={color} roughness={0.7} metalness={0.1} side={THREE.DoubleSide} toneMapped={false} />
+    </mesh>
+  )
+}
+
+const ColoredMesh: React.FC<{ plyUrl: string; border?: BorderMeshData | null; borderColor?: string }> = ({ plyUrl, border, borderColor }) => {
+  const [borderBox, setBorderBox] = useState<THREE.Box3 | null>(null)
   const [mesh, setMesh] = useState<{ geom: THREE.BufferGeometry; colors: boolean } | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -186,8 +218,9 @@ const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
         geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
         geom.setIndex(new THREE.BufferAttribute(indices, 1))
         geom.computeVertexNormals()
+        geom.computeBoundingBox()
 
-        const centered = centerAndScaleGeom(geom)
+        const centered = geom
 
         if (colors) {
           centered.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3))
@@ -256,16 +289,20 @@ const ColoredMesh: React.FC<{ plyUrl: string }> = ({ plyUrl }) => {
     )
   }
 
+  const fit = fitTransform([mesh.geom.boundingBox, border ? borderBox : null])
   return (
-    <mesh geometry={mesh.geom}>
-      <meshStandardMaterial
-        roughness={0.7}
-        metalness={0.1}
-        side={THREE.DoubleSide}
-        vertexColors={mesh.colors}
-        toneMapped={false}
-      />
-    </mesh>
+    <group position={fit.position} scale={fit.scale}>
+      <mesh geometry={mesh.geom}>
+        <meshStandardMaterial
+          roughness={0.7}
+          metalness={0.1}
+          side={THREE.DoubleSide}
+          vertexColors={mesh.colors}
+          toneMapped={false}
+        />
+      </mesh>
+      {border && <BorderGeometry border={border} color={borderColor ?? '#000000'} onBox={setBorderBox} />}
+    </group>
   )
 }
 
@@ -306,6 +343,8 @@ export const ThreeDView: React.FC<ThreeDViewProps> = ({
   stlUrl,
   coloredPlyUrl,
   stackSegments,
+  border,
+  borderColor,
   className,
 }) => {
   const theme = useThreeDTheme()
@@ -366,9 +405,9 @@ export const ThreeDView: React.FC<ThreeDViewProps> = ({
         <directionalLight position={[5, 10, 5]} intensity={0.35} />
         <directionalLight position={[-5, -5, -5]} intensity={0.15} />
         {coloredPlyUrl ? (
-          <ColoredMesh plyUrl={coloredPlyUrl} />
+          <ColoredMesh plyUrl={coloredPlyUrl} border={border} borderColor={borderColor} />
         ) : stlUrl ? (
-          <ColoredMesh plyUrl={stlUrl} />
+          <ColoredMesh plyUrl={stlUrl} border={border} borderColor={borderColor} />
         ) : stackSegments ? (
           <ColorStackPreview segments={stackSegments} />
         ) : null}

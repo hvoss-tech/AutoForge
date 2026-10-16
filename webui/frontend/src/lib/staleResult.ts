@@ -13,6 +13,8 @@ const IGNORED = new Set([
   'auto_initial_prune',
   // More attempts at the same settings; the result on screen still matches them.
   'best_of',
+  // Added to the finished model by the 3D view and the export.
+  'border',
   'visualize',
   'disable_visualization_for_gradio',
   'tensorboard',
