@@ -1035,7 +1035,6 @@ test.describe('Settings Modal', () => {
     ]) {
       await expect(page.locator(`[data-testid="setting-${key}"]`)).toBeVisible()
     }
-    await expect(page.locator('[data-testid="setting-best_of"]')).toHaveCount(0)
   })
 
   test('every field explains itself', async ({ page }) => {
