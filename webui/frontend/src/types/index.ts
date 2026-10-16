@@ -99,6 +99,9 @@ export interface JobStatus {
   result_colors?: number | null
   result_swaps?: number | null
   result_layers?: number | null
+  /** Best of N runs: the finished runs' losses, and the one kept (0-based). */
+  best_of_losses?: number[] | null
+  best_of_run?: number | null
   /** Which auto-repeat pruning pass is running, out of how many allowed. */
   pruning_pass?: number | null
   pruning_max_passes?: number | null

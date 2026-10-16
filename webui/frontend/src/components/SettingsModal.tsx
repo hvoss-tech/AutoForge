@@ -8,6 +8,7 @@ import { QUALITY_PRESETS, presetForIterations } from '../lib/settingsPresets'
 import { FilamentPicker } from './FilamentPicker'
 import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { RunLimitsEditor } from './RunLimits'
+import { BEST_OF_MAX } from '../lib/bestOf'
 
 type FieldType = 'number' | 'boolean' | 'select' | 'color'
 
@@ -299,6 +300,25 @@ export const SettingsModal: React.FC = () => {
                 />
               </label>
               {activePreset === 'custom' && <span className="text-xs text-gray-400">Custom</span>}
+              <label
+                className="flex items-center gap-2 text-xs text-gray-300"
+                htmlFor="setting-best_of"
+                title="Runs the whole optimization this many times and keeps the result with the lowest loss. Each run takes as long as a normal one."
+              >
+                Best of
+                <NumberInput
+                  id="setting-best_of"
+                  value={settings.best_of}
+                  onValueChange={(v) => updateSetting('best_of', v)}
+                  integer
+                  min={1}
+                  max={BEST_OF_MAX}
+                  step={1}
+                  className="w-16 text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1 text-gray-100"
+                  data-testid="setting-best_of"
+                />
+                runs
+              </label>
             </div>
             <p className="text-[11px] text-gray-400 mt-1.5">
               {QUALITY_PRESETS.find((p) => p.id === activePreset)?.description ?? 'More iterations take longer but usually match the picture more closely.'}

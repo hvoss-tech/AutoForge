@@ -35,6 +35,7 @@ import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { onUiCommand, sendUiCommand, type UiCommand } from '../lib/uiEvents'
 import { useFlash } from '../hooks/usePersistentState'
 import { describeReportPins, summarizeReport } from '../lib/heightGuidance'
+import { bestOfWarning, describeBestOfRuns } from '../lib/bestOf'
 
 interface UpdateInfo {
   current_version: string
@@ -223,6 +224,7 @@ const JobProgress: React.FC<{ elapsedEta: { elapsed: number; eta: number; stalle
   const phase = currentJob.status === 'paused' ? 'Paused' : currentJob.phase || 'Optimizing'
   const points = lossJobId === currentJob.job_id ? lossHistory : []
   const bestLoss = points.length ? Math.min(...points.map((p) => p.loss)) : null
+  const finishedRuns = describeBestOfRuns(currentJob.best_of_losses)
   const disconnected = connection !== 'ok'
   // "Stalled" only means something while the server is reachable; a lost
   // connection gets its own, louder state (and the banner under the bar).
@@ -299,6 +301,12 @@ const JobProgress: React.FC<{ elapsedEta: { elapsed: number; eta: number; stalle
           {bestLoss !== null && (
             <div className="flex justify-between"><span className="text-gray-400">Lowest so far</span><span className="text-gray-100 tabular-nums">{bestLoss.toFixed(4)}</span></div>
           )}
+          {finishedRuns && (
+            <div data-testid="job-best-of-runs">
+              <div className="text-gray-400">Finished runs</div>
+              {finishedRuns.map((line) => <div key={line} className="text-gray-100 tabular-nums">{line}</div>)}
+            </div>
+          )}
           {timing && <div className="flex justify-between"><span className="text-gray-400">Time</span><span className="text-gray-100 tabular-nums">{timing}</span></div>}
           {disconnected && (
             <div className="flex justify-between"><span className="text-gray-400">Server</span><span className={connection === 'lost' ? 'text-red-400' : 'text-amber-500'}>{connection === 'lost' ? 'not reachable' : 'reconnecting…'}</span></div>
@@ -356,6 +364,7 @@ const ResultStatus: React.FC = () => {
   // prune finished, else the run's.
   const guidanceReport = (pruned ? pruningJob?.guidance_report : null) ?? currentJob?.guidance_report ?? null
   const guidanceSummary = summarizeReport(guidanceReport)
+  const bestOfRuns = describeBestOfRuns(currentJob?.best_of_losses, currentJob?.best_of_run)
 
   return (
     <div
@@ -403,6 +412,16 @@ const ResultStatus: React.FC = () => {
         >
           <span aria-hidden className="text-gray-500">· </span>
           Heights {guidanceSummary.text}
+        </span>
+      )}
+      {bestOfRuns && (
+        <span
+          className="text-xs text-gray-300 tabular-nums"
+          title={['The result with the lowest loss was kept:', ...bestOfRuns].join('\n')}
+          data-testid="result-best-of"
+        >
+          <span aria-hidden className="text-gray-500">· </span>
+          Best of {bestOfRuns.length}
         </span>
       )}
       {pruned && (
@@ -573,6 +592,8 @@ export const TopBar: React.FC = () => {
         })
         if (!ok) return
       }
+      const warning = bestOfWarning(useAppStore.getState().settings.best_of)
+      if (warning && !(await requestConfirm(warning))) return
       await startOptimization()
     } catch (e) {
       console.error('Failed to start:', e)

@@ -11,6 +11,8 @@ const IGNORED = new Set([
   'pruning_max_swaps',
   'pruning_max_layer',
   'auto_initial_prune',
+  // More attempts at the same settings; the result on screen still matches them.
+  'best_of',
   'visualize',
   'disable_visualization_for_gradio',
   'tensorboard',
