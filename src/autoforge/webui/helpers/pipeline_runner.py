@@ -491,6 +491,87 @@ def run_pipeline(
     return state
 
 
+def result_loss(state: Dict[str, Any]) -> float:
+    """The loss a best-of series compares runs by: the optimizer's own best
+    discrete loss (colour, plus the height guidance's cost with guidance),
+    the same number the UI shows while a run trains."""
+    loss = state["optimizer"].best_discrete_loss
+    return float(loss.item() if hasattr(loss, "item") else loss)
+
+
+def run_best_of(
+    input_image_path: str,
+    active_filaments: List[Dict[str, Any]],
+    output_dir: str,
+    settings: dict,
+    best_of: int = 1,
+    run_callback: Optional[Callable] = None,
+    pipeline: Optional[Callable] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """``run_pipeline()`` ``best_of`` times and keep the run with the lowest
+    loss (see ``result_loss``), like the CLI's --best_of.
+
+    A fixed seed is the first run's and counts up from there; seed 0 draws
+    a fresh one per run. Only the best run so far stays on the device, the
+    others are released as soon as they lose. ``run_callback(index, total,
+    losses)`` is called before each run with the losses of the finished
+    ones. ``pipeline`` replaces ``run_pipeline`` (called with keyword
+    arguments only). Cancelling stops the series and returns a cancelled state. A run
+    that fails after an earlier one finished ends the series with the best
+    finished run.
+
+    Returns the best run's state, plus ``best_of = {"runs", "best_run",
+    "losses"}`` when more than one run was asked for.
+    """
+    from autoforge.webui.helpers.gpu_memory import release_pipeline_result
+
+    pipeline = pipeline or run_pipeline
+    common = {"input_image_path": input_image_path, "active_filaments": active_filaments, "output_dir": output_dir}
+    total = max(1, int(best_of))
+    if total == 1:
+        return pipeline(**common, settings=settings, **kwargs)
+
+    cancel_event = kwargs.get("cancel_event")
+    base_seed = int(settings.get("random_seed") or 0)
+    best: Optional[Dict[str, Any]] = None
+    best_index = -1
+    losses: List[float] = []
+    for i in range(total):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        if run_callback is not None:
+            run_callback(i, total, list(losses))
+        run_settings = dict(settings)
+        if base_seed != 0:
+            run_settings["random_seed"] = base_seed + i
+        try:
+            state = pipeline(**common, settings=run_settings, **kwargs)
+        except Exception:
+            if best is None:
+                raise
+            traceback.print_exc()
+            print(f"Run {i + 1}/{total} failed; keeping the best of the {len(losses)} finished runs.")
+            break
+        if state.get("cancelled"):
+            release_pipeline_result(state)
+            break
+        loss = result_loss(state)
+        losses.append(loss)
+        print(f"Run {i + 1}/{total} finished with loss {loss:.4f}")
+        if best is None or loss < losses[best_index]:
+            release_pipeline_result(best)
+            best, best_index = state, i
+        else:
+            release_pipeline_result(state)
+
+    if best is None or (cancel_event is not None and cancel_event.is_set()):
+        release_pipeline_result(best)
+        return {"cancelled": True}
+    best["best_of"] = {"runs": total, "best_run": best_index, "losses": losses}
+    return best
+
+
 def build_init_preview(
     input_image_path: str,
     active_filaments: List[Dict[str, Any]],

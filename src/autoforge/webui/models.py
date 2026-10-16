@@ -233,6 +233,10 @@ class JobStatus(CamelCaseModel):
     # How the result follows the height guidance (see
     # sliders.guidance_report_from_optimizer); None without guidance.
     guidance_report: Optional[dict[str, Any]] = None
+    # Best of N runs (OptimizationSettings.best_of): the losses of the runs
+    # finished so far, and once completed, which of them (0-based) was kept.
+    best_of_losses: Optional[list[float]] = None
+    best_of_run: Optional[int] = None
     # Which pruning pass is running, and how many are allowed, when pruning
     # repeats itself until it stops improving.
     pruning_pass: Optional[int] = None

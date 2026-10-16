@@ -9,7 +9,7 @@ from ..models import OptimizationSettings, StateSnapshot
 from ..services.optimization_service import get_optimization_service
 from ..services.project_service import get_project_service
 from ..services.filament_service import get_filament_service
-from ..helpers.pipeline_runner import run_pipeline as _run_pipeline, friendly_error_message
+from ..helpers.pipeline_runner import run_pipeline as _run_pipeline, run_best_of as _run_best_of, friendly_error_message
 from ..helpers.gpu_memory import empty_device_cache, release_pipeline_result
 from ..helpers.telemetry import capture_exception
 from ..services.image_service import get_image_service
@@ -246,13 +246,35 @@ async def start_optimization(settings: OptimizationSettings):
                 "Exporting results": (95.0, 100.0),
             }
 
+            # With best of N, the runs share everything before the export
+            # equally, and each phase is named after its run.
+            series = {"index": 0, "total": max(1, int(settings.best_of))}
+
             def _overall(phase, fraction):
                 lo, hi = slices[phase]
-                return lo + (hi - lo) * min(1.0, max(0.0, float(fraction)))
+                value = lo + (hi - lo) * min(1.0, max(0.0, float(fraction)))
+                if phase == "Exporting results":
+                    return value
+                return (series["index"] * 95.0 + value) / series["total"]
+
+            def _label(phase):
+                if series["total"] == 1 or phase == "Exporting results":
+                    return phase
+                return f"Run {series['index'] + 1}/{series['total']} · {phase}"
+
+            def _run_callback(index, total, losses):
+                series["index"] = index
+                try:
+                    svc.update_status(
+                        job.job_id, "running", phase=_label("Estimating heights"),
+                        progress=_overall("Estimating heights", 0.0), iteration=0, best_of_losses=losses,
+                    )
+                except Exception:
+                    pass
 
             def _phase_callback(phase, fraction):
                 try:
-                    svc.update_status(job.job_id, "running", phase=phase, progress=_overall(phase, fraction))
+                    svc.update_status(job.job_id, "running", phase=_label(phase), progress=_overall(phase, fraction))
                 except Exception:
                     pass
 
@@ -271,7 +293,7 @@ async def start_optimization(settings: OptimizationSettings):
                         iteration=step,
                         loss=loss_val,
                         total_iterations=settings.iterations,
-                        phase="Optimizing",
+                        phase=_label("Optimizing"),
                     )
                 except Exception:
                     import traceback
@@ -311,11 +333,14 @@ async def start_optimization(settings: OptimizationSettings):
                     import traceback
                     traceback.print_exc()
 
-            result = _run_pipeline(
+            result = _run_best_of(
                 input_image_path=input_image_path,
                 active_filaments=filament_dicts,
                 output_dir=output_dir,
                 settings=run_settings,
+                best_of=settings.best_of,
+                run_callback=_run_callback,
+                pipeline=_run_pipeline,
                 preview_callback=_preview_callback,
                 progress_callback=_progress_callback,
                 cancel_event=cancel_event,
@@ -394,6 +419,9 @@ async def start_optimization(settings: OptimizationSettings):
                     counts["guidance_report"] = report
             except Exception:
                 logger.exception("Could not report the height guidance of job %s", job.job_id)
+            if result.get("best_of"):
+                counts["best_of_losses"] = result["best_of"]["losses"]
+                counts["best_of_run"] = result["best_of"]["best_run"]
             svc.update_status(job.job_id, "completed",
                               phase=None,
                               progress=100.0,
