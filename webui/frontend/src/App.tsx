@@ -20,6 +20,7 @@ import { TooltipProvider } from './components/ui/tooltip'
 import { useAppStore } from './store/appStore'
 import { useJobWebSocket } from './hooks/useJobWebSocket'
 import { useAutoPreviewInit } from './hooks/useAutoPreviewInit'
+import { useResultLayerRange } from './hooks/useResultLayerRange'
 import { useHueforgeOffer } from './hooks/useHueforgeOffer'
 import { useElementHeight, usePersistentState } from './hooks/usePersistentState'
 import { historyShortcut } from './lib/history'
@@ -152,6 +153,7 @@ const App: React.FC = () => {
   useJobWebSocket(activeJobId)
   useHueforgeOffer()
   useAutoPreviewInit()
+  useResultLayerRange()
 
   useEffect(() => onUiCommand('focus-library', () => setSidebarCollapsed(false)), [setSidebarCollapsed])
 

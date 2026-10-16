@@ -1,13 +1,15 @@
 import asyncio
+import os
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from ..config import config
 from ..services.optimization_service import get_optimization_service
 from ..helpers.sliders import (
     derive_base_from_result,
     derive_sliders_from_result,
     derive_layer_range_from_result,
 )
-from ..helpers.result_store import ResultUnavailable, using_result
+from ..helpers.result_store import ResultUnavailable, load_solution, using_result
 from .init import get_init_pipeline_result
 
 router = APIRouter()
@@ -24,6 +26,39 @@ def _from_result(job_id: str, derive):
         return None
 
 _DEFAULTS = {"sliders": [], "min_layer": 0, "max_layer": 75}
+
+
+@router.get("/range")
+async def get_layer_range(job_id: str):
+    """``{"min_layer", "max_layer"}`` of a result's height map: what the
+    color core runs up to. Cheap - the live result, else the job's saved
+    solution, never a rebuild - because the page asks on every reload: it
+    used to keep its placeholder range (75) there, so the color core ran far
+    past the result's top layer."""
+    return await asyncio.to_thread(_layer_range, job_id)
+
+
+def _layer_range(job_id: str) -> dict:
+    if job_id == "__init__":
+        result = get_init_pipeline_result()
+        range_info = derive_layer_range_from_result(result) if result else None
+        if range_info:
+            return range_info
+        raise HTTPException(404, "No auto-preview")
+    live = get_optimization_service().get_pipeline_result(job_id)
+    if live:
+        range_info = derive_layer_range_from_result(live)
+        if range_info:
+            return range_info
+    checkpoints = os.path.realpath(config.checkpoints_path)
+    job_dir = os.path.realpath(os.path.join(checkpoints, job_id))
+    solution = load_solution(job_dir) if job_dir.startswith(checkpoints + os.sep) else None
+    if solution is None:
+        raise HTTPException(404, "No saved result for this job")
+    heights = solution["heights"]
+    if heights.size == 0:
+        return {"min_layer": 0, "max_layer": 0}
+    return {"min_layer": int(heights.min()), "max_layer": int(heights.max())}
 
 
 @router.get("/from-optimizer")
