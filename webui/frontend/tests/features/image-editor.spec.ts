@@ -150,6 +150,20 @@ test('a layer on a selection changes only the selected part', async ({ page }) =
   await expect(outline).toHaveCount(0)
   await byTestId(page, 'editor-show-selection').click()
   await expect(outline).toBeVisible()
+  // A click outside the picture selects nothing; undo brings it back.
+  const scope = byTestId(page, 'editor-layer-0').getByTestId('editor-layer-scope')
+  const pic = (await byTestId(page, 'editor-canvas').boundingBox())!
+  await page.mouse.click(pic.x + pic.width * 0.5, pic.y - 8)
+  await expect(outline).toHaveCount(0)
+  await expect(scope).toHaveText('0%')
+  await byTestId(page, 'editor-undo').click()
+  await expect(scope).toHaveText('50%')
+  // So does Ctrl+D (and the Deselect button).
+  await page.keyboard.press('Control+d')
+  await expect(scope).toHaveText('0%')
+  await byTestId(page, 'editor-undo').click()
+  await expect(scope).toHaveText('50%')
+  await expect(outline).toBeVisible()
   // Hard edges, so the halves are clean.
   await press(page, 'editor-feather', 'Home')
   await press(page, 'adjust-saturation', 'Home')

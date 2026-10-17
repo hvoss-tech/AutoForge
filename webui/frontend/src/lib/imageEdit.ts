@@ -131,7 +131,20 @@ export function hashBytes(bytes: Uint8Array | Uint8ClampedArray, seed = 0x811c9d
  * expensive part, so moving the colour count only cuts a cached tree. */
 export class ReduceCache {
   private entries = new Map<string, Prepared>()
+  /** The analysis Lab of a layer's input (big: kept for two inputs). */
+  private labs = new Map<string, Float32Array>()
   constructor(private limit = 6) {}
+  lab(key: string, compute: () => Float32Array): Float32Array {
+    let hit = this.labs.get(key)
+    if (hit) {
+      this.labs.delete(key)
+    } else {
+      hit = compute()
+      while (this.labs.size >= 2) this.labs.delete(this.labs.keys().next().value as string)
+    }
+    this.labs.set(key, hit)
+    return hit
+  }
   get(key: string): Prepared | undefined {
     const hit = this.entries.get(key)
     if (hit) {
@@ -177,10 +190,13 @@ export function renderLayers(input: RenderLayersInput): { rgba: Uint8ClampedArra
     }
     const adjusted = applyAdjustments(current, w, h, layer.adjust, new Uint8ClampedArray(current.length), scale)
     if (layer.adjust.reduce.enabled) {
-      const lab = analysisLab(adjusted, w, h, scale)
+      // Moving the colour count, or a layer above this one, leaves this
+      // layer's input as it was: its analysis and merge tree are reused.
+      const inputKey = `${w}x${h}:${hashBytes(adjusted)}`
+      const lab = input.cache ? input.cache.lab(inputKey, () => analysisLab(adjusted, w, h, scale)) : analysisLab(adjusted, w, h, scale)
       let palette = input.palettes?.get(layer.id)
       if (!palette) {
-        const key = `${w}x${h}:${hashBytes(adjusted)}:${weights ? hashBytes(weights) : 'all'}`
+        const key = `${inputKey}:${weights ? hashBytes(weights) : 'all'}`
         let prepared = input.cache?.get(key)
         if (!prepared) {
           prepared = prepareReduce(lab, weights, w * h)

@@ -301,15 +301,43 @@ const ImageEditorDialog: React.FC = () => {
     | { kind: 'brush'; mask: Uint8Array; last: Point; erase: boolean }
     | { kind: 'lasso'; points: Point[]; mode: SelectMode }
     | { kind: 'box'; start: Point; end: Point; mode: SelectMode }
+    // Pressed outside the picture: a click clears the selection, a drag
+    // starts the tool from there.
+    | { kind: 'outside'; start: Point; screen: Point; mods: { shiftKey: boolean; altKey: boolean } }
     | null
   >(null)
   const [shape, setShape] = useState<{ kind: 'lasso'; points: Point[] } | { kind: 'rect' | 'ellipse'; a: Point; b: Point } | null>(null)
   const [cursor, setCursor] = useState<Point | null>(null)
 
+  const inPicture = (p: Point) => !!work && p[0] >= 0 && p[1] >= 0 && p[0] < work.w && p[1] < work.h
+
+  /** Nothing selected on the current layer (it then changes nothing until
+   * something is selected again). */
+  const deselect = () => {
+    if (!work || !layer || layer.selection !== 'mask') return
+    const mask = docRef.current.masks.get(layer.id)
+    if (!mask || !mask.some((v) => v > 0)) return
+    commit()
+    setMask(new Uint8Array(work.w * work.h))
+  }
+
+  const deselectRef = useRef(deselect)
+  deselectRef.current = deselect
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (!work || !layer || e.button !== 0 || tool === 'pan') return
     const p = toImage(e)
     ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
+    if (!inPicture(p)) {
+      gesture.current = { kind: 'outside', start: p, screen: [e.clientX, e.clientY], mods: { shiftKey: e.shiftKey, altKey: e.altKey } }
+      return
+    }
+    begin(p, e)
+  }
+
+  /** The current tool, starting at p (in the picture's pixels). */
+  const begin = (p: Point, e: { shiftKey: boolean; altKey: boolean }) => {
+    if (!work || !layer) return
     if (tool === 'brush' || tool === 'eraser') {
       const erase = tool === 'eraser' || e.altKey
       commit()
@@ -324,7 +352,7 @@ const ImageEditorDialog: React.FC = () => {
       gesture.current = { kind: 'box', start: p, end: p, mode: effectiveMode(e) }
       setShape({ kind: tool, a: p, b: p })
     } else if (tool === 'wand') {
-      if (p[0] < 0 || p[1] < 0 || p[0] >= work.w || p[1] >= work.h) return
+      if (!inPicture(p)) return
       const m = effectiveMode(e)
       commit()
       const base = editableMask(m)
@@ -357,6 +385,15 @@ const ImageEditorDialog: React.FC = () => {
     if (tool === 'brush' || tool === 'eraser') setCursor(p)
     const g = gesture.current
     if (!g) return
+    if (g.kind === 'outside') {
+      // Far enough to be a drag: the tool starts where it was pressed.
+      if (Math.hypot(e.clientX - g.screen[0], e.clientY - g.screen[1]) < 4) return
+      gesture.current = null
+      if (tool === 'wand') return
+      begin(g.start, g.mods)
+      onPointerMove(e)
+      return
+    }
     if (g.kind === 'brush') {
       brushStroke(g.mask, work.w, work.h, g.last[0], g.last[1], p[0], p[1], brushSize / 2, brushHardness, g.erase)
       g.last = p
@@ -377,6 +414,10 @@ const ImageEditorDialog: React.FC = () => {
     const g = gesture.current
     gesture.current = null
     if (!g || !work) return
+    if (g.kind === 'outside') {
+      deselect()
+      return
+    }
     // A stroke painted into its own copy (see editableMask): undo still
     // has the mask from before it.
     if (g.kind === 'brush') return
@@ -507,6 +548,12 @@ const ImageEditorDialog: React.FC = () => {
         e.stopPropagation()
         if (e.shiftKey) redo()
         else undo()
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'd') {
+        e.preventDefault()
+        e.stopPropagation()
+        deselectRef.current()
         return
       }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
@@ -666,6 +713,15 @@ const ImageEditorDialog: React.FC = () => {
                 </>
               )}
               <div className="ml-auto flex items-center gap-1.5">
+                <button
+                  onClick={deselect}
+                  disabled={!currentMask || !outline?.path}
+                  className={outlineButton}
+                  title="Select nothing (Ctrl+D, or click outside the picture)"
+                  data-testid="editor-deselect"
+                >
+                  Deselect
+                </button>
                 <button onClick={() => selectionAction((m) => (invertMask(m), m))} disabled={!work} className={outlineButton} title="Swap selected and not selected" data-testid="editor-invert">
                   Invert
                 </button>
@@ -758,7 +814,7 @@ const ImageEditorDialog: React.FC = () => {
               )}
             </div>
             <div className="flex items-center gap-3 px-3 py-1 border-t border-gray-700 text-[11px] text-gray-500">
-              <span>Scroll to zoom · {viewportPaint ? 'right-drag' : 'drag'} to pan · double-click to reset · hold \ for before</span>
+              <span>Scroll to zoom · {viewportPaint ? 'right-drag' : 'drag'} to pan · click outside the picture to deselect · hold \ for before</span>
               {zoom.scale > 1 && <span className="ml-auto tabular-nums text-gray-400">{zoom.scale.toFixed(1)}×</span>}
             </div>
           </div>

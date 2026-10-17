@@ -1,11 +1,13 @@
 import { OUTPUT_MAX_SIDE, WORK_PIXELS, fitPixels, fitSide, renderLayers, ReduceCache, type EditLayer } from './imageEdit.ts'
 import { resizeChannel } from './imageMath.ts'
 import type { Palette } from './colorReduce.ts'
+import { LatestOnly } from './latestOnly.ts'
 
 /** The image editor's renderer: the picture at a working size for the live
  * preview and at full size for the result, rendered in a worker so the
- * editor stays responsive while a slider moves. Only the newest render is
- * delivered; ones overtaken meanwhile resolve to null. */
+ * editor stays responsive while a slider moves. One render at a time; of
+ * the ones asked for meanwhile only the newest runs, the rest resolve to
+ * null (see LatestOnly). */
 
 export interface Picture {
   rgba: Uint8ClampedArray
@@ -88,7 +90,7 @@ export class ImageEditEngine {
   private worker: Worker | null = null
   private nextId = 1
   private pending = new Map<number, Pending>()
-  private latestRender = 0
+  private renders = new LatestOnly<Rendered>()
   private work: Picture | null = null
   private full: Picture | null = null
   // Without a worker (old browsers, tests): the same work, inline.
@@ -130,18 +132,19 @@ export class ImageEditEngine {
   }
 
   /** The layers over the working-size picture; null if a newer render was
-   * asked for meanwhile. */
-  async render(layers: EditLayer[], masks: Map<string, Uint8Array>): Promise<Rendered | null> {
-    const ticket = ++this.latestRender
-    if (!this.worker) {
-      if (!this.work) throw new Error('No picture loaded')
-      await new Promise((r) => setTimeout(r, 0))
-      if (ticket !== this.latestRender) return null
-      return renderLayers({ rgba: this.work.rgba, w: this.work.w, h: this.work.h, layers, masks, cache: this.cache })
-    }
-    const reply = await this.call({ type: 'render', layers, masks: [...masks].map(([id, m]) => [id, m.slice()]) })
-    if (ticket !== this.latestRender) return null
-    return { rgba: reply.rgba as Uint8ClampedArray, palettes: new Map(reply.palettes as [string, Palette][]) }
+   * asked for before this one got its turn. */
+  render(layers: EditLayer[], masks: Map<string, Uint8Array>): Promise<Rendered | null> {
+    // The masks as they are now: a brush stroke keeps changing its array.
+    const snapshot = new Map([...masks].map(([id, m]) => [id, m.slice()]))
+    return this.renders.run(async () => {
+      if (!this.worker) {
+        if (!this.work) throw new Error('No picture loaded')
+        await new Promise((r) => setTimeout(r, 0))
+        return renderLayers({ rgba: this.work.rgba, w: this.work.w, h: this.work.h, layers, masks: snapshot, cache: this.cache })
+      }
+      const reply = await this.call({ type: 'render', layers, masks: [...snapshot] }, [...snapshot.values()].map((m) => m.buffer))
+      return { rgba: reply.rgba as Uint8ClampedArray, palettes: new Map(reply.palettes as [string, Palette][]) }
+    })
   }
 
   /** The layers over the full picture. */

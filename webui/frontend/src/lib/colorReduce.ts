@@ -306,6 +306,27 @@ export function voteLabels(labels: Int16Array, lab: Float32Array, w: number, h: 
         out[i] = -1
         continue
       }
+      // Inside an area of one colour there is nothing to decide (most of
+      // the picture, after the nearest-colour pass).
+      const own = labels[i]
+      let uniform = true
+      for (let dy = -radius; dy <= radius && uniform; dy++) {
+        const yy = y + dy
+        if (yy < 0 || yy >= h) continue
+        for (let dx = -radius; dx <= radius; dx++) {
+          const xx = x + dx
+          if (xx < 0 || xx >= w) continue
+          const lbl = labels[yy * w + xx]
+          if (lbl !== own && lbl >= 0) {
+            uniform = false
+            break
+          }
+        }
+      }
+      if (uniform) {
+        out[i] = own
+        continue
+      }
       let nTouched = 0
       let s = 0
       for (let dy = -radius; dy <= radius; dy++) {

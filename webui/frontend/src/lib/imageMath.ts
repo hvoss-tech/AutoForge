@@ -68,49 +68,109 @@ export function rgbaToLab(rgba: Uint8Array | Uint8ClampedArray, count: number): 
 /** Rec. 709 luma of sRGB 0-255 values, 0-255. */
 export const luma = (r: number, g: number, b: number) => 0.2126 * r + 0.7152 * g + 0.0722 * b
 
-/** Gaussian blur of `channels` interleaved float channels, in place,
- * separable with clamped edges. sigma <= 0.3 is a no-op. */
+/** Gaussian blur of `channels` interleaved float channels, in place, with
+ * clamped edges. sigma <= 0.3 is a no-op. Small radii use the exact kernel;
+ * larger ones three box blurs (the same curve within a few percent), whose
+ * cost doesn't grow with the radius: a wide soften used to take most of a
+ * second per render. */
 export function gaussianBlur(data: Float32Array, w: number, h: number, sigma: number, channels = 1): void {
+  blurChannels(data, w, h, sigma, channels, sigma >= 1.5)
+}
+
+/** The exact (sampled-kernel) Gaussian blur at any radius; see gaussianBlur. */
+export function gaussianBlurExact(data: Float32Array, w: number, h: number, sigma: number, channels = 1): void {
+  blurChannels(data, w, h, sigma, channels, false)
+}
+
+function blurChannels(data: Float32Array, w: number, h: number, sigma: number, channels: number, boxes: boolean): void {
   if (!(sigma > 0.3) || w === 0 || h === 0) return
+  const n = w * h
+  const plane = channels === 1 ? data : new Float32Array(n)
+  const tmp = new Float32Array(n)
+  for (let c = 0; c < channels; c++) {
+    if (channels > 1) for (let i = 0; i < n; i++) plane[i] = data[i * channels + c]
+    if (boxes) for (const size of boxSizes(sigma)) boxPlane(plane, tmp, w, h, (size - 1) / 2)
+    else kernelPlane(plane, tmp, w, h, sigma)
+    if (channels > 1) for (let i = 0; i < n; i++) data[i * channels + c] = plane[i]
+  }
+}
+
+/** One plane through a sampled Gaussian kernel: rows, then columns added
+ * row by row (contiguous memory instead of walking down columns). */
+function kernelPlane(plane: Float32Array, tmp: Float32Array, w: number, h: number, sigma: number): void {
   const radius = Math.min(Math.ceil(sigma * 3), Math.max(w, h))
   const kernel = new Float32Array(radius * 2 + 1)
   let sum = 0
-  for (let i = -radius; i <= radius; i++) {
-    const v = Math.exp(-(i * i) / (2 * sigma * sigma))
-    kernel[i + radius] = v
-    sum += v
-  }
+  for (let i = -radius; i <= radius; i++) sum += kernel[i + radius] = Math.exp(-(i * i) / (2 * sigma * sigma))
   for (let i = 0; i < kernel.length; i++) kernel[i] /= sum
-  const line = new Float32Array(Math.max(w, h) * channels)
-  // Rows.
   for (let y = 0; y < h; y++) {
-    const row = y * w * channels
-    line.set(data.subarray(row, row + w * channels))
+    const row = y * w
     for (let x = 0; x < w; x++) {
-      for (let c = 0; c < channels; c++) {
-        let acc = 0
+      let acc = 0
+      if (x >= radius && x < w - radius) {
+        const base = row + x - radius
+        for (let k = 0; k < kernel.length; k++) acc += plane[base + k] * kernel[k]
+      } else {
         for (let k = -radius; k <= radius; k++) {
           const xx = x + k < 0 ? 0 : x + k >= w ? w - 1 : x + k
-          acc += line[xx * channels + c] * kernel[k + radius]
+          acc += plane[row + xx] * kernel[k + radius]
         }
-        data[row + x * channels + c] = acc
       }
+      tmp[row + x] = acc
     }
   }
-  // Columns.
-  for (let x = 0; x < w; x++) {
-    for (let y = 0; y < h; y++) for (let c = 0; c < channels; c++) line[y * channels + c] = data[(y * w + x) * channels + c]
-    for (let y = 0; y < h; y++) {
-      for (let c = 0; c < channels; c++) {
-        let acc = 0
-        for (let k = -radius; k <= radius; k++) {
-          const yy = y + k < 0 ? 0 : y + k >= h ? h - 1 : y + k
-          acc += line[yy * channels + c] * kernel[k + radius]
-        }
-        data[(y * w + x) * channels + c] = acc
-      }
+  plane.fill(0)
+  for (let y = 0; y < h; y++) {
+    const row = y * w
+    for (let k = -radius; k <= radius; k++) {
+      const yy = y + k < 0 ? 0 : y + k >= h ? h - 1 : y + k
+      const from = yy * w
+      const kv = kernel[k + radius]
+      for (let x = 0; x < w; x++) plane[row + x] += tmp[from + x] * kv
     }
   }
+}
+
+/** One plane through a box blur of radius r (running sums; rows, then
+ * columns kept as one running sum per column). */
+function boxPlane(plane: Float32Array, tmp: Float32Array, w: number, h: number, r: number): void {
+  const scale = 1 / (2 * r + 1)
+  for (let y = 0; y < h; y++) {
+    const row = y * w
+    let sum = 0
+    for (let i = -r; i <= r; i++) sum += plane[row + (i < 0 ? 0 : i >= w ? w - 1 : i)]
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = sum * scale
+      const add = x + r + 1
+      const sub = x - r
+      sum += plane[row + (add >= w ? w - 1 : add)] - plane[row + (sub < 0 ? 0 : sub)]
+    }
+  }
+  const sums = new Float32Array(w)
+  for (let i = -r; i <= r; i++) {
+    const from = (i < 0 ? 0 : i >= h ? h - 1 : i) * w
+    for (let x = 0; x < w; x++) sums[x] += tmp[from + x]
+  }
+  for (let y = 0; y < h; y++) {
+    const row = y * w
+    const add = (y + r + 1 >= h ? h - 1 : y + r + 1) * w
+    const sub = (y - r < 0 ? 0 : y - r) * w
+    for (let x = 0; x < w; x++) {
+      plane[row + x] = sums[x] * scale
+      sums[x] += tmp[add + x] - tmp[sub + x]
+    }
+  }
+}
+
+/** Widths of three box blurs that together approximate a Gaussian. */
+function boxSizes(sigma: number): number[] {
+  const n = 3
+  const ideal = Math.sqrt((12 * sigma * sigma) / n + 1)
+  let lower = Math.floor(ideal)
+  if (lower % 2 === 0) lower--
+  const upper = lower + 2
+  const m = Math.round((12 * sigma * sigma - n * lower * lower - 4 * n * lower - 3 * n) / (-4 * lower - 4))
+  return Array.from({ length: n }, (_, i) => (i < m ? lower : upper))
 }
 
 /** A single channel resized with bilinear filtering (masks between the

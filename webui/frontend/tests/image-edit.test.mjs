@@ -6,7 +6,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { gaussianBlur, labToRgb, resizeChannel, rgbToLab } from '../src/lib/imageMath.ts'
+import { gaussianBlur, gaussianBlurExact, labToRgb, resizeChannel, rgbToLab } from '../src/lib/imageMath.ts'
 import {
   applyAdjustments,
   autoLevels,
@@ -83,6 +83,41 @@ test('a blur keeps a flat picture flat and spreads a dot', () => {
   dot[40] = 100
   gaussianBlur(dot, 9, 9, 1)
   assert.ok(dot[40] < 100 && dot[41] > 0 && dot[0] < dot[41])
+})
+
+test('a wide blur matches the exact Gaussian closely, and is fast', () => {
+  const rnd = noise(5, 120)
+  const w = 120
+  const h = 80
+  const src = new Float32Array(w * h * 3)
+  for (let i = 0; i < src.length; i++) src[i] = 128 + rnd()
+  // A hard edge too, where an approximation would show first.
+  for (let y = 0; y < h; y++) for (let x = 60; x < w; x++) src[(y * w + x) * 3] += 60
+  for (const sigma of [1.5, 4, 12]) {
+    const exact = src.slice()
+    gaussianBlurExact(exact, w, h, sigma, 3)
+    const fast = src.slice()
+    gaussianBlur(fast, w, h, sigma, 3)
+    let worst = 0
+    let total = 0
+    for (let i = 0; i < src.length; i++) {
+      const d = Math.abs(exact[i] - fast[i])
+      worst = Math.max(worst, d)
+      total += d
+    }
+    // On noise of ±120: off by about one level on average, a little more at spikes.
+    assert.ok(total / src.length < 1.5, `sigma ${sigma}: off by ${(total / src.length).toFixed(2)} on average`)
+    assert.ok(worst < 25, `sigma ${sigma}: off by up to ${worst.toFixed(1)}`)
+  }
+  // Its cost doesn't grow with the radius.
+  const big = new Float32Array(1000 * 1000)
+  let t = performance.now()
+  gaussianBlur(big, 1000, 1000, 3)
+  const small = performance.now() - t
+  t = performance.now()
+  gaussianBlur(big, 1000, 1000, 30)
+  const wide = performance.now() - t
+  assert.ok(wide < small * 3 + 20, `sigma 3: ${small.toFixed(0)} ms, sigma 30: ${wide.toFixed(0)} ms`)
 })
 
 test('a mask resized up keeps its shape', () => {
