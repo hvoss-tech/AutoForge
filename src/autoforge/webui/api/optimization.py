@@ -326,19 +326,25 @@ async def start_optimization(settings: OptimizationSettings):
             # The whole run on one bar, each step in its own slice so the bar
             # keeps moving: the height estimate, training, the final search
             # within the colour/swap limits (only with limits) and the export.
+            # With best of N, the runs share everything before the export
+            # equally, and each phase is named after its run.
+            series = {"index": 0, "total": max(1, int(settings.best_of))}
+            # A single run is pruned after it finished (the frontend starts
+            # that); each run of a series is pruned before it is shown, since
+            # pruning changes the result the user picks from.
+            prune_each = series["total"] > 1 and settings.auto_initial_prune
+
             limited = settings.max_colors is not None or settings.max_swaps is not None
-            train_end = 88.0 if limited else 95.0
+            run_end = 90.0 if prune_each else 95.0
+            train_end = run_end - 7.0 if limited else run_end
             slices = {
                 "Estimating heights": (0.0, 5.0),
                 "Optimizing": (5.0, train_end - 1.0),
                 "Choosing the base filament": (train_end - 1.0, train_end),
-                "Refining within the limits": (train_end, 95.0),
+                "Refining within the limits": (train_end, run_end),
+                "Pruning": (run_end, 95.0),
                 "Exporting results": (95.0, 100.0),
             }
-
-            # With best of N, the runs share everything before the export
-            # equally, and each phase is named after its run.
-            series = {"index": 0, "total": max(1, int(settings.best_of))}
 
             def _overall(phase, fraction):
                 lo, hi = slices[phase]
@@ -369,13 +375,25 @@ async def start_optimization(settings: OptimizationSettings):
                 shutil.rmtree(candidates_dir, ignore_errors=True)
 
             def _save_candidate(index, state, loss):
-                from ..helpers.pipeline_runner import to_output_resolution
+                """Save a finished run of the series, pruned first when runs
+                are; returns its loss after pruning."""
+                from ..helpers.pipeline_runner import initial_prune, solution_loss, to_output_resolution
                 from ..helpers.result_store import save_solution
 
+                # Saved as the export will have it (see to_output_resolution).
+                to_output_resolution(state)
+                pruned_loss = None
+                if prune_each:
+                    _phase_callback("Pruning", 0.0)
+                    if not initial_prune(
+                        state, settings.initial_prune_seed_search_count,
+                        cancel_event=cancel_event, pause_event=pause_event,
+                    ):
+                        return None  # cancelled; the series stops
+                    pruned_loss = solution_loss(state)
+                    _phase_callback("Pruning", 1.0)
                 run_dir = _candidate_dir(output_dir, index)
                 try:
-                    # Saved as the export will have it (see to_output_resolution).
-                    to_output_resolution(state)
                     save_solution(run_dir, state)
                     image = state["optimizer"].get_best_discretized_image()
                     if image is not None:
@@ -383,6 +401,7 @@ async def start_optimization(settings: OptimizationSettings):
                             f.write(base64.b64decode(encode_png_b64(image)))
                 except Exception:
                     logger.exception("Could not save run %d of job %s", index + 1, job.job_id)
+                return pruned_loss
 
             def _choose(losses, best_index):
                 return _choose_run(job.job_id, losses, best_index, cancel_event)
@@ -555,6 +574,7 @@ async def start_optimization(settings: OptimizationSettings):
                 counts["best_of_run"] = result["best_of"]["best_run"]
                 # The kept run's, not the last run's last progress report.
                 counts["loss"] = result["best_of"]["losses"][result["best_of"]["best_run"]]
+                counts["best_of_pruned"] = prune_each
             svc.update_status(job.job_id, "completed",
                               phase=None,
                               progress=100.0,

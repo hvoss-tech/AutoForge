@@ -89,3 +89,13 @@ export function stepRun(run: number, delta: number, count: number): number {
   if (count <= 0) return 0
   return (((run + delta) % count) + count) % count
 }
+
+/** Whether a just-finished job still gets the automatic pruning pass
+ * (settings.auto_initial_prune): not a prune's own result, and not a
+ * best-of series, whose runs all had it before they were shown. */
+export function needsInitialPrune(
+  job: { job_id: string; best_of_pruned?: boolean | null },
+  autoInitialPrune: boolean | undefined,
+): boolean {
+  return !!autoInitialPrune && !job.job_id.startsWith('prune-') && !job.best_of_pruned
+}

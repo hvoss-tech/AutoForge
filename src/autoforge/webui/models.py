@@ -181,6 +181,9 @@ class OptimizationSettings(CamelCaseModel):
     # so it's print-ready without the user opening the Pruning dialog by
     # hand. See appStore.setCurrentJob.
     auto_initial_prune: bool = True
+    # Best of N prunes every run with that same pass before it is shown (the
+    # pass changes the result), seed search count as the pruning dialog has it.
+    initial_prune_seed_search_count: int = Field(200, ge=1, le=20000)
     random_seed: int = 0
     # Empty/None means auto-detect (CUDA/ROCm, then Apple Metal, then CPU).
     device: Optional[str] = None
@@ -277,6 +280,9 @@ class JobStatus(CamelCaseModel):
     # the user to pick the one to keep (POST /api/optimize/best-of/.../pick);
     # best_of_run is then the lowest-loss run.
     best_of_choosing: Optional[bool] = None
+    # Every run of the series already had the automatic pruning pass
+    # (OptimizationSettings.auto_initial_prune); the frontend doesn't run it again.
+    best_of_pruned: Optional[bool] = None
     # Which pruning pass is running, and how many are allowed, when pruning
     # repeats itself until it stops improving.
     pruning_pass: Optional[int] = None

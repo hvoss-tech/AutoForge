@@ -8,10 +8,10 @@ import { FAST_SETTINGS, activePalette, byTestId, latestJob, openApp, presetSetti
 test.describe.configure({ mode: 'serial' })
 test.setTimeout(300_000)
 
-async function startSeries(page: Page, request: APIRequestContext, baseURL: string) {
+async function startSeries(page: Page, request: APIRequestContext, baseURL: string, autoPrune = false) {
   await resetBackend(baseURL)
   await activePalette(request)
-  await presetSettings(request, { ...FAST_SETTINGS, best_of: 2, auto_initial_prune: false })
+  await presetSettings(request, { ...FAST_SETTINGS, best_of: 2, auto_initial_prune: autoPrune })
   await openApp(page)
   await uploadAndWaitForPreview(page)
   await byTestId(page, 'top-start-btn').click()
@@ -27,7 +27,8 @@ async function imageLoaded(page: Page, testId: string) {
 }
 
 test('every run in a gallery: inspect, compare A/B, keep one', async ({ page, request, baseURL }) => {
-  const jobId = await startSeries(page, request, baseURL!)
+  // With the automatic pruning pass: every run had it before it is shown.
+  const jobId = await startSeries(page, request, baseURL!, true)
   const job = await (await request.get(`/api/optimize/status/${jobId}`)).json()
   expect(job.best_of_choosing).toBe(true)
   const lowest: number = job.best_of_run
@@ -100,6 +101,11 @@ test('every run in a gallery: inspect, compare A/B, keep one', async ({ page, re
   expect(done.status).toBe('completed')
   expect(done.best_of_run).toBe(other)
   expect(done.loss).toBeCloseTo(done.best_of_losses[other], 6)
+  expect(done.best_of_pruned).toBe(true)
+  // Pruned already: no second pruning pass starts after the pick.
+  await page.waitForTimeout(3000)
+  expect((await latestJob(request)).job_id).toBe(jobId)
+  await expect(byTestId(page, 'pruning-indicator')).toHaveCount(0)
   await expect(byTestId(page, 'result-best-of')).toBeVisible({ timeout: 15_000 })
   await expect(byTestId(page, 'three-d-view')).toBeVisible({ timeout: 15_000 })
   await expect(page.locator('[data-testid^="toast-"]').filter({ hasText: /failed|couldn't/i })).toHaveCount(0)

@@ -16,6 +16,7 @@ import {
   galleryGrid,
   isChoosingBestOf,
   lowestLossRun,
+  needsInitialPrune,
   stepRun,
   toggleCompareRun,
 } from '../src/lib/bestOf.ts'
@@ -110,4 +111,12 @@ test('flipping through runs wraps around both ways', () => {
 
 test('run images are addressed by job and run', () => {
   assert.equal(bestOfImageUrl('abc', 2), '/api/optimize/best-of/abc/image/2')
+})
+
+test('a best-of series pruned run by run is not pruned again', () => {
+  assert.equal(needsInitialPrune({ job_id: 'a' }, true), true)
+  assert.equal(needsInitialPrune({ job_id: 'a', best_of_pruned: false }, true), true)
+  assert.equal(needsInitialPrune({ job_id: 'a', best_of_pruned: true }, true), false)
+  assert.equal(needsInitialPrune({ job_id: 'prune-a' }, true), false)
+  assert.equal(needsInitialPrune({ job_id: 'a' }, false), false)
 })

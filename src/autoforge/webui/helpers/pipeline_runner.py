@@ -526,7 +526,7 @@ def run_best_of(
 
     The user can pick the run instead: ``candidate_callback(index, state,
     loss)`` is called for each finished run before it is released (to save
-    it), then ``choose(losses, best_index)`` once more than one run
+    it; a loss it returns replaces the run's, for a run it changed), then ``choose(losses, best_index)`` once more than one run
     finished; it returns the index of the run to keep, or None to cancel.
     A run other than the one still on the device comes back through
     ``restore(index)``.
@@ -570,7 +570,19 @@ def run_best_of(
         losses.append(loss)
         print(f"Run {i + 1}/{total} finished with loss {loss:.4f}")
         if candidate_callback is not None:
-            candidate_callback(i, state, loss)
+            # It may change the run (prune it): then it says what it scores now.
+            try:
+                changed = candidate_callback(i, state, loss)
+            except Exception:
+                losses.pop()
+                release_pipeline_result(state)
+                if best is None:
+                    raise
+                traceback.print_exc()
+                print(f"Run {i + 1}/{total} failed; keeping the best of the {len(losses)} finished runs.")
+                break
+            if changed is not None:
+                loss = losses[-1] = float(changed)
         if best is None or loss < losses[best_index]:
             release_pipeline_result(best)
             best, best_index = state, i
@@ -836,6 +848,65 @@ def to_output_resolution(result: Dict[str, Any]) -> None:
                 sweeps=int(getattr(args, "pixel_height_refine_sweeps", 2)),
                 radius=int(getattr(args, "pixel_height_refine_radius", 3)),
             )
+
+
+# The args the automatic prune after a run sets (see initial_prune).
+_INITIAL_PRUNE_ARGS = (
+    "pruning_max_colors", "pruning_max_swaps", "pruning_max_layer", "perform_pruning",
+    "prune_seed_search", "prune_seed_search_count", "prune_fine_tune_height", "prune_fine_tune_steps",
+)
+
+
+def initial_prune(
+    result: Dict[str, Any],
+    seed_search_count: int = 200,
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+) -> bool:
+    """The pruning pass the webui runs on every finished run (the frontend's
+    automatic prune, appStore setCurrentJob): one manual pass limited to the
+    result's own counts, so nothing is forced out, with the seed search and
+    without the height fine-tune. Changes ``result`` in place and leaves its
+    args as they were, so the export after it doesn't prune again. False
+    when it was cancelled midway."""
+    from .sliders import result_counts_from_optimizer
+
+    counts = result_counts_from_optimizer(result["optimizer"])
+    if counts is None:
+        return True
+    args = result["args"]
+    missing = object()
+    saved = {key: getattr(args, key, missing) for key in _INITIAL_PRUNE_ARGS}
+    try:
+        args.pruning_max_colors = max(1, int(counts["colors"]))
+        args.pruning_max_swaps = max(0, int(counts["swaps"]))
+        args.pruning_max_layer = max(1, int(counts["layers"]))
+        args.perform_pruning = True
+        args.prune_seed_search = True
+        args.prune_seed_search_count = int(seed_search_count)
+        args.prune_fine_tune_height = False
+        args.prune_fine_tune_steps = 50
+        outputs = export_results(result, cancel_event=cancel_event, pause_event=pause_event, prune_only=True)
+    finally:
+        for key, value in saved.items():
+            if value is missing:
+                if hasattr(args, key):
+                    delattr(args, key)
+            else:
+                setattr(args, key, value)
+    return bool(outputs.get("pruning_completed", True))
+
+
+def solution_loss(result: Dict[str, Any]) -> Optional[float]:
+    """The loss of the result's discrete solution as it now stands, measured
+    like pruning measures it."""
+    from autoforge.Helper.PruningHelper import _compute_loss_for_heightmap
+
+    optimizer = result["optimizer"]
+    disc_global, _ = optimizer.get_discretized_solution(best=True)
+    if disc_global is None:
+        return None
+    return float(_compute_loss_for_heightmap(optimizer, disc_global))
 
 
 def export_results(

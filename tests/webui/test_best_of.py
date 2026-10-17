@@ -98,6 +98,29 @@ def test_a_later_failed_run_keeps_the_best_finished_one():
     assert best["best_of"]["losses"] == [2.0, 1.0]
 
 
+def test_a_run_that_fails_to_save_ends_the_series_with_the_finished_ones():
+    pipeline, states = _fake_pipeline([2.0, 1.0, 0.5], [])
+
+    def save(i, state, loss):
+        if i == 1:
+            raise RuntimeError("out of memory while pruning")
+
+    best = run_best_of("in.png", [], "out", {}, best_of=3, pipeline=pipeline, candidate_callback=save)
+    assert best["run"] == 0
+    assert best["best_of"]["losses"] == [2.0]
+    assert states[1] == {}
+
+
+def test_a_run_changed_while_saving_is_compared_by_its_new_loss():
+    pipeline, _ = _fake_pipeline([2.0, 1.0], [])
+    best = run_best_of(
+        "in.png", [], "out", {}, best_of=2, pipeline=pipeline,
+        candidate_callback=lambda i, state, loss: [0.5, 1.5][i],
+    )
+    assert best["run"] == 0
+    assert best["best_of"]["losses"] == [0.5, 1.5]
+
+
 def test_a_failed_first_run_fails_the_series():
     pipeline, _ = _fake_pipeline([1.0], [], fail_at=0)
     with pytest.raises(RuntimeError):
@@ -154,8 +177,8 @@ def test_a_single_finished_run_needs_no_choice():
     assert best["run"] == 0
 
 
-@pytest.fixture
-def fake_run(monkeypatch):
+@pytest.fixture(params=[{}])
+def fake_run(monkeypatch, request):
     """The webui's best-of job with a fake pipeline: saving, rebuilding and
     exporting a run are recorded instead of done."""
     from autoforge.webui.api import optimization as opt_api
@@ -200,6 +223,16 @@ def fake_run(monkeypatch):
     exported = []
     monkeypatch.setattr(opt_api, "_run_pipeline", fake_pipeline)
     monkeypatch.setattr(pipeline_runner, "to_output_resolution", lambda result: None)
+    # The pruning pass every run of a series gets: lowers the loss by 0.5.
+    pruned = []
+
+    def fake_prune(result, seed_search_count=200, **_k):
+        pruned.append(seed_search_count)
+        result["optimizer"].best_discrete_loss -= 0.5
+        return True
+
+    monkeypatch.setattr(pipeline_runner, "initial_prune", fake_prune)
+    monkeypatch.setattr(pipeline_runner, "solution_loss", lambda result: result["optimizer"].best_discrete_loss)
     monkeypatch.setattr(pipeline_runner, "export_results", lambda result, **_k: exported.append(result["optimizer"].best_discrete_loss))
     monkeypatch.setattr(result_store, "save_solution", fake_save)
     monkeypatch.setattr(result_store, "load_solution", fake_load)
@@ -210,11 +243,13 @@ def fake_run(monkeypatch):
         f.write(b"x")
     client.put("/api/filaments/active", json=[{"uuid": "a", "name": "A", "td": 1.0}, {"uuid": "b", "name": "B", "td": 2.0}])
     job_id = client.post(
-        "/api/optimize/start", json={"input_image": "bestof.png", "iterations": 10, "best_of": 3}
+        "/api/optimize/start",
+        json={"input_image": "bestof.png", "iterations": 10, "best_of": 3, "initial_prune_seed_search_count": 77,
+              **request.param},
     ).json()["job_id"]
     job_dir = os.path.join(config.checkpoints_path, job_id)
     yield {"client": client, "job_id": job_id, "job_dir": job_dir, "updates": updates,
-           "exported": exported, "rebuilt": rebuilt}
+           "exported": exported, "rebuilt": rebuilt, "pruned": pruned}
     client.post(f"/api/optimize/cancel/{job_id}")
 
 
@@ -233,7 +268,10 @@ def test_webui_series_waits_for_the_user_to_pick_a_run(fake_run):
     status = _wait_for(client, job_id, lambda s: s.get("best_of_choosing"))
     assert status["status"] == "running"
     assert status["phase"] == "Choose a result"
-    assert status["best_of_losses"] == [3.0, 1.0, 2.0]
+    # Every run was pruned (as a single run is after it finished) before it
+    # is shown, and is compared by its loss after pruning.
+    assert fake_run["pruned"] == [77, 77, 77]
+    assert status["best_of_losses"] == [2.5, 0.5, 1.5]
     # The lowest loss is suggested.
     assert status["best_of_run"] == 1
     # Nothing is exported until a run was picked.
@@ -266,9 +304,11 @@ def test_webui_picking_the_live_run_exports_it_as_is(fake_run):
     assert client.post(f"/api/optimize/best-of/{job_id}/pick", json={"run": 1}).status_code == 200
     status = _wait_for(client, job_id, lambda s: s["status"] == "completed")
     assert status["best_of_run"] == 1
-    assert status["loss"] == 1.0
+    assert status["loss"] == 0.5
     assert not status["best_of_choosing"]
-    assert fake_run["exported"] == [1.0]
+    # Pruned already: the frontend must not prune it again.
+    assert status["best_of_pruned"] is True
+    assert fake_run["exported"] == [0.5]
     assert fake_run["rebuilt"] == []
     # The saved runs are gone once one was picked.
     assert not os.path.exists(os.path.join(fake_run["job_dir"], "best_of_runs"))
@@ -284,9 +324,20 @@ def test_webui_picking_another_run_exports_that_run(fake_run):
     status = _wait_for(client, job_id, lambda s: s["status"] == "completed")
     assert status["best_of_run"] == 2
     # The job reports the picked run's loss, not the last run's.
-    assert status["loss"] == 2.0
-    assert fake_run["rebuilt"] == [2.0]
-    assert fake_run["exported"] == [2.0]
+    assert status["loss"] == 1.5
+    assert fake_run["rebuilt"] == [1.5]
+    assert fake_run["exported"] == [1.5]
+
+
+@pytest.mark.parametrize("fake_run", [{"auto_initial_prune": False}], indirect=True)
+def test_webui_series_without_automatic_pruning_leaves_runs_unpruned(fake_run):
+    client, job_id = fake_run["client"], fake_run["job_id"]
+    status = _wait_for(client, job_id, lambda s: s.get("best_of_choosing"))
+    assert status["best_of_losses"] == [3.0, 1.0, 2.0]
+    assert fake_run["pruned"] == []
+    client.post(f"/api/optimize/best-of/{job_id}/pick", json={"run": 1})
+    status = _wait_for(client, job_id, lambda s: s["status"] == "completed")
+    assert status["best_of_pruned"] is False
 
 
 def test_webui_cancelling_the_choice_keeps_nothing(fake_run):
@@ -316,8 +367,8 @@ def test_webui_a_run_that_was_not_saved_cannot_be_picked(fake_run):
 
 def test_real_series_finishes_with_the_picked_run():
     """A real (tiny) series: the run picked from the gallery that wasn't the
-    live one comes back from its saved solution, and the finished job holds
-    exactly that run's layers and heights."""
+    live one comes back from its saved (pruned) solution, and the finished
+    job holds exactly that run's layers and heights."""
     import io
 
     from PIL import Image
@@ -340,7 +391,7 @@ def test_real_series_finishes_with_the_picked_run():
 
         job_id = client.post("/api/optimize/start", json={
             "input_image": image, "iterations": 60, "max_layers": 10, "stl_output_size": 16,
-            "num_init_rounds": 1, "random_seed": 7, "auto_initial_prune": False, "best_of": 2,
+            "num_init_rounds": 1, "random_seed": 7, "best_of": 2,
         }).json()["job_id"]
         status = _wait_for(client, job_id, lambda s: s.get("best_of_choosing") or s["status"] in ("failed", "cancelled"), timeout=300)
         assert status["status"] == "running", status
@@ -354,6 +405,9 @@ def test_real_series_finishes_with_the_picked_run():
         assert status["status"] == "completed", status
         assert status["best_of_run"] == other
         assert status["loss"] == status["best_of_losses"][other]
+        # Each run had its pruning pass before it was shown, and the export
+        # wrote the run exactly as it was shown (no second prune).
+        assert status["best_of_pruned"] is True
         final = load_solution(os.path.join(config.checkpoints_path, job_id))
         assert np.array_equal(final["stack"], picked["stack"])
         assert np.array_equal(final["heights"], picked["heights"])

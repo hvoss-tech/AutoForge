@@ -14,6 +14,7 @@ import {
   restoredImage,
 } from '../lib/history'
 import { describeApiError } from '../lib/apiError'
+import { needsInitialPrune } from '../lib/bestOf'
 import * as bandOps from '../lib/bandOps'
 import { inheritRunInputs, readStoredRunInputs, storeRunInputs, type RunInputs } from '../lib/staleResult'
 import { appendLossPoint, type LossPoint } from '../lib/lossHistory'
@@ -955,7 +956,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       // completion — that path sets currentJob directly (see startPruning's
       // poll loop) rather than through this action; the job_id check is
       // cheap extra insurance against that assumption changing later.
-      if (get().settings.auto_initial_prune && !job.job_id.startsWith('prune-')) {
+      // A best-of series pruned each run before showing it (best_of_pruned).
+      if (needsInitialPrune(job, get().settings.auto_initial_prune)) {
         const baseUuid = effectiveBaseFilamentUuid(get().resolvedBase)
         // The server's counts of the finished result; the sliders still
         // show the last training preview (see finishedResultCounts).
@@ -1289,7 +1291,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     const response = await fetch('/api/optimize/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(state.settings),
+      // A best-of series prunes each run like the automatic prune after a
+      // run does, with the pruning dialog's seed search.
+      body: JSON.stringify({ ...state.settings, initial_prune_seed_search_count: state.pruningSettings.seed_search_count }),
     })
     if (!response.ok) {
       throw new Error(describeApiError(await response.json().catch(() => null), response.status))
