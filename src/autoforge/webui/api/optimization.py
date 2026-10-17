@@ -3,8 +3,11 @@ import os
 import logging
 import numpy as np
 import base64
+import shutil
 import threading
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from ..models import OptimizationSettings, StateSnapshot
 from ..services.optimization_service import get_optimization_service
 from ..services.project_service import get_project_service
@@ -86,6 +89,92 @@ def _broadcast_final_result(result: dict, job_id: str) -> None:
         logger.exception("Could not send the final result of job %s", job_id)
 
 
+# Best of N: every finished run is saved under the job's folder until the
+# user picked the one to keep (see _choose_run).
+CANDIDATES_DIR = "best_of_runs"
+CANDIDATE_IMAGE = "preview.png"
+
+
+def _candidate_dir(output_dir: str, index: int) -> str:
+    return os.path.join(output_dir, CANDIDATES_DIR, f"run_{index}")
+
+
+class _Choice:
+    def __init__(self, runs: int, live_run: int):
+        self.runs = runs
+        self.live_run = live_run
+        self.picked: int | None = None
+        self.event = threading.Event()
+
+
+# The series waiting for the user to pick a run, by job id.
+_choices: dict[str, _Choice] = {}
+_choices_lock = threading.Lock()
+
+
+def _choose_run(job_id: str, losses: list[float], best_index: int, cancel_event) -> int | None:
+    """Wait until the user picks one of the finished runs (POST
+    /best-of/{job_id}/pick). Returns its index, or None once the job was
+    cancelled. The job stays "running" meanwhile: nothing else may start,
+    and the run on the device is still the one the export may need."""
+    svc = get_optimization_service()
+    choice = _Choice(len(losses), best_index)
+    with _choices_lock:
+        _choices[job_id] = choice
+    try:
+        # Nothing is left to pause; a pause pressed as the last run finished
+        # would also drop this report (see update_status).
+        if (job := svc.get_job(job_id)) is not None and job.status == "paused":
+            svc.resume(job_id)
+        svc.update_status(
+            job_id, "running", phase="Choose a result", progress=95.0,
+            best_of_losses=losses, best_of_run=best_index, best_of_choosing=True,
+        )
+        while not choice.event.wait(0.2):
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+        return choice.picked
+    finally:
+        with _choices_lock:
+            _choices.pop(job_id, None)
+        svc.update_status(job_id, "running", best_of_choosing=False)
+
+
+class BestOfPick(BaseModel):
+    run: int
+
+
+@router.post("/best-of/{job_id}/pick")
+async def pick_best_of_run(job_id: str, body: BestOfPick):
+    """Keep run ``body.run`` (0-based) of a best-of series waiting for a
+    choice; the job then finishes with it like a single run would."""
+    with _choices_lock:
+        choice = _choices.get(job_id)
+        if choice is None or choice.event.is_set():
+            raise HTTPException(409, "This optimization isn't waiting for a choice anymore.")
+        if not 0 <= body.run < choice.runs:
+            raise HTTPException(400, f"There is no run {body.run + 1}.")
+        if body.run != choice.live_run and not os.path.isfile(
+            os.path.join(_candidate_dir(os.path.join(config.checkpoints_path, job_id), body.run), "solution.npz")
+        ):
+            raise HTTPException(409, f"Run {body.run + 1} wasn't saved and can't be used. Pick another one.")
+        choice.picked = body.run
+        choice.event.set()
+    return {"status": "running", "run": body.run}
+
+
+@router.get("/best-of/{job_id}/image/{run}")
+async def best_of_run_image(job_id: str, run: int):
+    """The finished image of run ``run`` (0-based) of a series still
+    waiting for a choice."""
+    if get_optimization_service().get_job(job_id) is None:
+        raise HTTPException(404, "Job not found")
+    path = os.path.join(_candidate_dir(os.path.join(config.checkpoints_path, job_id), run), CANDIDATE_IMAGE)
+    if run < 0 or not os.path.isfile(path):
+        raise HTTPException(404, "No image for this run")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+
+
 @router.post("/start")
 async def start_optimization(settings: OptimizationSettings):
     svc = get_optimization_service()
@@ -165,6 +254,7 @@ async def start_optimization(settings: OptimizationSettings):
     def _run():
         nonlocal input_image_path
         run_device = None
+        output_dir = None
         try:
             svc.update_status(job.job_id, "running",
                               total_iterations=settings.iterations,
@@ -272,6 +362,44 @@ async def start_optimization(settings: OptimizationSettings):
                 except Exception:
                     pass
 
+            # Each finished run of a series is saved, so the user can look at
+            # all of them and pick one (see _choose_run).
+            candidates_dir = os.path.join(output_dir, CANDIDATES_DIR)
+            if series["total"] > 1:
+                shutil.rmtree(candidates_dir, ignore_errors=True)
+
+            def _save_candidate(index, state, loss):
+                from ..helpers.pipeline_runner import to_output_resolution
+                from ..helpers.result_store import save_solution
+
+                run_dir = _candidate_dir(output_dir, index)
+                try:
+                    # Saved as the export will have it (see to_output_resolution).
+                    to_output_resolution(state)
+                    save_solution(run_dir, state)
+                    image = state["optimizer"].get_best_discretized_image()
+                    if image is not None:
+                        with open(os.path.join(run_dir, CANDIDATE_IMAGE), "wb") as f:
+                            f.write(base64.b64decode(encode_png_b64(image)))
+                except Exception:
+                    logger.exception("Could not save run %d of job %s", index + 1, job.job_id)
+
+            def _choose(losses, best_index):
+                return _choose_run(job.job_id, losses, best_index, cancel_event)
+
+            def _restore(index):
+                from ..helpers.result_store import load_solution, rebuild_pipeline_result
+
+                svc.update_status(job.job_id, "running", phase=f"Loading run {index + 1}")
+                solution = load_solution(_candidate_dir(output_dir, index))
+                if solution is None:
+                    raise RuntimeError(f"Run {index + 1} could not be loaded back.")
+                restored = rebuild_pipeline_result(solution, input_image_path, output_dir)
+                # The rebuild only knows each filament's color, TD and name;
+                # the export writes the rest (brand, type) into the project.
+                restored["active_filaments"] = filament_dicts
+                return restored
+
             def _phase_callback(phase, fraction):
                 try:
                     svc.update_status(job.job_id, "running", phase=_label(phase), progress=_overall(phase, fraction))
@@ -341,6 +469,9 @@ async def start_optimization(settings: OptimizationSettings):
                 best_of=settings.best_of,
                 run_callback=_run_callback,
                 pipeline=_run_pipeline,
+                candidate_callback=_save_candidate,
+                choose=_choose,
+                restore=_restore,
                 preview_callback=_preview_callback,
                 progress_callback=_progress_callback,
                 cancel_event=cancel_event,
@@ -422,6 +553,8 @@ async def start_optimization(settings: OptimizationSettings):
             if result.get("best_of"):
                 counts["best_of_losses"] = result["best_of"]["losses"]
                 counts["best_of_run"] = result["best_of"]["best_run"]
+                # The kept run's, not the last run's last progress report.
+                counts["loss"] = result["best_of"]["losses"][result["best_of"]["best_run"]]
             svc.update_status(job.job_id, "completed",
                               phase=None,
                               progress=100.0,
@@ -436,6 +569,9 @@ async def start_optimization(settings: OptimizationSettings):
             capture_exception(e, {"phase": "optimization", "job_id": job.job_id})
             svc.update_status(job.job_id, "failed", error=friendly_error_message(e))
         finally:
+            if output_dir is not None:
+                # Only needed until a run was picked.
+                shutil.rmtree(os.path.join(output_dir, CANDIDATES_DIR), ignore_errors=True)
             # Training and export both leave large freed blocks in the
             # caching allocator. Returning them keeps `nvidia-smi` honest and,
             # more importantly, leaves room for the next image's init.
@@ -453,6 +589,12 @@ async def start_optimization(settings: OptimizationSettings):
 @router.post("/pause/{job_id}")
 async def pause_optimization(job_id: str):
     svc = get_optimization_service()
+    with _choices_lock:
+        choosing = job_id in _choices
+    if choosing:
+        # All runs are done; the series only waits for the user's choice.
+        job = svc.get_job(job_id)
+        return {"status": job.status if job else "running"}
     if not svc.pause(job_id):
         raise HTTPException(404, "Job not found")
     # The job's real status, not an assumed one — a job that already

@@ -507,6 +507,9 @@ def run_best_of(
     best_of: int = 1,
     run_callback: Optional[Callable] = None,
     pipeline: Optional[Callable] = None,
+    candidate_callback: Optional[Callable] = None,
+    choose: Optional[Callable] = None,
+    restore: Optional[Callable] = None,
     **kwargs,
 ) -> Dict[str, Any]:
     """``run_pipeline()`` ``best_of`` times and keep the run with the lowest
@@ -521,7 +524,14 @@ def run_best_of(
     that fails after an earlier one finished ends the series with the best
     finished run.
 
-    Returns the best run's state, plus ``best_of = {"runs", "best_run",
+    The user can pick the run instead: ``candidate_callback(index, state,
+    loss)`` is called for each finished run before it is released (to save
+    it), then ``choose(losses, best_index)`` once more than one run
+    finished; it returns the index of the run to keep, or None to cancel.
+    A run other than the one still on the device comes back through
+    ``restore(index)``.
+
+    Returns the kept run's state, plus ``best_of = {"runs", "best_run",
     "losses"}`` when more than one run was asked for.
     """
     from autoforge.webui.helpers.gpu_memory import release_pipeline_result
@@ -559,13 +569,28 @@ def run_best_of(
         loss = result_loss(state)
         losses.append(loss)
         print(f"Run {i + 1}/{total} finished with loss {loss:.4f}")
+        if candidate_callback is not None:
+            candidate_callback(i, state, loss)
         if best is None or loss < losses[best_index]:
             release_pipeline_result(best)
             best, best_index = state, i
         else:
             release_pipeline_result(state)
 
-    if best is None or (cancel_event is not None and cancel_event.is_set()):
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    if best is not None and not _cancelled() and choose is not None and len(losses) > 1:
+        picked = choose(list(losses), best_index)
+        if picked is None or _cancelled():
+            release_pipeline_result(best)
+            return {"cancelled": True}
+        if picked != best_index:
+            # Off the device first: the restored run needs the room.
+            release_pipeline_result(best)
+            best, best_index = restore(picked), picked
+
+    if best is None or _cancelled():
         release_pipeline_result(best)
         return {"cancelled": True}
     best["best_of"] = {"runs": total, "best_run": best_index, "losses": losses}
@@ -708,61 +733,25 @@ def _run_optimization_loop(
 _best_heights_at_output_res = best_heights_at_output_res
 
 
-def export_results(
-    result: Dict[str, Any],
-    cancel_event: Optional[threading.Event] = None,
-    pause_event: Optional[threading.Event] = None,
-    apply_spike_removal: bool = True,
-    export_progress: Optional[Callable] = None,
-    prune_only: bool = False,
-) -> Dict[str, Any]:
-    """Generate STL, preview PNG, swap instructions, project file and
-    colored PLY mesh from the state dict produced by ``run_pipeline()``.
-
-    Parameters
-    ----------
-    result : dict
-        State dict from ``run_pipeline()``.
-    prune_only : bool
-        Stop once pruning is done, before any file is written. Automatic
-        pruning runs many passes and only needs the files of the last one.
-
-    Returns
-    -------
-    dict
-        File paths keyed by type::
-
-            {
-                "preview_png": "...",
-                "stl": "...",
-                "colored_ply": "...",
-                "swap_instructions": "...",
-                "project_file": "...",
-                "final_loss": float,
-            }
-    """
-    optimizer: FilamentOptimizer = result["optimizer"]
-    args: argparse.Namespace = result["args"]
-    # Exports (and the pruning that runs inside them) composite with the
-    # job's own edge bleed, whatever job ran last.
+def to_output_resolution(result: Dict[str, Any]) -> None:
+    """Bring a finished run's solution from the processing resolution it was
+    trained at to the output resolution, as its first export does (later
+    calls only reset the target and labels). A best-of run is saved after
+    this, so the run picked from the gallery is the same as the run kept
+    live, and its image is what the print will look like."""
     from autoforge.Helper.OptimizerHelper import EDGE_BLEED, set_edge_bleed
 
+    optimizer: FilamentOptimizer = result["optimizer"]
+    args: argparse.Namespace = result["args"]
     set_edge_bleed(float(getattr(args, "edge_bleed", EDGE_BLEED)))
     device: torch.device = result["device"]
-    # Pruning calls this from its own thread (the current device is per thread).
     activate_device(device)
-    material_colors_np: np.ndarray = result["material_colors_np"]
-    material_TDs_np: np.ndarray = result["material_TDs_np"]
-    material_names: list = result["material_names"]
     alpha: Optional[np.ndarray] = result["alpha"]
     output_target: torch.Tensor = result["output_target"]
     focus_map_full: Optional[torch.Tensor] = result["focus_map_full"]
     focus_map_proc: Optional[torch.Tensor] = result["focus_map_proc"]
     pixel_height_logits_init: np.ndarray = result["pixel_height_logits_init"]
     pixel_height_labels: np.ndarray = result["pixel_height_labels"]
-
-    post_opt_step = 0
-    pruning_completed = True
 
     # Restore full-resolution logits & target — but only the first time.
     #
@@ -838,16 +827,73 @@ def export_results(
         # Every pixel already has its exact height for the stack.
         refine_carried = False
 
+    if refine_carried:
+        from autoforge.Helper.PixelHeightRefine import refine_pixel_heights
+
+        with torch.no_grad(), safe_autocast(device):
+            refine_pixel_heights(
+                optimizer,
+                sweeps=int(getattr(args, "pixel_height_refine_sweeps", 2)),
+                radius=int(getattr(args, "pixel_height_refine_radius", 3)),
+            )
+
+
+def export_results(
+    result: Dict[str, Any],
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+    apply_spike_removal: bool = True,
+    export_progress: Optional[Callable] = None,
+    prune_only: bool = False,
+) -> Dict[str, Any]:
+    """Generate STL, preview PNG, swap instructions, project file and
+    colored PLY mesh from the state dict produced by ``run_pipeline()``.
+
+    Parameters
+    ----------
+    result : dict
+        State dict from ``run_pipeline()``.
+    prune_only : bool
+        Stop once pruning is done, before any file is written. Automatic
+        pruning runs many passes and only needs the files of the last one.
+
+    Returns
+    -------
+    dict
+        File paths keyed by type::
+
+            {
+                "preview_png": "...",
+                "stl": "...",
+                "colored_ply": "...",
+                "swap_instructions": "...",
+                "project_file": "...",
+                "final_loss": float,
+            }
+    """
+    optimizer: FilamentOptimizer = result["optimizer"]
+    args: argparse.Namespace = result["args"]
+    # Exports (and the pruning that runs inside them) composite with the
+    # job's own edge bleed, whatever job ran last.
+    from autoforge.Helper.OptimizerHelper import EDGE_BLEED, set_edge_bleed
+
+    set_edge_bleed(float(getattr(args, "edge_bleed", EDGE_BLEED)))
+    device: torch.device = result["device"]
+    # Pruning calls this from its own thread (the current device is per thread).
+    activate_device(device)
+    material_colors_np: np.ndarray = result["material_colors_np"]
+    material_TDs_np: np.ndarray = result["material_TDs_np"]
+    material_names: list = result["material_names"]
+    alpha: Optional[np.ndarray] = result["alpha"]
+    output_target: torch.Tensor = result["output_target"]
+
+    post_opt_step = 0
+    pruning_completed = True
+
+    to_output_resolution(result)
+
     with torch.no_grad():
         with safe_autocast(device):
-            if refine_carried:
-                from autoforge.Helper.PixelHeightRefine import refine_pixel_heights
-
-                refine_pixel_heights(
-                    optimizer,
-                    sweeps=int(getattr(args, "pixel_height_refine_sweeps", 2)),
-                    radius=int(getattr(args, "pixel_height_refine_radius", 3)),
-                )
             # ---- Pruning ----
             if args.perform_pruning:
                 max_colors_for_pruning = args.pruning_max_colors

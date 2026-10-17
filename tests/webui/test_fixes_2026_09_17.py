@@ -390,9 +390,10 @@ def test_the_full_resolution_height_restore_happens_only_once():
 
     from autoforge.webui.helpers import pipeline_runner
 
-    source = inspect.getsource(pipeline_runner.export_results)
+    source = inspect.getsource(pipeline_runner.to_output_resolution)
     assert 'if not getattr(optimizer, "_full_res_height_restored", False):' in source
     assert "optimizer._full_res_height_restored = True" in source
+    assert "to_output_resolution(result)" in inspect.getsource(pipeline_runner.export_results)
 
     # And the flag lives on the optimizer, so a *different* job's optimizer
     # still gets its own first-time restore.

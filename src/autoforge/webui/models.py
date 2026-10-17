@@ -272,6 +272,10 @@ class JobStatus(CamelCaseModel):
     # finished so far, and once completed, which of them (0-based) was kept.
     best_of_losses: Optional[list[float]] = None
     best_of_run: Optional[int] = None
+    # True while every run of the series has finished and the job waits for
+    # the user to pick the one to keep (POST /api/optimize/best-of/.../pick);
+    # best_of_run is then the lowest-loss run.
+    best_of_choosing: Optional[bool] = None
     # Which pruning pass is running, and how many are allowed, when pruning
     # repeats itself until it stops improving.
     pruning_pass: Optional[int] = None
