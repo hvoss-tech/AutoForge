@@ -219,6 +219,7 @@ const SETTING_NAMES: Record<string, string> = {
   priority_mask_strength: 'focus strength',
   height_guidance: 'height guidance',
   height_regions: 'height regions',
+  image_edit: 'image edits',
 }
 
 /** Plain-language name of a settings key ("layer height"). */

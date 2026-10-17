@@ -1,3 +1,4 @@
+import type { ImageEdit } from '../lib/imageEdit'
 import type { GuidanceReport, HeightGuidanceSettings } from '../lib/heightGuidance'
 import type { BorderSettings } from '../lib/border'
 
@@ -74,6 +75,9 @@ export interface OptimizationSettings {
   cap_layers: number
   init_heightmap_method: string
   priority_mask: string
+  /** How input_image was made in the image editor (lib/imageEdit), or
+   * null/absent for a picture used as uploaded. */
+  image_edit?: ImageEdit | null
   /** How many times more a painted focus-area pixel counts (2–100 in the UI). */
   priority_mask_strength: number
   /** Height guidance (lib/heightGuidance); null when nothing is suggested. */

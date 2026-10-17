@@ -20,6 +20,8 @@ const IGNORED = new Set([
   'tensorboard',
   'run_name',
   'output_folder',
+  // Always changes together with input_image, which names the change.
+  'image_edit',
 ])
 
 /** Settings keys that changed since the run, plus 'active_filaments' when

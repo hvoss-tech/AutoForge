@@ -181,6 +181,10 @@ class OptimizationSettings(CamelCaseModel):
     # so it's print-ready without the user opening the Pruning dialog by
     # hand. See appStore.setCurrentJob.
     auto_initial_prune: bool = True
+    # The image editor's layers (frontend lib/imageEdit ImageEdit): how
+    # input_image was made from the uploaded picture, so it can be edited
+    # again. None for a picture used as uploaded.
+    image_edit: Optional[dict[str, Any]] = None
     # Best of N prunes every run with that same pass before it is shown (the
     # pass changes the result), seed search count as the pruning dialog has it.
     initial_prune_seed_search_count: int = Field(200, ge=1, le=20000)

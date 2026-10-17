@@ -292,7 +292,7 @@ test('a step without an image shows no image, whatever the step before it had', 
 test('the tutorial explains that pruning can repeat itself', async ({ page }) => {
   await openApp(page)
   await byTestId(page, 'tutorial-open-btn').click()
-  for (let i = 0; i < 4; i++) await byTestId(page, 'tutorial-next-btn').click()
+  for (let i = 0; i < 5; i++) await byTestId(page, 'tutorial-next-btn').click()
   await expect(byTestId(page, 'tutorial-body')).toHaveAttribute('data-step', 'prune')
   await expect(byTestId(page, 'tutorial-body')).toContainText('Keep pruning until it stops improving')
 })
@@ -318,12 +318,12 @@ test.describe('first-run tutorial', () => {
   test('walks through the whole workflow, pruning and STL size included', async ({ page }) => {
     await page.goto('/')
     await expect(byTestId(page, 'tutorial-modal')).toBeVisible()
-    await expect(byTestId(page, 'tutorial-progress')).toHaveText('1 of 7')
+    await expect(byTestId(page, 'tutorial-progress')).toHaveText('1 of 8')
 
     const seen: string[] = []
-    for (let i = 0; i < 7; i++) {
+    for (let i = 0; i < 8; i++) {
       seen.push(await byTestId(page, 'tutorial-body').innerText())
-      if (i < 6) await byTestId(page, 'tutorial-next-btn').click()
+      if (i < 7) await byTestId(page, 'tutorial-next-btn').click()
     }
     const text = seen.join('\n')
 
@@ -340,6 +340,11 @@ test.describe('first-run tutorial', () => {
     expect(text).toMatch(/focus areas/i)
     expect(text).toMatch(/Erase/)
     expect(text).toMatch(/Differences/)
+    // The image editor: where it is, selections, and what fewer colours is for.
+    expect(text).toMatch(/Click Edit in the image panel/)
+    expect(text).toMatch(/magic wand/i)
+    expect(text).toMatch(/Fewer colours/)
+    expect(text).toMatch(/style choice/)
 
     await byTestId(page, 'tutorial-done-btn').click()
     await expect(byTestId(page, 'tutorial-modal')).toHaveCount(0)
@@ -348,9 +353,9 @@ test.describe('first-run tutorial', () => {
   test('Back returns to the previous step', async ({ page }) => {
     await page.goto('/')
     await byTestId(page, 'tutorial-next-btn').click()
-    await expect(byTestId(page, 'tutorial-progress')).toHaveText('2 of 7')
+    await expect(byTestId(page, 'tutorial-progress')).toHaveText('2 of 8')
     await byTestId(page, 'tutorial-back-btn').click()
-    await expect(byTestId(page, 'tutorial-progress')).toHaveText('1 of 7')
+    await expect(byTestId(page, 'tutorial-progress')).toHaveText('1 of 8')
     await expect(byTestId(page, 'tutorial-back-btn')).toBeDisabled()
   })
 })
@@ -361,13 +366,13 @@ test('the ? button in the top bar reopens the tutorial from the start', async ({
 
   await byTestId(page, 'tutorial-open-btn').click()
   await expect(byTestId(page, 'tutorial-modal')).toBeVisible()
-  await expect(byTestId(page, 'tutorial-progress')).toHaveText('1 of 7')
+  await expect(byTestId(page, 'tutorial-progress')).toHaveText('1 of 8')
 
   await byTestId(page, 'tutorial-next-btn').click()
   await byTestId(page, 'tutorial-close-x').click()
   // Reopening starts over rather than resuming somewhere in the middle.
   await byTestId(page, 'tutorial-open-btn').click()
-  await expect(byTestId(page, 'tutorial-progress')).toHaveText('1 of 7')
+  await expect(byTestId(page, 'tutorial-progress')).toHaveText('1 of 8')
 })
 
 // --- 12. STL size -----------------------------------------------------------

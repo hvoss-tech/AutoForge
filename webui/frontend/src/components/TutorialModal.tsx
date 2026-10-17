@@ -59,6 +59,39 @@ export const TUTORIAL_STEPS: Step[] = [
     ),
   },
   {
+    id: 'edit',
+    title: 'Optional · Touch up the picture',
+    body: (
+      <>
+        <p>
+          You don't need another program to prepare your picture. Click <strong>Edit</strong> in the image panel to
+          change its <strong>light</strong> (exposure, brightness, contrast, highlights, shadows, black and white
+          levels), its <strong>colour</strong> (temperature, tint, hue, saturation, vibrance), <strong>levels</strong>,{' '}
+          <strong>curves</strong> and <strong>detail</strong> (soften, sharpen). Hover a slider to see what it does, and
+          double-click its name to reset it.
+        </p>
+        <p>
+          Every change applies to the <strong>whole picture</strong>, or only to a <strong>selection</strong>. Pick a
+          tool on the left: the <strong>brush</strong> and <strong>eraser</strong>, the <strong>lasso</strong>,{' '}
+          <strong>rectangle</strong> and <strong>ellipse</strong>, or the <strong>magic wand</strong>, which selects
+          similar colours with one click. Hold <strong>Shift</strong> to add to a selection and <strong>Alt</strong> to
+          take away from it. Each <strong>layer</strong> has its own selection and its own adjustments, so a darker sky
+          and a brighter face are two layers.
+        </p>
+        <p>
+          <strong>Fewer colours</strong> turns the picture (or a selection) into a few flat colours, for a poster-like
+          look or to calm a busy background. It's a style choice: the optimizer picks its colours itself and usually
+          matches a picture more closely without it.
+        </p>
+        <p>
+          Hold <strong>Hold for before</strong> to compare, then <strong>Apply</strong>. The optimizer works from the
+          edited picture from then on; your upload stays untouched, holding the eye button next to Edit shows it, and
+          Edit opens your layers again to change them. The edits are saved with the project.
+        </p>
+      </>
+    ),
+  },
+  {
     id: 'focus',
     title: 'Optional · Mark what matters most',
     body: (

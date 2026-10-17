@@ -13,12 +13,14 @@ import {
   Columns2,
   Crosshair,
   Eraser,
+  Eye,
   Flame,
   Image as ImageIcon,
   Layers,
   Loader2,
   Mountain,
   RefreshCw,
+  SlidersHorizontal,
   SplitSquareHorizontal,
   Trash2,
   Upload,
@@ -30,6 +32,7 @@ import { DifferenceImage, DifferenceLegend, useDifferenceMap } from './Differenc
 import { DEFAULT_FOCUS_STRENGTH, sliderFromStrength, strengthFromSlider } from '../lib/focusMask'
 import { HeightsControls, HeightsImage, HeightsToolbar, useHeightsKeys, useHeightsMode } from './HeightsMode'
 import { suggestionCount } from '../lib/heightGuidance'
+import { parseEdit } from '../lib/imageEdit'
 
 const VIEWS: View[] = ['original', 'result', 'split', 'compare', 'difference']
 const VIEW_LABELS: Record<View, string> = { original: 'Original', result: 'Result', split: 'Side by side', compare: 'Compare', difference: 'Differences' }
@@ -72,9 +75,9 @@ export const InputImagePanel: React.FC = () => {
   const headerWidth = useElementWidth(headerRef)
   // Narrow panels (laptop screens) keep every control on one row by
   // dropping labels, the least important ones first.
-  const viewLabels = headerWidth === 0 || headerWidth >= 560
-  const focusLabel = headerWidth === 0 || headerWidth >= 480
-  const changeLabel = headerWidth === 0 || headerWidth >= 700
+  const viewLabels = headerWidth === 0 || headerWidth >= 680
+  const focusLabel = headerWidth === 0 || headerWidth >= 520
+  const changeLabel = headerWidth === 0 || headerWidth >= 780
 
   // Focus areas: painting mode, tool and brush size.
   const focusMask = useFocusMask()
@@ -98,6 +101,18 @@ export const InputImagePanel: React.FC = () => {
   useHeightsKeys(heightsMode, heights, stopHeights)
 
   const jobActive = !!currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
+
+  // The image editor: the picture shown (and optimized) is the edited one;
+  // the unedited upload can be peeked at while a button is held.
+  const editSource = useAppStore((s) => parseEdit(s.settings.image_edit)?.source ?? null)
+  const setImageEditorOpen = useAppStore((s) => s.setImageEditorOpen)
+  const [showUnedited, setShowUnedited] = useState(false)
+  useEffect(() => setShowUnedited(false), [editSource])
+  const openEditor = useCallback(() => {
+    setPainting(false)
+    setHeightsMode(false)
+    setImageEditorOpen(true)
+  }, [setHeightsMode, setImageEditorOpen])
   // The printed result, next to the original: the optimizer's image (or the
   // slider-edited one) once done, the live preview while running.
   const resultSrc = currentJob?.status === 'completed'
@@ -270,7 +285,14 @@ export const InputImagePanel: React.FC = () => {
   )
 
   const originalImg = inputImage && (
-    <img src={inputImage} alt="Original" draggable={false} className="w-full h-full object-contain select-none" data-testid="input-image" />
+    <img
+      src={showUnedited && editSource ? `/uploads/${encodeURIComponent(editSource)}` : inputImage}
+      alt="Original"
+      draggable={false}
+      className="w-full h-full object-contain select-none"
+      data-testid="input-image"
+      data-unedited={showUnedited || undefined}
+    />
   )
   const resultImg = resultSrc && (
     <img src={resultSrc} alt="Result" draggable={false} className="w-full h-full object-contain select-none [image-rendering:pixelated]" data-testid="result-image" />
@@ -474,6 +496,40 @@ export const InputImagePanel: React.FC = () => {
           )
         })}
       </div>
+      <button
+        onClick={openEditor}
+        disabled={jobActive}
+        className={`relative ${outlineButton} ${editSource ? 'border-cyan-600 text-cyan-300' : ''} disabled:opacity-40 disabled:hover:bg-transparent`}
+        title={
+          jobActive
+            ? 'The picture can be edited once the run is done'
+            : editSource
+              ? 'The picture is edited — click to change the edits'
+              : 'Brightness, contrast, colours, curves, fewer colours… for the whole picture or a selected part'
+        }
+        aria-label="Edit image"
+        data-testid="edit-image-btn"
+        data-active={!!editSource || undefined}
+      >
+        <SlidersHorizontal className="w-3 h-3" />
+        {focusLabel && 'Edit'}
+        {editSource && <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" aria-hidden data-testid="edit-image-dot" />}
+      </button>
+      {editSource && (
+        <button
+          onPointerDown={() => setShowUnedited(true)}
+          onPointerUp={() => setShowUnedited(false)}
+          onPointerLeave={() => setShowUnedited(false)}
+          onKeyDown={(e) => (e.key === ' ' || e.key === 'Enter') && setShowUnedited(true)}
+          onKeyUp={() => setShowUnedited(false)}
+          className={`${outlineButton} ${showUnedited ? 'bg-gray-700' : ''}`}
+          title="Hold to see the picture as uploaded, before your edits"
+          aria-label="Hold to see the unedited picture"
+          data-testid="show-unedited-btn"
+        >
+          <Eye className="w-3 h-3" />
+        </button>
+      )}
       <button
         onClick={startPainting}
         className={`relative ${outlineButton} ${hasFocusAreas ? 'border-cyan-600 text-cyan-300' : ''}`}

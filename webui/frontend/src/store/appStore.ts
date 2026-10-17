@@ -15,6 +15,7 @@ import {
 } from '../lib/history'
 import { describeApiError } from '../lib/apiError'
 import { needsInitialPrune } from '../lib/bestOf'
+import { editFiles, parseEdit, type ImageEdit } from '../lib/imageEdit'
 import * as bandOps from '../lib/bandOps'
 import { inheritRunInputs, readStoredRunInputs, storeRunInputs, type RunInputs } from '../lib/staleResult'
 import { appendLossPoint, type LossPoint } from '../lib/lossHistory'
@@ -150,6 +151,47 @@ export function acceptsPreviewFor(jobId: string | undefined, currentJobId: strin
   return acceptsPreviewUpdate(jobId, currentJobId, hasTrackedJob)
 }
 
+/** A different picture to optimize: a new upload, or an edit of the
+ * current one. Everything derived from the old picture goes at the same
+ * moment the new one arrives (`changes` are the settings that come with
+ * it). Leaving any of it in place is what made the 3D panel show the
+ * previous image: `stlFile`/`currentJob` kept the old result's mesh on
+ * screen, and the backend kept serving the old auto-preview mesh (its state
+ * was still "ready") until the new heightmap init finished. */
+async function replaceInputImage(changes: Partial<OptimizationSettings>, displayUrl: string, label: string): Promise<void> {
+  stopPruningPoll()
+  // Before the store changes, not after: setting `inputImage` is what makes
+  // useAutoPreviewInit start the new heightmap init, and a reset landing
+  // after that had started would wipe the init it had just kicked off.
+  await fetch('/api/init/reset?forget=true', { method: 'POST' }).catch(() => {})
+  const settings = { ...useAppStore.getState().settings, ...changes }
+  // The previous upload's local preview holds that whole file in memory.
+  releaseReplacedObjectUrl(useAppStore.getState().inputImage, displayUrl)
+  useAppStore.setState({
+    settings,
+    inputImage: displayUrl,
+    // The previous image's heightmap bounds must not keep clamping band
+    // edits until the new init lands and reports its own range.
+    sliderLayerRange: { min: 0, max: settings.max_layers || 75 },
+    initState: { status: 'idle', preview_image: null },
+    initSkipImage: null,
+    hasRenderedInitPreview: false,
+    previewImage: null,
+    currentJob: null,
+    stlFile: null,
+    pruningJob: null,
+    pruningBaseline: null,
+    resolvedBase: null,
+    lossHistory: [],
+    lossJobId: null,
+    imageView: 'original',
+    sessionRestored: false,
+    selectedBand: null,
+    hoveredBand: null,
+  })
+  queueCaptureSnapshot(label)
+}
+
 async function refreshCurrentJob(jobId: string): Promise<void> {
   try {
     const response = await fetch(`/api/optimize/status/${jobId}`)
@@ -257,6 +299,28 @@ async function uploadDataUrl(dataUrl: string, name: string): Promise<{ filename:
   return response.json()
 }
 
+/** A loaded project's image edit with its files uploaded here (from the
+ * file's imageEditData), or null when they aren't all there. */
+async function uploadEditFiles(edit: ImageEdit | null, files: unknown): Promise<ImageEdit | null> {
+  if (!edit || !files || typeof files !== 'object') return null
+  const embedded = files as Record<string, unknown>
+  const renamed = new Map<string, string>()
+  try {
+    for (const name of editFiles(edit)) {
+      const dataUrl = embedded[name]
+      if (!isImageDataUrl(dataUrl)) return null
+      renamed.set(name, (await uploadDataUrl(dataUrl, name === edit.source ? 'unedited' : 'selection')).filename)
+    }
+  } catch {
+    return null
+  }
+  return {
+    ...edit,
+    source: renamed.get(edit.source)!,
+    layers: edit.layers.map((l) => (l.selection === 'mask' && l.mask ? { ...l, mask: renamed.get(l.mask)! } : l)),
+  }
+}
+
 /** The project file as saved: projectFileData plus everything it needs to
  * open on another machine — the image(s) and the heightmap the color layers
  * were made for (see lib/projectFile). `missing` names what couldn't be
@@ -274,6 +338,17 @@ async function shareableProjectFile(state: AppState): Promise<{ data: Record<str
   if (state.settings.input_image) await embed(state.settings.input_image, 'inputImageData', 'the image')
   if (state.settings.priority_mask) await embed(state.settings.priority_mask, 'priorityMaskData', 'the focus areas')
   if (state.settings.height_regions) await embed(state.settings.height_regions, 'heightRegionsData', 'the height regions')
+  // The unedited picture and the selections, so the edit can be changed again.
+  const edit = parseEdit(state.settings.image_edit)
+  if (edit) {
+    try {
+      const files: Record<string, string> = {}
+      for (const name of editFiles(edit)) files[name] = await uploadAsDataUrl(name)
+      data.imageEditData = files
+    } catch {
+      missing.push('the unedited picture (the edited one is included)')
+    }
+  }
   const source = heightmapSource(state.currentJob, state.initState.status)
   if (source) {
     try {
@@ -541,6 +616,12 @@ interface AppState {
   /** Best of N: keep run `run` (0-based) of the series waiting for a choice;
    * the job then finishes with it like a single run. */
   pickBestOfRun: (jobId: string, run: number) => Promise<void>
+  /** The image editor (ImageEditor) is open. */
+  imageEditorOpen: boolean
+  setImageEditorOpen: (open: boolean) => void
+  /** Use `picture` (the edited image) for `edit`, or go back to the picture
+   * as uploaded when `edit` is null. */
+  applyImageEdit: (edit: ImageEdit | null, picture: Blob | null) => Promise<void>
   /** The gallery of a best-of series waiting for a choice (BestOfGallery). */
   bestOfGalleryOpen: boolean
   setBestOfGalleryOpen: (open: boolean) => void
@@ -1060,6 +1141,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       inputImageData: unknown
       priorityMaskData: unknown
       heightRegionsData: unknown
+      imageEditData: unknown
       heightmap: unknown
       resolvedBase: ResolvedBase | null
     }>
@@ -1078,6 +1160,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       } catch {
         parsed.settings.priority_mask = ''
       }
+    }
+    if (parsed.settings?.image_edit) {
+      // The edit's own files (unedited picture, selections) under this
+      // server's names; without them it can't be edited again, but the
+      // edited picture itself still works.
+      parsed.settings.image_edit = await uploadEditFiles(parseEdit(parsed.settings.image_edit), parsed.imageEditData)
     }
     if (parsed.settings && isImageDataUrl(parsed.heightRegionsData)) {
       try {
@@ -1173,44 +1261,30 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   applyUploadedImage: async (filename, displayUrl) => {
-    // A new photo invalidates everything derived from the old one. Leaving
-    // any of it in place is what made the 3D panel show the previous image:
-    // `stlFile`/`currentJob` kept the old result's mesh on screen, and the
-    // backend kept serving the old auto-preview mesh (its state was still
-    // "ready") until the new heightmap init finished.
-    stopPruningPoll()
-    // Before the store changes, not after: setting `inputImage` is what makes
-    // useAutoPreviewInit start the new heightmap init, and a reset landing
-    // after that had started would wipe the init it had just kicked off.
-    await fetch('/api/init/reset?forget=true', { method: 'POST' }).catch(() => {})
     // The focus-area mask and the height regions were painted over the old
-    // picture's shapes.
-    const settings = { ...get().settings, input_image: filename, priority_mask: '', height_regions: '' }
-    // The previous upload's local preview holds that whole file in memory.
-    releaseReplacedObjectUrl(get().inputImage, displayUrl)
-    set({
-      settings,
-      inputImage: displayUrl,
-      // The previous image's heightmap bounds must not keep clamping band
-      // edits until the new init lands and reports its own range.
-      sliderLayerRange: { min: 0, max: settings.max_layers || 75 },
-      initState: { status: 'idle', preview_image: null },
-      initSkipImage: null,
-      hasRenderedInitPreview: false,
-      previewImage: null,
-      currentJob: null,
-      stlFile: null,
-      pruningJob: null,
-      pruningBaseline: null,
-      resolvedBase: null,
-      lossHistory: [],
-      lossJobId: null,
-      imageView: 'original',
-      sessionRestored: false,
-      selectedBand: null,
-      hoveredBand: null,
-    })
-    queueCaptureSnapshot('Input image changed')
+    // picture's shapes; an uploaded picture starts unedited.
+    await replaceInputImage({ input_image: filename, priority_mask: '', height_regions: '', image_edit: null }, displayUrl, 'Input image changed')
+  },
+
+  imageEditorOpen: false,
+  setImageEditorOpen: (open) => set({ imageEditorOpen: open }),
+
+  applyImageEdit: async (edit, picture) => {
+    const source = edit?.source ?? get().settings.image_edit?.source ?? get().settings.input_image
+    if (!edit) {
+      // Back to the picture as it was uploaded.
+      await replaceInputImage({ input_image: source, image_edit: null }, `/uploads/${encodeURIComponent(source)}`, 'Removed the image edits')
+      return
+    }
+    if (!picture) throw new Error('Nothing to apply')
+    const form = new FormData()
+    form.append('file', picture, 'edited.png')
+    const response = await fetch('/api/images/upload', { method: 'POST', body: form })
+    if (!response.ok) throw new Error(describeApiError(await response.json().catch(() => null), response.status))
+    const data = await response.json()
+    // Same shapes, other colours: focus areas, height regions and the
+    // height guidance still fit.
+    await replaceInputImage({ input_image: data.filename, image_edit: edit }, URL.createObjectURL(picture), 'Edited the image')
   },
 
   runInit: async () => {

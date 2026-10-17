@@ -241,3 +241,18 @@ body {
      shifting the whole UI up and cutting off the top bar. */
   html, body, #root { height: 100%; overflow: hidden; }
 }
+
+/* The image editor's selection outline. */
+@keyframes marching-ants {
+  to {
+    stroke-dashoffset: -8;
+  }
+}
+.marching-ants {
+  animation: marching-ants 0.5s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .marching-ants {
+    animation: none;
+  }
+}

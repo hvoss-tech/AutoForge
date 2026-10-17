@@ -9,6 +9,7 @@ import { BottomPanel } from './components/BottomPanel'
 import { HistoryDrawer } from './components/HistoryDrawer'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { BestOfGallery } from './components/BestOfGallery'
+import { ImageEditor } from './components/ImageEditor'
 import { StatusBar } from './components/StatusBar'
 import { SettingsModal } from './components/SettingsModal'
 import { NewFilamentModal } from './components/NewFilamentModal'
@@ -307,6 +308,7 @@ const App: React.FC = () => {
       <CatalogModal />
       <HistoryDrawer />
       <BestOfGallery />
+      <ImageEditor />
       <ConfirmDialog />
       <TutorialModal />
       <ToastContainer />
