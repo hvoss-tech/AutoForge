@@ -303,7 +303,7 @@ export const SettingsModal: React.FC = () => {
               <label
                 className="flex items-center gap-2 text-xs text-gray-300"
                 htmlFor="setting-best_of"
-                title="Runs the whole optimization this many times and keeps the result with the lowest loss. Each run takes as long as a normal one."
+                title="Runs the whole optimization this many times, then shows every result side by side so you can compare them and pick the one to keep. Each run takes as long as a normal one."
               >
                 Best of
                 <NumberInput

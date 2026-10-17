@@ -6,6 +6,7 @@ import {
   Check,
   HelpCircle,
   History,
+  LayoutGrid,
   Loader2,
   Moon,
   Pause,
@@ -35,7 +36,7 @@ import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { onUiCommand, sendUiCommand, type UiCommand } from '../lib/uiEvents'
 import { useFlash } from '../hooks/usePersistentState'
 import { describeReportPins, summarizeReport } from '../lib/heightGuidance'
-import { bestOfWarning, describeBestOfRuns } from '../lib/bestOf'
+import { bestOfWarning, describeBestOfRuns, isChoosingBestOf } from '../lib/bestOf'
 
 interface UpdateInfo {
   current_version: string
@@ -327,6 +328,24 @@ const JobProgress: React.FC<{ elapsedEta: { elapsed: number; eta: number; stalle
   )
 }
 
+/** In place of the progress once every run of a best-of series is done:
+ * reopens the gallery to pick one. */
+const ChooseResultButton: React.FC = () => {
+  const runs = useAppStore((s) => s.currentJob?.best_of_losses?.length ?? 0)
+  const setOpen = useAppStore((s) => s.setBestOfGalleryOpen)
+  return (
+    <button
+      onClick={() => setOpen(true)}
+      className={primaryButton}
+      title="All runs are done: compare them and pick the one to keep"
+      data-testid="best-of-open"
+    >
+      <LayoutGrid className="w-3.5 h-3.5" />
+      Choose a result ({runs} runs)
+    </button>
+  )
+}
+
 /** Done / out of date, and what pruning did — one status area. */
 const ResultStatus: React.FC = () => {
   const currentJob = useAppStore((s) => s.currentJob)
@@ -417,7 +436,7 @@ const ResultStatus: React.FC = () => {
       {bestOfRuns && (
         <span
           className="text-xs text-gray-300 tabular-nums"
-          title={['The result with the lowest loss was kept:', ...bestOfRuns].join('\n')}
+          title={[`You kept run ${(currentJob?.best_of_run ?? 0) + 1} of ${bestOfRuns.length}:`, ...bestOfRuns].join('\n')}
           data-testid="result-best-of"
         >
           <span aria-hidden className="text-gray-500">· </span>
@@ -527,6 +546,7 @@ export const TopBar: React.FC = () => {
 
   const jobId = currentJob?.job_id
   const isActive = currentJob?.status === 'running' || currentJob?.status === 'paused' || currentJob?.status === 'pending'
+  const choosing = isChoosingBestOf(currentJob)
 
   // The websocket pushes a fresh `currentJob` object on every progress
   // update — far more often than once a second, and at irregular intervals
@@ -539,8 +559,11 @@ export const TopBar: React.FC = () => {
     latestProgressRef.current = (currentJob?.progress || 0) / 100
   }, [currentJob?.progress])
 
+  // Not while a best-of series waits for a pick: nothing moves then, and
+  // the finish after it would start out "stalled" with a skewed estimate.
+  const tracking = isActive && !choosing
   useEffect(() => {
-    if (!isActive || !jobId) {
+    if (!tracking || !jobId) {
       trackerRef.current = null
       setElapsedEta(null)
       return
@@ -564,7 +587,7 @@ export const TopBar: React.FC = () => {
     tick()
     const interval = setInterval(tick, 1000)
     return () => clearInterval(interval)
-  }, [isActive, jobId])
+  }, [tracking, jobId])
 
   // A "can't start" message is about the state at click time; once that's
   // fixed it shouldn't linger next to an enabled Run button.
@@ -612,6 +635,15 @@ export const TopBar: React.FC = () => {
 
   const handleCancel = async () => {
     if (!currentJob) return
+    if (isChoosingBestOf(currentJob)) {
+      const runs = currentJob.best_of_losses?.length ?? 0
+      const ok = await requestConfirm({
+        title: `Discard all ${runs} runs?`,
+        message: 'None of the finished runs is kept.',
+        confirmLabel: 'Discard all',
+      })
+      if (!ok) return
+    }
     try {
       await cancelOptimization(currentJob.job_id)
     } catch (e) {
@@ -660,7 +692,7 @@ export const TopBar: React.FC = () => {
           at a fixed width this group slid over the workflow steps on a
           1280px screen and swallowed clicks on the last step. */}
       <div className="flex items-center gap-2 min-w-0">
-        {isActive && currentJob && <JobProgress elapsedEta={elapsedEta} />}
+        {isActive && currentJob && (choosing ? <ChooseResultButton /> : <JobProgress elapsedEta={elapsedEta} />)}
 
         {hasResult && !isActive && <ResultStatus />}
 
@@ -710,7 +742,7 @@ export const TopBar: React.FC = () => {
 
         {!isActive && <RunLimitsButton />}
 
-        {currentJob?.status === 'running' ? (
+        {choosing ? null : currentJob?.status === 'running' ? (
           <button
             onClick={handlePause}
             disabled={serverLost}
@@ -744,12 +776,12 @@ export const TopBar: React.FC = () => {
         {isActive && (
           <button
             onClick={handleCancel}
-            title={serverLost ? 'Stop showing this run (the server that ran it is gone)' : undefined}
+            title={serverLost ? 'Stop showing this run (the server that ran it is gone)' : choosing ? 'Discard all runs without keeping one' : undefined}
             className={outlineButton('border-red-600 text-red-500 hover:bg-red-600/15')}
             data-testid="top-cancel-btn"
           >
             <Square className="w-3.5 h-3.5" />
-            Cancel
+            {choosing ? 'Discard' : 'Cancel'}
           </button>
         )}
 

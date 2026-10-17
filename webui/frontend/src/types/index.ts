@@ -105,6 +105,9 @@ export interface JobStatus {
   /** Best of N runs: the finished runs' losses, and the one kept (0-based). */
   best_of_losses?: number[] | null
   best_of_run?: number | null
+  /** All runs are done and the job waits for the user to pick one (see
+   * lib/bestOf isChoosingBestOf); best_of_run is then the lowest loss. */
+  best_of_choosing?: boolean | null
   /** Which auto-repeat pruning pass is running, out of how many allowed. */
   pruning_pass?: number | null
   pruning_max_passes?: number | null

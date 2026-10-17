@@ -537,6 +537,12 @@ interface AppState {
   pauseOptimization: (jobId: string) => Promise<void>
   resumeOptimization: (jobId: string) => Promise<void>
   cancelOptimization: (jobId: string) => Promise<void>
+  /** Best of N: keep run `run` (0-based) of the series waiting for a choice;
+   * the job then finishes with it like a single run. */
+  pickBestOfRun: (jobId: string, run: number) => Promise<void>
+  /** The gallery of a best-of series waiting for a choice (BestOfGallery). */
+  bestOfGalleryOpen: boolean
+  setBestOfGalleryOpen: (open: boolean) => void
   startPruning: (overrides?: Partial<PruningSettings>) => Promise<string>
   pausePruning: (jobId: string) => Promise<void>
   resumePruning: (jobId: string) => Promise<void>
@@ -604,6 +610,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   filterType: '',
   filterBrand: '',
   pruningModalOpen: false,
+  bestOfGalleryOpen: false,
   pruningSettings: defaultPruningSettings,
   pruningJob: null,
   initState: { status: 'idle', preview_image: null },
@@ -989,6 +996,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setFilterType: (type) => set({ filterType: type }),
   setFilterBrand: (brand) => set({ filterBrand: brand }),
   setPruningModalOpen: (open) => set({ pruningModalOpen: open }),
+  setBestOfGalleryOpen: (open) => set({ bestOfGalleryOpen: open }),
   setPruningSettings: (settings) => set({ pruningSettings: settings }),
   setPruningJob: (job) => set({ pruningJob: job }),
   setInitState: (state) => set((prev) => ({ initState: { ...prev.initState, ...state } })),
@@ -1325,6 +1333,26 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     set((state) => ({
       currentJob: state.currentJob ? { ...state.currentJob, status } : null,
+    }))
+  },
+
+  pickBestOfRun: async (jobId, run) => {
+    const response = await fetch(`/api/optimize/best-of/${encodeURIComponent(jobId)}/pick`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run }),
+    })
+    if (!response.ok) {
+      const message = describeApiError(await response.json().catch(() => null), response.status)
+      // Picked meanwhile (another tab) or cancelled: show what it is now.
+      if (response.status === 409) await refreshCurrentJob(jobId)
+      throw new Error(message)
+    }
+    // Until the socket reports it, the series no longer waits for a choice.
+    set((state) => ({
+      currentJob: state.currentJob?.job_id === jobId
+        ? { ...state.currentJob, best_of_choosing: false, best_of_run: run, phase: `Loading run ${run + 1}` }
+        : state.currentJob,
     }))
   },
 

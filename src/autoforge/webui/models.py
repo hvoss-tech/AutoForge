@@ -193,8 +193,9 @@ class OptimizationSettings(CamelCaseModel):
     num_init_rounds: int = Field(1, ge=1)
     num_init_cluster_layers: int = Field(-1, ge=-1)
     disable_visualization_for_gradio: int = 1
-    # Runs the optimization this many times and keeps the lowest-loss run
-    # (the CLI's --best_of); the frontend asks before starting more than one.
+    # Runs the optimization this many times (like the CLI's --best_of), then
+    # waits for the user to pick one of the runs (see JobStatus.best_of_choosing);
+    # the frontend asks before starting more than one.
     best_of: int = Field(1, ge=1, le=20)
     discrete_check: int = Field(100, ge=1)
     flatforge: bool = False
