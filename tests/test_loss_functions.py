@@ -164,3 +164,18 @@ def test_loss_fn_low_memory_path_matches_default():
     default = loss_fn(params, target, low_memory=False, **kw)
     low = loss_fn(params, target, low_memory=True, **kw)
     assert torch.allclose(default, low, atol=1e-3)
+
+
+def test_target_lab_cache_is_full_precision_even_when_first_built_under_autocast():
+    # Training on CPU runs under bf16 autocast, and the first compute_loss
+    # call cached the target's Lab at bf16 precision (~0.9 Lab off). Every
+    # later loss - the reported final loss, pruning - reused that, so a result
+    # rebuilt from disk (fresh cache) scored differently than the live one.
+    g = torch.Generator().manual_seed(0)
+    target = torch.rand(16, 16, 3, generator=g) * 255
+    comp = torch.rand(16, 16, 3, generator=g) * 255
+    expected = compute_loss(comp, target.clone()).item()
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        compute_loss(comp, target)
+    assert compute_loss(comp, target).item() == pytest.approx(expected, rel=1e-6)

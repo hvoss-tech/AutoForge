@@ -1,3 +1,4 @@
+import contextlib
 from typing import Optional
 
 import torch
@@ -76,6 +77,33 @@ def loss_fn(
     )
 
 
+_AUTOCAST_DEVICES = ("cpu", "cuda", "mps", "xpu")
+
+
+def cached_target_lab(target: torch.Tensor) -> torch.Tensor:
+    """Lab of a fixed target image, cached on the tensor object.
+
+    `target` is the same image for many consecutive calls (every training
+    step, all pruning phases at one resolution), so its fairly expensive
+    conversion is done once - it only needs redoing when the target tensor is
+    swapped out (e.g. solver -> full output resolution).
+
+    Always converted in float32 with autocast off: the first call usually
+    happens inside the training loop's autocast, and a bf16 matmul there put
+    the cached target ~0.9 Lab off for every later loss of the run."""
+    lab = getattr(target, "_af_lab_cache", None)
+    if lab is None or lab.device != target.device or lab.dtype != torch.float32:
+        kind = target.device.type
+        guard = torch.autocast(kind, enabled=False) if kind in _AUTOCAST_DEVICES else contextlib.nullcontext()
+        with guard:
+            lab = srgb_to_lab(target.to(torch.float32))
+        try:
+            target._af_lab_cache = lab
+        except Exception:
+            pass
+    return lab
+
+
 def compute_loss(
     comp: torch.Tensor,
     target: torch.Tensor,
@@ -103,23 +131,9 @@ def compute_loss(
     """
     comp_lab = srgb_to_lab(comp)
 
-    # `target` is a fixed image for many consecutive calls (every training
-    # step, all pruning phases operating at one resolution). Cache its Lab
-    # conversion on the tensor object itself so we don't redo the (fairly
-    # expensive, pow/log-heavy) color conversion every single call - it only
-    # needs recomputing when the target tensor is swapped out (e.g. going
-    # from solver resolution to full output resolution during post-processing).
-    target_lab = getattr(target, "_af_lab_cache", None)
-    if (
-        target_lab is None
-        or target_lab.dtype != comp_lab.dtype
-        or target_lab.device != comp_lab.device
-    ):
-        target_lab = srgb_to_lab(target)
-        try:
-            target._af_lab_cache = target_lab
-        except Exception:
-            pass
+    target_lab = cached_target_lab(target)
+    if target_lab.dtype != comp_lab.dtype:
+        target_lab = target_lab.to(comp_lab.dtype)
 
     if focus_map is None and alpha is None:
         mse_loss = F.mse_loss(comp_lab, target_lab)

@@ -21,7 +21,7 @@ from autoforge.Helper.OptimizerHelper import (
     layer_coverage_params,
     material_run_starts,
 )
-from autoforge.Loss.LossFunctions import compute_loss
+from autoforge.Loss.LossFunctions import cached_target_lab, compute_loss
 from autoforge.Helper.ImageHelper import srgb_to_lab
 from autoforge.Modules.Optimizer import FilamentOptimizer, _compute_height_offset_term
 
@@ -182,13 +182,7 @@ def _candidate_loss(optimizer, eff_thick, cols, tds) -> torch.Tensor:
         if fc.fused_available(eff_thick):
             return fc.heights_loss(optimizer, z, cols, tds)
     if optimizer.focus_map is None and optimizer.alpha is None:
-        target_lab = getattr(optimizer.target, "_af_lab_cache", None)
-        if target_lab is None or target_lab.dtype != torch.float32:
-            target_lab = srgb_to_lab(optimizer.target)
-            try:
-                optimizer.target._af_lab_cache = target_lab
-            except Exception:
-                pass
+        target_lab = cached_target_lab(optimizer.target)
         return _replay_captured(
             _compose_loss_impl,
             "compose_loss",
