@@ -37,7 +37,9 @@ jobs:
           EOF
 
   playwright:
-    runs-on: ubuntu-latest
+    # Playwright only knows the system packages up to Ubuntu 24.04; on the
+    # newer ubuntu-latest image `install --with-deps` fails.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
