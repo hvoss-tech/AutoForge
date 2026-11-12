@@ -129,7 +129,10 @@ def test_project_file_is_strict_json_when_csv_fields_are_blank(tmp_path):
         assert isinstance(entry["uuid"], str) and entry["uuid"]
         assert entry["Transmissivity"] == 2.5
     blue = next(f for f in data["filament_set"] if f["Name"] == "Blue")
-    assert blue["Brand"] == "Acme" and blue["uuid"] == "u2" and blue["Transmissivity"] == 3
+    assert blue["Brand"] == "Acme" and blue["Transmissivity"] == 3
+    # "u2" is no uuid HueForge can read (issue #66); it maps to a stable one.
+    from autoforge.Helper.OutputHelper import hfp_uuid
+    assert blue["uuid"] == hfp_uuid("u2")
 
 
 def test_model_size_mm_matches_the_stl_scale():

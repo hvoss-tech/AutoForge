@@ -158,3 +158,60 @@ def test_generate_project_file_contents(tmp_path):
     assert data["layer_height"] == args.layer_height
     assert data["slider_values"]
     assert data["stl"] == os.path.basename(str(stl_path))
+
+
+def _hueforge_uuid(text):
+    """The uuid as HueForge reads it (QUuid::fromString): 32 hex digits in
+    8-4-4-4-12 groups, optionally in braces. None if it would be rejected."""
+    import re
+
+    m = re.fullmatch(r"\{?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\}?", text)
+    return m.group(1).lower() if m else None
+
+
+def test_project_file_uuids_are_readable_by_hueforge(tmp_path):
+    # Issue #66: filaments added from the catalog carry ids like
+    # "filamentcolors-4803". HueForge drops every filament_set entry whose
+    # uuid it can't parse, so the project loaded white / shifted.
+    args = _args(tmp_path)
+    native = "{1800e8df-9e84-7c9a-088d-ac7b98baf869}"
+    pandas.DataFrame(
+        {
+            "Brand": ["B0", "B1", "B2"],
+            "Name": ["N0", "N1", "N2"],
+            "Transmissivity": [1.0, 2.0, 3.0],
+            "Color": ["#000000", "#111111", "#222222"],
+            "Uuid": ["filamentcolors-4803", native, "filamentcolors-3500"],
+        }
+    ).to_csv(args.csv_file, index=False)
+    args.background_material_index = 0
+    disc_global = np.array([0, 1, 2, 0, 2, 1])
+    disc_height = np.array([[0, 2], [4, 6]])
+    project_path = tmp_path / "project.hfp"
+
+    generate_project_file(
+        str(project_path), args, disc_global, disc_height, 50, 40, "model.stl", args.csv_file,
+    )
+    entries = json.loads(project_path.read_text())["filament_set"]
+    parsed = [_hueforge_uuid(e["uuid"]) for e in entries]
+    assert None not in parsed, [e["uuid"] for e in entries]
+
+    by_name = {}
+    for e, u in zip(entries, parsed):
+        by_name.setdefault(e["Name"], set()).add(u)
+    # A filament used in several slots keeps one id, distinct filaments differ,
+    # and an id that already is a uuid is passed through unchanged.
+    assert all(len(ids) == 1 for ids in by_name.values()), by_name
+    assert len({next(iter(ids)) for ids in by_name.values()}) == len(by_name)
+    assert by_name["N1"] == {native.strip("{}")}
+
+
+def test_project_file_catalog_uuid_is_stable_across_exports(tmp_path):
+    # Same filament -> same uuid in every export, so HueForge sees it as the
+    # same filament each time instead of a new one.
+    from autoforge.Helper.OutputHelper import _hfp_filament
+
+    mat = {"Brand": "Elegoo", "Name": "Yellow", "Color": "#f4cf15",
+           "Transmissivity": 3.4, "Uuid": "filamentcolors-4803"}
+    first, second = _hfp_filament(dict(mat))["uuid"], _hfp_filament(dict(mat))["uuid"]
+    assert first == second and _hueforge_uuid(first)

@@ -69,6 +69,28 @@ def _is_blank(value) -> bool:
     return isinstance(value, str) and value.strip() == ""
 
 
+# Namespace for turning library ids that aren't uuids into stable ones.
+_HFP_UUID_NAMESPACE = uuid.UUID("5b0f6c2e-8a51-4d0e-9c3a-2f6d4b1e7a90")
+
+
+def hfp_uuid(value=None) -> str:
+    """A filament id HueForge can read, in its braced ``{8-4-4-4-12}`` form.
+
+    HueForge parses ids with QUuid and silently drops every filament_set
+    entry it can't parse, so the remaining filaments slide onto the wrong
+    sliders - or the whole model comes up white. Catalog filaments are
+    stored as ``filamentcolors-<id>``, so ids that aren't uuids get a
+    stable uuid5 of themselves: the same filament keeps one id across
+    slots and exports. Blank values get a fresh random uuid."""
+    if _is_blank(value):
+        return "{%s}" % uuid.uuid4()
+    text = str(value).strip()
+    try:
+        return "{%s}" % uuid.UUID(text)
+    except ValueError:
+        return "{%s}" % uuid.uuid5(_HFP_UUID_NAMESPACE, text)
+
+
 def _hfp_filament(mat, brand="", color="#000000", name=""):
     """One ``filament_set`` entry of a .hfp file from a material record.
 
@@ -96,7 +118,7 @@ def _hfp_filament(mat, brand="", color="#000000", name=""):
         "Owned": str(mat.get("Owned", False)).strip().lower() == "true",
         "Transmissivity": int(td) if td.is_integer() else td,
         "Type": text("Type", "PLA"),
-        "uuid": text("Uuid", str(uuid.uuid4())),
+        "uuid": hfp_uuid(mat.get("Uuid")),
     }
 
 
@@ -175,7 +197,7 @@ def generate_project_file(
                 "Owned": False,
                 "Transmissivity": 0.1,
                 "Type": "PLA",
-                "uuid": str(uuid.uuid4()),
+                "uuid": hfp_uuid(),
             }
         )
 
