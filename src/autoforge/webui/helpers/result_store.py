@@ -67,6 +67,10 @@ def _materials_of(result: dict[str, Any]) -> list[dict[str, Any]]:
                 "color": str(f["color"]),
                 "td": float(f["td"]),
                 "name": str(f.get("name", "")),
+                "brand": str(f.get("brand", "")),
+                "short_name": str(f.get("short_name", "")),
+                "filament_type": str(f.get("filament_type") or f.get("filamentType") or "PLA"),
+                "owned": bool(f.get("owned", False)),
             }
             for f in active
         ]
@@ -80,6 +84,14 @@ def _materials_of(result: dict[str, Any]) -> list[dict[str, Any]]:
             "color": str(colors[i]),
             "td": float(tds[i]) if tds is not None else 1.0,
             "name": str(names[i]) if i < len(names) else "",
+            "brand": str(names[i]).split(" - ", 1)[0].strip()
+            if i < len(names) and " - " in str(names[i])
+            else "",
+            "short_name": str(names[i]).split(" - ", 1)[1].strip()
+            if i < len(names) and " - " in str(names[i])
+            else (str(names[i]) if i < len(names) else ""),
+            "filament_type": "PLA",
+            "owned": False,
         }
         for i in range(len(colors))
     ]
@@ -189,6 +201,10 @@ def solution_from_sliders(
                 "color": str(f["color"]),
                 "td": float(f.get("td") or 1.0),
                 "name": str(f.get("name", "")),
+                "brand": str(f.get("brand", "")),
+                "short_name": str(f.get("short_name", "")),
+                "filament_type": str(f.get("filament_type") or f.get("filamentType") or "PLA"),
+                "owned": bool(f.get("owned", False)),
             })
     slot_material = []
     for s in enabled:
@@ -197,7 +213,16 @@ def solution_from_sliders(
             if not s.get("color"):
                 raise ResultUnavailable("A color layer uses a filament that isn't active anymore; add it again first.")
             index_of[uuid_] = len(materials)
-            materials.append({"uuid": uuid_, "color": str(s["color"]), "td": float(s.get("td") or 1.0), "name": ""})
+            materials.append({
+                "uuid": uuid_,
+                "color": str(s["color"]),
+                "td": float(s.get("td") or 1.0),
+                "name": "",
+                "brand": "",
+                "short_name": "",
+                "filament_type": "PLA",
+                "owned": False,
+            })
         slot_material.append(index_of[uuid_])
 
     max_layer = int(heights.max(initial=0))

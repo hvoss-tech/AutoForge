@@ -34,6 +34,7 @@ export const FileMenu: React.FC = () => {
   const projectName = useAppStore((s) => s.projectName)
   const pushToast = useAppStore((s) => s.pushToast)
   const [exporting, setExporting] = useState(false)
+  const [exporting3mf, setExporting3mf] = useState(false)
   const named = (suffix: string, fallback: string) => exportFileName(projectName, suffix, fallback)
   // The border picked in the 3D view goes into every STL download.
   const border = normalizeBorder(settings.border)
@@ -134,6 +135,30 @@ export const FileMenu: React.FC = () => {
       })
     } finally {
       setExporting(false)
+    }
+  }
+
+  const handleExport3mf = async () => {
+    if (!jobId || exporting3mf) return
+    setExporting3mf(true)
+    pushToast('Preparing Bambu .3mf — the download starts when it is ready', 'info')
+    try {
+      const state = useAppStore.getState()
+      const project = {
+        ...projectFileData(state),
+        settings: withEffectiveBaseColor(state.settings, state.resolvedBase),
+      }
+      await downloadFromServer(`/api/outputs/3mf/${jobId}`, named('model_bambu.3mf', 'final_model_bambu.3mf'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: projectName,
+          project,
+          border,
+        }),
+      })
+    } finally {
+      setExporting3mf(false)
     }
   }
 
@@ -248,6 +273,16 @@ export const FileMenu: React.FC = () => {
               <Box className="w-3.5 h-3.5" /> 3D model (.stl)
             </button>
           )}
+          <button
+            onClick={handleExport3mf}
+            disabled={!canExport || isFlatforge || exporting3mf}
+            title={isFlatforge ? 'Bambu .3mf layer-swap export is only available for single-STL runs' : exportHint}
+            className={itemClass}
+            role="menuitem"
+            data-testid="download-3mf"
+          >
+            <Box className="w-3.5 h-3.5" /> {exporting3mf ? 'Preparing .3mf…' : 'Bambu project (.3mf)'}
+          </button>
           <button onClick={handleInstructions} disabled={!hasBands} title={hasBands ? undefined : 'Add color layers first'} className={itemClass} role="menuitem" data-testid="download-instructions">
             <FileText className="w-3.5 h-3.5" /> Swap instructions (.txt)
           </button>

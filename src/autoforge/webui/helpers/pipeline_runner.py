@@ -1167,6 +1167,40 @@ def export_results(
                     args.csv_file,
                 )
 
+            bambu_3mf_path = None
+            if not args.flatforge:
+                from autoforge.helpers.export_3mf import export_solution_3mf
+
+                active_filaments = result.get("active_filaments") or [
+                    {
+                        "uuid": f"mat_{i}",
+                        "color": "#" + "".join(
+                            f"{int(round(float(c) * 255)):02X}" for c in material_colors_np[i][:3]
+                        ),
+                        "td": float(material_TDs_np[i]) if i < len(material_TDs_np) else 5.0,
+                        "brand": (
+                            str(material_names[i]).split(" - ", 1)[0].strip()
+                            if i < len(material_names) and " - " in str(material_names[i])
+                            else ""
+                        ),
+                        "name": material_names[i] if i < len(material_names) else f"Filament {i + 1}",
+                        "filament_type": "PLA",
+                    }
+                    for i in range(len(material_colors_np))
+                ]
+                bambu_3mf_path = export_solution_3mf(
+                    stl_path,
+                    os.path.join(args.output_folder, "final_model_bambu.3mf"),
+                    disc_global.detach().cpu().numpy(),
+                    disc_height_image.detach().cpu().numpy(),
+                    args.layer_height,
+                    args.background_height,
+                    getattr(args, "background_color", "#000000"),
+                    active_filaments,
+                    background_material_index=getattr(args, "background_material_index", None),
+                    swap_instructions_text="\n".join(swap_instructions),
+                )
+
             print("All done. Outputs in:", args.output_folder)
             if export_progress is not None:
                 export_progress(1.0)
@@ -1174,6 +1208,7 @@ def export_results(
             return {
                 "preview_png": preview_path,
                 "stl": stl_path,
+                "bambu_3mf": bambu_3mf_path,
                 "colored_ply": ply_path,
                 "swap_instructions": swap_path,
                 "project_file": project_path,
