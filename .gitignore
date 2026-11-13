@@ -308,3 +308,9 @@ fabric.properties
 # perf-optimization experiment scratch output
 bench_output/
 
+# WebUI runtime data and experiment outputs
+checkpoints/
+uploads/
+result.json
+
+
