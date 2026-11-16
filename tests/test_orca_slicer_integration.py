@@ -42,12 +42,16 @@ MATERIALS = [
 STACK = [0, 0, 1, 1, 2, 2, 3, 1]
 
 
-@pytest.mark.parametrize("printer, manual", [
-    ("Bambu Lab X1 Carbon 0.4 nozzle", False),  # AMS: tool changes
-    ("Prusa MK4 0.4 nozzle", True),  # pause for a hand swap
-    ("Snapmaker U1 (0.4 nozzle)", False),  # tool changer, four extruders
+@pytest.mark.parametrize("printer, manual, layer, base", [
+    ("Bambu Lab X1 Carbon 0.4 nozzle", False, LH, BG),  # AMS: tool changes
+    ("Prusa MK4 0.4 nozzle", True, LH, BG),  # pause for a hand swap
+    ("Snapmaker U1 (0.4 nozzle)", False, LH, BG),  # tool changer, four extruders
+    # Hand swaps on a Bambu printer: OrcaSlicer skipped the first one when it
+    # was done through the change-filament G-code.
+    ("Bambu Lab X1 Carbon 0.4 nozzle", True, 0.12, 0.36),
+    ("Prusa MK4 0.4 nozzle", True, 0.04, 0.16),
 ])
-def test_orca_slices_the_project(tmp_path, printer, manual):
+def test_orca_slices_the_project(tmp_path, printer, manual, layer, base):
     work = str(tmp_path)
     orca = _orca_command(work)
     if orca is None:
@@ -55,25 +59,28 @@ def test_orca_slices_the_project(tmp_path, printer, manual):
     yy, xx = np.mgrid[0:60, 0:60]
     heights = np.clip(8 - (np.hypot(yy - 30, xx - 30) // 4).astype(int), 0, 8)
     stl = os.path.join(work, "model.stl")
-    generate_stl(heights.astype(np.float32) * LH, stl, BG, maximum_x_y_size=30)
-    plan = swap_plan(STACK, 8, LH, BG, MATERIALS, 0)
+    generate_stl(heights.astype(np.float32) * layer, stl, base, maximum_x_y_size=30)
+    plan = swap_plan(STACK, 8, layer, base, MATERIALS, 0)
     project = os.path.join(work, "project.3mf")
-    export_3mf(project, stl, plan, printer, LH, BG, manual_swaps=manual)
+    export_3mf(project, stl, plan, printer, layer, base, manual_swaps=manual)
 
     subprocess.run(orca + ["--slice", "0", "--outputdir", work, project], capture_output=True, timeout=900, cwd=work)
     result = json.load(open(os.path.join(work, "result.json")))
     assert result["return_code"] == 0, result["error_string"]
     gcode = next(os.path.join(work, f) for f in os.listdir(work) if f.endswith(".gcode"))
 
-    changes, z = [], None
+    changes, layers, z = [], [], None
     for line in open(gcode, encoding="utf-8", errors="replace"):
         m = re.match(r";\s*Z_HEIGHT:\s*([\d.]+)", line) or re.match(r";Z:([\d.]+)", line)
         if m:
             z = round(float(m.group(1)), 2)
+            layers.append(z)
         elif manual and line.startswith("; AutoForge: swap the filament by hand"):
             changes.append(z)
-        elif not manual and re.match(r"^T([0-9])\b", line) and z is not None:
-            changes.append((z, int(line[1])))
+        elif not manual and (t := re.match(r"^[ \t]*T([0-9])\b", line)) and z is not None and z >= base:
+            changes.append((z, int(t.group(1))))
+    # The project's layer and base heights are what OrcaSlicer prints.
+    assert layers[0] == pytest.approx(base) and layers[1] == pytest.approx(base + layer)
     if manual:
         assert changes == [round(z, 2) for z, _ in plan.swaps]
     else:

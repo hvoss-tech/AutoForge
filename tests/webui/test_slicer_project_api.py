@@ -71,7 +71,7 @@ def _job(stack=(0, 0, 1, 1, 2, 2), base_index=0, size_mm=30, nozzle=None):
 
 def _swaps(data):
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        layers = ET.fromstring(zf.read("Metadata/custom_gcode_per_layer.xml")).findall(".//layer")
+        layers = ET.fromstring(zf.read("Metadata/custom_gcode_per_layer.xml")).findall(".//layer[@type='2']")
         cfg = json.loads(zf.read("Metadata/project_settings.config"))
     return [(l.attrib["top_z"], l.attrib["extruder"]) for l in layers], cfg
 

@@ -491,10 +491,23 @@ def project_settings(
     min_heights = as_list(machine.get("min_layer_height"))
     if min_heights and any(_float(h, 0.0) > float(layer_height) for h in min_heights):
         printer_changes["min_layer_height"] = [f"{float(layer_height):g}"] * len(min_heights)
+    # And the other way round: AutoForge's layer height is what the colours
+    # were computed for, so the printer's limit gives way, not the layers.
+    max_heights = as_list(machine.get("max_layer_height"))
+    if max_heights and any(0 < _float(h, 0.0) < float(layer_height) for h in max_heights):
+        printer_changes["max_layer_height"] = [
+            f"{max(_float(h, 0.0), float(layer_height)):g}" for h in max_heights
+        ]
     if manual_swaps:
+        # Each swap is a pause entry in custom_gcode_per_layer.xml running the
+        # printer's pause G-code. Not the change-filament G-code: with manual
+        # filament changes OrcaSlicer skips that on the first tool change of a
+        # print (taking it for the initial load), and on printers whose start
+        # G-code loads the filament itself (Bambu) that is the first real swap.
         pause = str(machine.get("machine_pause_gcode") or "").strip() or "M600"
-        printer_changes["manual_filament_change"] = "1"
-        printer_changes["change_filament_gcode"] = f"; AutoForge: swap the filament by hand\n{pause}\n"
+        printer_changes["manual_filament_change"] = "1"  # T commands become comments
+        printer_changes["change_filament_gcode"] = ""
+        printer_changes["machine_pause_gcode"] = f"; AutoForge: swap the filament by hand\n{pause}\n"
         printer_changes["single_extruder_multi_material"] = "1"
     config.update(process_changes)
     config.update(printer_changes)
@@ -919,12 +932,18 @@ def _model_settings(title: str) -> str:
 </config>"""
 
 
-def _custom_gcodes(plan: SwapPlan) -> str:
-    rows = "".join(
-        f'  <layer top_z="{z:.4f}" type="2" extruder="{slot + 1}" color="{plan.slots[slot].color}" '
-        f'extra="" gcode="tool_change"/>\n'
-        for z, slot in plan.swaps
-    )
+def _custom_gcodes(plan: SwapPlan, manual_swaps: bool = False) -> str:
+    """Tool changes give each layer band its filament; for hand swaps a pause
+    at the same height stops the print (type 1 runs machine_pause_gcode)."""
+    rows = ""
+    for z, slot in plan.swaps:
+        rows += (
+            f'  <layer top_z="{z:.4f}" type="2" extruder="{slot + 1}" color="{plan.slots[slot].color}" '
+            f'extra="" gcode="tool_change"/>\n'
+        )
+        if manual_swaps:
+            label = _xml_attr(plan.slots[slot].name or plan.slots[slot].color)
+            rows += f'  <layer top_z="{z:.4f}" type="1" extruder="{slot + 1}" color="" extra="Swap to {label}" gcode=""/>\n'
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n<custom_gcodes_per_layer>\n <plate>\n'
         '  <plate_info id="1"/>\n' + rows + '  <mode value="MultiAsSingle"/>\n </plate>\n</custom_gcodes_per_layer>\n'
@@ -1029,7 +1048,7 @@ def export_3mf(
             f.write(b"    </triangles>\n   </mesh>\n  </object>\n </resources>\n <build/>\n</model>\n")
         zf.writestr("Metadata/model_settings.config", _model_settings(title))
         zf.writestr("Metadata/project_settings.config", json.dumps(settings, indent=4, ensure_ascii=False))
-        zf.writestr("Metadata/custom_gcode_per_layer.xml", _custom_gcodes(plan))
+        zf.writestr("Metadata/custom_gcode_per_layer.xml", _custom_gcodes(plan, manual_swaps))
         zf.writestr(
             "Metadata/slice_info.config",
             '<?xml version="1.0" encoding="UTF-8"?>\n<config>\n  <header>\n'

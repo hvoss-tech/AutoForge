@@ -234,7 +234,8 @@ def test_project_settings_carry_full_presets_and_heightmap_overrides(acme):
     assert cfg["enable_prime_tower"] == "0"
     assert cfg["min_layer_height"] == ["0.04"]  # the printer's 0.07 would clamp 0.04 layers
     assert cfg["manual_filament_change"] == "1"
-    assert cfg["change_filament_gcode"].rstrip().endswith("M601")
+    assert cfg["machine_pause_gcode"].rstrip().endswith("M601")
+    assert cfg["change_filament_gcode"] == ""
     # Empty: OrcaSlicer would reset every unlisted option to its own system
     # preset (VIRTU E3, deltas: refused to slice); empty, it uses this config.
     assert cfg["different_settings_to_system"] == [""] * (3 + 2)
@@ -309,7 +310,7 @@ def test_export_3mf_archive(acme):
         assert (verts[:, 0].min() + verts[:, 0].max()) / 2 + tx == pytest.approx(100)
         assert (verts[:, 1].min() + verts[:, 1].max()) / 2 + ty == pytest.approx(100)
         assert verts[:, 2].min() + tz == pytest.approx(0)
-        layers = ET.fromstring(zf.read("Metadata/custom_gcode_per_layer.xml")).findall(".//layer")
+        layers = ET.fromstring(zf.read("Metadata/custom_gcode_per_layer.xml")).findall(".//layer[@type='2']")
         assert [(l.attrib["top_z"], l.attrib["extruder"], l.attrib["color"]) for l in layers] == [
             ("0.3200", "2", "#FF0000"), ("0.4000", "3", "#FFFFFF"), ("0.4800", "2", "#FF0000")]
         cfg = json.loads(zf.read("Metadata/project_settings.config"))
@@ -360,7 +361,7 @@ def test_cli_writes_the_slicer_project_only_when_asked(acme, tmp_path, capsys):
     _export_slicer_project(args, np.array([0, 1, 1, 1]), heights, colors, ["Acme - Black", "Acme - Red"], 0)
     with zipfile.ZipFile(tmp_path / "final_model.3mf") as zf:
         cfg = json.loads(zf.read("Metadata/project_settings.config"))
-        layers = ET.fromstring(zf.read("Metadata/custom_gcode_per_layer.xml")).findall(".//layer")
+        layers = ET.fromstring(zf.read("Metadata/custom_gcode_per_layer.xml")).findall(".//layer[@type='2']")
     assert cfg["filament_colour"] == ["#000000", "#FF0000"]
     assert [l.attrib["top_z"] for l in layers] == ["0.4000"]
     assert "manual_filament_change" not in cfg
@@ -579,7 +580,7 @@ def test_small_nozzle_export_splits_the_base_and_says_so(acme):
     assert any("0.16 mm first layer" in n for n in info["notes"])
     cfg = json.loads(zipfile.ZipFile(io.BytesIO(buf.getvalue())).read("Metadata/project_settings.config"))
     assert cfg["initial_layer_print_height"] == "0.16"
-    layers = ET.fromstring(zipfile.ZipFile(io.BytesIO(buf.getvalue())).read("Metadata/custom_gcode_per_layer.xml")).findall(".//layer")
+    layers = ET.fromstring(zipfile.ZipFile(io.BytesIO(buf.getvalue())).read("Metadata/custom_gcode_per_layer.xml")).findall(".//layer[@type='2']")
     assert [l.attrib["top_z"] for l in layers] == ["0.3200", "0.4000", "0.4800"]
 
 
@@ -723,3 +724,31 @@ def test_nullable_options_come_from_orcas_print_config(tmp_path):
         'def = this->add("long_retractions_when_cut", coBools);\n    def->nullable = true;\n'
     )
     assert OP.extract_nullable_options(str(cpp)) == ["filament_wipe", "filament_z_hop", "long_retractions_when_cut"]
+
+
+
+def test_hand_swaps_are_pause_entries_at_every_swap(acme):
+    """OrcaSlicer skips the change-filament G-code on the first tool change
+    of a print when filament changes are manual; on Bambu printers that was
+    the first real colour change, printed without stopping. A pause entry
+    (machine_pause_gcode) at each swap stops every time."""
+    for manual in (True, False):
+        buf = io.BytesIO()
+        E.export_3mf(buf, _stl_bytes(), _plan(), "Acme One 0.4 nozzle", 0.08, 0.24, manual_swaps=manual)
+        root = ET.fromstring(zipfile.ZipFile(io.BytesIO(buf.getvalue())).read("Metadata/custom_gcode_per_layer.xml"))
+        tools = [l.attrib["top_z"] for l in root.findall(".//layer[@type='2']")]
+        pauses = [l.attrib["top_z"] for l in root.findall(".//layer[@type='1']")]
+        assert tools == ["0.3200", "0.4000", "0.4800"]
+        assert pauses == (tools if manual else [])
+
+
+@pytest.mark.parametrize("layer, base, min_expected, max_expected", [
+    (0.04, 0.24, ["0.04"], ["0.28"]),   # thinner than the printer's minimum
+    (0.32, 0.32, ["0.07"], ["0.32"]),   # thicker than its maximum
+    (0.12, 0.24, ["0.07"], ["0.28"]),   # within limits: untouched
+])
+def test_layer_limits_follow_autoforges_layer_height(acme, layer, base, min_expected, max_expected):
+    printer = OP.find_printer("Acme One 0.4 nozzle")
+    cfg = E.project_settings(printer, _slots("PLA", "PLA"), layer, base, False, acme)
+    assert cfg["layer_height"] == f"{layer:g}" and cfg["initial_layer_print_height"] == f"{base:g}"
+    assert cfg["min_layer_height"] == min_expected and cfg["max_layer_height"] == max_expected
