@@ -23,6 +23,8 @@ const selectClass =
 interface PrinterList {
   orca_version: string
   printers: SlicerPrinter[]
+  /** What the AutoForge print settings change, in words. */
+  autoforge_settings?: string[]
 }
 
 let printerListCache: Promise<PrinterList> | null = null
@@ -48,15 +50,17 @@ interface Props {
   /** The printer remembered in the project settings, and its swap choice. */
   rememberedPrinter?: string
   rememberedManualSwaps?: boolean | null
+  /** Whether the AutoForge print settings were on last time (default on). */
+  rememberedAutoforgeSettings?: boolean
   /** The nozzle (mm) from the settings: presets for it are offered first,
    * and a printer without one gets a warning. */
   nozzle?: number
-  onConfirm: (printer: string, manualSwaps: boolean) => void
+  onConfirm: (printer: string, manualSwaps: boolean, autoforgeSettings: boolean) => void
 }
 
 /** The printer picker for slicer projects (OrcaSlicer's printer presets)
  * plus how colour changes happen on it. */
-export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, rememberedPrinter, rememberedManualSwaps, nozzle, onConfirm }) => {
+export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, rememberedPrinter, rememberedManualSwaps, rememberedAutoforgeSettings, nozzle, onConfirm }) => {
   const [list, setList] = useState<PrinterList | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
@@ -66,6 +70,8 @@ export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, reme
   const [browsing, setBrowsing] = useState(true)
   const [showBrands, setShowBrands] = useState(false)
   const [manual, setManual] = useState(true)
+  const [printSettings, setPrintSettings] = useState(true)
+  const [showPrintSettingsList, setShowPrintSettingsList] = useState(false)
   const searchRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
@@ -81,6 +87,8 @@ export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, reme
         // A known printer starts collapsed to its card; otherwise straight to search.
         setBrowsing(!start)
         setShowBrands(false)
+        setPrintSettings(rememberedAutoforgeSettings !== false)
+        setShowPrintSettingsList(false)
         setQuery('')
         setHighlight(0)
       })
@@ -90,7 +98,7 @@ export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, reme
     return () => {
       cancelled = true
     }
-  }, [open, rememberedPrinter, reload])
+  }, [open, rememberedPrinter, rememberedAutoforgeSettings, reload])
 
   // Focus the search as it appears (also after "Change", whose button just
   // vanished). Done at mount: a later focus() lost the race against the
@@ -328,6 +336,43 @@ export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, reme
             </fieldset>
           )}
 
+          {list && selected && (
+            <div className="rounded-lg border border-gray-700 px-3 py-2" data-testid="slicer-print-settings">
+              <label className="flex items-start gap-2 text-xs text-gray-100 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={printSettings}
+                  onChange={(e) => setPrintSettings(e.target.checked)}
+                  className="mt-0.5"
+                  data-testid="slicer-print-settings-toggle"
+                />
+                <span className="flex-1">
+                  <span className="font-medium">AutoForge print settings</span> <span className="text-[10px] text-cyan-300">recommended</span>
+                  <span className="block text-[11px] text-gray-400 leading-snug">
+                    Settings tuned for colour-layer prints, for more reliable results. Off: the printer's own print profile.
+                  </span>
+                </span>
+              </label>
+              {(list.autoforge_settings?.length ?? 0) > 0 && (
+                <>
+                  <button
+                    onClick={() => setShowPrintSettingsList((v) => !v)}
+                    className="mt-1 ml-5 flex items-center gap-1 text-[11px] text-gray-400 hover:text-gray-200"
+                    aria-expanded={showPrintSettingsList}
+                    data-testid="slicer-print-settings-details"
+                  >
+                    {showPrintSettingsList ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />} What changes
+                  </button>
+                  {showPrintSettingsList && (
+                    <ul className="mt-1 ml-5 list-disc pl-4 text-[11px] leading-snug text-gray-400 space-y-0.5" data-testid="slicer-print-settings-list">
+                      {list.autoforge_settings!.map((line) => <li key={line}>{line}</li>)}
+                    </ul>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
           {list && (
             <p className="text-[11px] leading-snug text-gray-500">
               Uses OrcaSlicer {list.orca_version}'s own printer, print and filament settings, with your layer heights and 100 % infill.
@@ -341,7 +386,7 @@ export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, reme
             Cancel
           </button>
           <button
-            onClick={() => selected && onConfirm(selected.name, manual)}
+            onClick={() => selected && onConfirm(selected.name, manual, printSettings)}
             disabled={!selected}
             className="px-3 py-1.5 text-xs rounded text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed"
             data-testid="slicer-export"

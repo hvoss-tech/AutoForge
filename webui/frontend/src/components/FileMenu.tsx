@@ -41,7 +41,7 @@ export const FileMenu: React.FC = () => {
   const [slicerDialogOpen, setSlicerDialogOpen] = useState(false)
   const [slicerExport, setSlicerExport] = useState<ExportState | null>(null)
   const slicerAbort = useRef<AbortController | null>(null)
-  const lastSlicerExport = useRef<{ printer: string; manualSwaps: boolean | null } | null>(null)
+  const lastSlicerExport = useRef<{ printer: string; manualSwaps: boolean | null; printSettings: boolean } | null>(null)
   const exporting3mf = slicerExport?.status === 'running'
   const runInputsByJob = useAppStore((s) => s.runInputsByJob)
   const setSettings = useAppStore((s) => s.setSettings)
@@ -163,12 +163,17 @@ export const FileMenu: React.FC = () => {
   // base the pipeline resolved. It runs in the background with a progress
   // card; the printer is remembered in the project, so the next export (and
   // the .zip) use it without asking again.
-  const exportSlicerProject = async (printer: string, manualSwaps: boolean | null) => {
+  const exportSlicerProject = async (printer: string, manualSwaps: boolean | null, printSettings: boolean) => {
     if (!jobId || exporting3mf) return
-    lastSlicerExport.current = { printer, manualSwaps }
+    lastSlicerExport.current = { printer, manualSwaps, printSettings }
     const state = useAppStore.getState()
-    if (manualSwaps !== null && (state.settings.orca_printer !== printer || state.settings.orca_manual_swaps !== manualSwaps)) {
-      setSettings({ ...state.settings, orca_printer: printer, orca_manual_swaps: manualSwaps })
+    if (
+      manualSwaps !== null &&
+      (state.settings.orca_printer !== printer ||
+        state.settings.orca_manual_swaps !== manualSwaps ||
+        (state.settings.orca_autoforge_settings !== false) !== printSettings)
+    ) {
+      setSettings({ ...state.settings, orca_printer: printer, orca_manual_swaps: manualSwaps, orca_autoforge_settings: printSettings })
     }
     const title = `Slicer project · ${shortPrinterName(printer)}`
     const abort = new AbortController()
@@ -185,6 +190,7 @@ export const FileMenu: React.FC = () => {
           base: current.resolvedBase,
           printer,
           manual_swaps: manualSwaps,
+          autoforge_settings: printSettings,
         },
         (p) => setSlicerExport({ status: 'running', title, fraction: p.fraction, stage: p.stage }),
         abort.signal,
@@ -212,7 +218,7 @@ export const FileMenu: React.FC = () => {
   // One click when a printer is known; otherwise ask for it first.
   const handleSlicerProject = () => {
     setOpen(false)
-    if (settings.orca_printer) exportSlicerProject(settings.orca_printer, settings.orca_manual_swaps ?? null)
+    if (settings.orca_printer) exportSlicerProject(settings.orca_printer, settings.orca_manual_swaps ?? null, settings.orca_autoforge_settings !== false)
     else setSlicerDialogOpen(true)
   }
 
@@ -386,10 +392,11 @@ export const FileMenu: React.FC = () => {
         onClose={() => setSlicerDialogOpen(false)}
         rememberedPrinter={settings.orca_printer}
         rememberedManualSwaps={settings.orca_manual_swaps}
+        rememberedAutoforgeSettings={settings.orca_autoforge_settings}
         nozzle={resultNozzle}
-        onConfirm={(printer, manualSwaps) => {
+        onConfirm={(printer, manualSwaps, printSettings) => {
           setSlicerDialogOpen(false)
-          exportSlicerProject(printer, manualSwaps)
+          exportSlicerProject(printer, manualSwaps, printSettings)
         }}
       />
       <ExportProgressCard
@@ -397,7 +404,7 @@ export const FileMenu: React.FC = () => {
         onCancel={() => slicerAbort.current?.abort()}
         onRetry={() => {
           const last = lastSlicerExport.current
-          if (last) exportSlicerProject(last.printer, last.manualSwaps)
+          if (last) exportSlicerProject(last.printer, last.manualSwaps, last.printSettings)
         }}
         onDismiss={dismissSlicerExport}
         onChangePrinter={() => {

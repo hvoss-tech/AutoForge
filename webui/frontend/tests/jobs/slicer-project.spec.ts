@@ -55,6 +55,10 @@ test('the first slicer project asks for the printer, the next is one click', asy
   // Enter takes the usual 0.4 mm nozzle, not the first preset in the list (0.2)
   await expect(byTestId(page, 'slicer-selected-printer')).toContainText('0.4 mm nozzle')
   await expect(byTestId(page, 'slicer-swaps-auto')).toHaveAttribute('aria-checked', 'true')
+  // AutoForge print settings: on by default, and it says what they change.
+  await expect(byTestId(page, 'slicer-print-settings-toggle')).toBeChecked()
+  await byTestId(page, 'slicer-print-settings-details').click()
+  await expect(byTestId(page, 'slicer-print-settings-list')).toContainText('1 wall')
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/2-chosen.png` })
 
   if (SHOTS) {
@@ -90,6 +94,16 @@ test('the first slicer project asks for the printer, the next is one click', asy
   await byTestId(page, 'file-menu-btn').click()
   await byTestId(page, 'download-3mf-change-printer').click()
   await expect(byTestId(page, 'slicer-selected-printer')).toContainText('Bambu Lab X1 Carbon')
+  // Turning the AutoForge print settings off is remembered for the next export.
+  await expect(byTestId(page, 'slicer-print-settings-toggle')).toBeChecked()
+  await byTestId(page, 'slicer-print-settings-toggle').uncheck()
+  const third = page.waitForEvent('download')
+  await byTestId(page, 'slicer-export').click()
+  await third
+  await byTestId(page, 'file-menu-btn').click()
+  await byTestId(page, 'download-3mf-change-printer').click()
+  await expect(byTestId(page, 'slicer-print-settings-toggle')).not.toBeChecked()
+  await byTestId(page, 'slicer-print-settings-toggle').check()
   // Change, look around, keep the old one after all.
   await byTestId(page, 'slicer-change-printer').click()
   await page.keyboard.type('neptune 4')

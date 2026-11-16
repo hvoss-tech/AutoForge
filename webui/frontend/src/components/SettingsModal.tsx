@@ -118,6 +118,7 @@ export const SettingsModal: React.FC = () => {
         input_image: current.input_image,
         orca_printer: current.orca_printer,
         orca_manual_swaps: current.orca_manual_swaps,
+        orca_autoforge_settings: current.orca_autoforge_settings,
       })
     }
   }
@@ -365,6 +366,7 @@ export const SettingsModal: React.FC = () => {
                         : settings.orca_manual_swaps
                           ? 'Colour changes: the print pauses, you swap by hand'
                           : 'Colour changes: the printer swaps filament itself'}
+                      {settings.orca_autoforge_settings === false ? ' · printer\'s own print profile' : ' · AutoForge print settings'}
                     </div>
                   </>
                 ) : (
@@ -399,10 +401,16 @@ export const SettingsModal: React.FC = () => {
               onClose={() => setPrinterDialogOpen(false)}
               rememberedPrinter={settings.orca_printer}
               rememberedManualSwaps={settings.orca_manual_swaps}
+              rememberedAutoforgeSettings={settings.orca_autoforge_settings}
               nozzle={settings.nozzle_diameter}
-              onConfirm={(printer, manualSwaps) => {
+              onConfirm={(printer, manualSwaps, printSettings) => {
                 setPrinterDialogOpen(false)
-                setSettings({ ...useAppStore.getState().settings, orca_printer: printer, orca_manual_swaps: manualSwaps })
+                setSettings({
+                  ...useAppStore.getState().settings,
+                  orca_printer: printer,
+                  orca_manual_swaps: manualSwaps,
+                  orca_autoforge_settings: printSettings,
+                })
               }}
             />
           </section>

@@ -91,6 +91,8 @@ export interface OptimizationSettings {
    * (null: decided by the printer). Not optimizer inputs. */
   orca_printer?: string
   orca_manual_swaps?: boolean | null
+  /** Use AutoForge print settings in the slicer project (on unless turned off). */
+  orca_autoforge_settings?: boolean
   visualize: boolean
 }
 

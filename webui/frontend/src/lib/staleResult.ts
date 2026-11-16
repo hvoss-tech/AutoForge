@@ -25,6 +25,7 @@ const IGNORED = new Set([
   // The printer of File › Slicer project; it doesn't change the result.
   'orca_printer',
   'orca_manual_swaps',
+  'orca_autoforge_settings',
 ])
 
 /** Settings keys that changed since the run, plus 'active_filaments' when
