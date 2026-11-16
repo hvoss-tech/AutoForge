@@ -644,6 +644,22 @@ def build_parser() -> configargparse.ArgParser:
     )
 
     parser.add_argument(
+        "--orca_printer",
+        type=str,
+        default="",
+        help="Also write final_model.3mf, an OrcaSlicer / Bambu Studio project for this printer "
+        "(an OrcaSlicer printer preset name, e.g. 'Bambu Lab X1 Carbon 0.4 nozzle') with every swap "
+        "as a filament change. The printer's profile is downloaded from OrcaSlicer's GitHub once.",
+    )
+    parser.add_argument(
+        "--orca_manual_swaps",
+        choices=["auto", "yes", "no"],
+        default="auto",
+        help="In the slicer project, pause for a hand swap at each change (yes) or let the printer "
+        "change filament (no: AMS, MMU, tool changer). auto picks by printer.",
+    )
+
+    parser.add_argument(
         "--cap_layers",
         type=int,
         default=0,
@@ -1296,6 +1312,43 @@ def best_heights_at_output_res(
     return out
 
 
+def _export_slicer_project(args, disc_global, disc_height_image, material_colors_np, material_names, base_material):
+    """``final_model.3mf``: an OrcaSlicer / Bambu Studio project for
+    ``--orca_printer`` with the swaps as filament changes. A failure (no
+    internet for the printer's profile, a model too big for its bed) is
+    reported and leaves the other outputs alone."""
+    from autoforge.Helper.Export3MF import export_3mf, swap_plan
+    from autoforge.Helper.OrcaProfiles import ProfileError
+
+    types = []
+    try:
+        types = [str(rec.get("Type") or "PLA") for rec in load_materials_data(args)]
+    except Exception:
+        pass
+    materials = [
+        {
+            "color": "#" + "".join(f"{int(round(float(c) * 255)):02X}" for c in material_colors_np[i][:3]),
+            "name": str(material_names[i]) if i < len(material_names) else f"Filament {i + 1}",
+            "filament_type": types[i] if i < len(types) and types[i] != "nan" else "PLA",
+        }
+        for i in range(len(material_colors_np))
+    ]
+    plan = swap_plan(
+        disc_global, int(np.max(disc_height_image)), args.layer_height, args.background_height,
+        materials, base_material, args.background_color,
+    )
+    manual = {"auto": None, "yes": True, "no": False}[args.orca_manual_swaps]
+    out = os.path.join(args.output_folder, "final_model.3mf")
+    try:
+        export_3mf(
+            out, os.path.join(args.output_folder, "final_model.stl"), plan, args.orca_printer,
+            args.layer_height, args.background_height, manual, title="AutoForge",
+        )
+        print(f"Slicer project for {args.orca_printer}: {out}")
+    except (ProfileError, ValueError) as e:
+        print(f"Could not write the slicer project: {e}")
+
+
 def _post_optimize_and_export(
     args,
     optimizer: FilamentOptimizer,
@@ -1545,57 +1598,15 @@ def _post_optimize_and_export(
                     args.csv_file,
                 )
 
-                from autoforge.helpers.export_3mf import export_solution_3mf
-
-                cli_materials = []
-                if getattr(args, "csv_file", "") or getattr(args, "json_file", ""):
-                    try:
-                        from autoforge.Helper.FilamentHelper import load_materials_data
-
-                        for i, rec in enumerate(load_materials_data(args)):
-                            brand = rec.get("Brand")
-                            ftype = rec.get("Type")
-                            uid = rec.get("Uuid") or rec.get("uuid")
-                            cli_materials.append({
-                                "uuid": str(uid) if uid and str(uid) != "nan" else f"mat_{i}",
-                                "color": rec.get("Color") or (
-                                    "#" + "".join(f"{int(round(float(c) * 255)):02X}" for c in material_colors_np[i][:3])
-                                    if i < len(material_colors_np) else "#808080"
-                                ),
-                                "td": float(material_TDs_np[i]) if i < len(material_TDs_np) else 5.0,
-                                "brand": "" if brand is None or (isinstance(brand, float) and np.isnan(brand)) else str(brand),
-                                "name": material_names[i] if i < len(material_names) else str(rec.get("Name") or ""),
-                                "filament_type": "PLA" if ftype is None or (isinstance(ftype, float) and np.isnan(ftype)) else str(ftype),
-                            })
-                    except Exception:
-                        cli_materials = []
-                if not cli_materials:
-                    cli_materials = [
-                        {
-                            "uuid": f"mat_{i}",
-                            "color": "#" + "".join(
-                                f"{int(round(float(c) * 255)):02X}" for c in material_colors_np[i][:3]
-                            ),
-                            "td": float(material_TDs_np[i]) if i < len(material_TDs_np) else 5.0,
-                            "brand": "",
-                            "name": material_names[i] if i < len(material_names) else f"Filament {i + 1}",
-                            "filament_type": "PLA",
-                        }
-                        for i in range(len(material_colors_np))
-                    ]
-
-                export_solution_3mf(
-                    os.path.join(args.output_folder, "final_model.stl"),
-                    os.path.join(args.output_folder, "final_model_bambu.3mf"),
-                    disc_global.cpu().numpy(),
-                    disc_height_image.cpu().numpy(),
-                    args.layer_height,
-                    args.background_height,
-                    getattr(args, "background_color", "#000000"),
-                    cli_materials,
-                    background_material_index=getattr(args, "background_material_index", None),
-                    swap_instructions_text="\n".join(swap_instructions),
-                )
+                if getattr(args, "orca_printer", ""):
+                    _export_slicer_project(
+                        args,
+                        disc_global.cpu().numpy(),
+                        disc_height_image.cpu().numpy(),
+                        material_colors_np,
+                        material_names,
+                        optimizer.base_material,
+                    )
 
             print("All done. Outputs in:", args.output_folder)
             print("Happy Printing!")

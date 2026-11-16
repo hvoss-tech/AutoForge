@@ -1,0 +1,641 @@
+"""Export a heightmap print as an OrcaSlicer / Bambu Studio project (.3mf).
+
+The project carries the model, one filament per colour, a filament change at
+every swap height, and the complete configuration of the printer the user
+picked (see OrcaProfiles), so it opens sliced-and-ready for that printer.
+
+Swaps are written as tool changes between filaments. Printers with an AMS,
+MMU or tool changer do them on their own. For every other printer the export
+turns on Orca's "manual filament change", which replaces each tool change with
+the printer's pause G-code: the print stops and the user swaps the spool.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import math
+import struct
+import uuid as _uuid
+import zipfile
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Sequence
+
+import numpy as np
+
+from autoforge.Helper.OrcaProfiles import OrcaProfiles, ProfileError, as_list, find_printer
+
+# Matches what OrcaSlicer 2.5.0 writes into its own projects.
+ORCA_VERSION = "2.5.0"
+BBS_VERSION = "02.08.01.55"
+
+# Process settings every heightmap print needs, whatever the printer.
+PROCESS_OVERRIDES = {
+    # Light has to pass through solid plastic for the colours to mix.
+    "sparse_infill_density": "100%",
+    "sparse_infill_pattern": "zig-zag",  # Orca's name for rectilinear
+    # Purging happens in the nozzle / poop chute; a tower would stand next to the picture.
+    "enable_prime_tower": "0",
+    "enable_support": "0",
+    # A brim would have to be cut off the picture; ironing smears the thin colour layers.
+    "brim_type": "no_brim",
+    "ironing_type": "no ironing",
+}
+# Keys copied from the printer that are not per-filament settings even though
+# they name filaments.
+_DROP_KEYS = frozenset({
+    "compatible_printers", "compatible_printers_condition", "compatible_prints",
+    "compatible_prints_condition", "filament_id", "inherits", "print_settings_id",
+    "printer_settings_id", "filament_settings_id",
+})
+
+# Per-extruder-variant options (OrcaSlicer 2.5 PrintConfig.cpp, *_options_with_variant).
+# A preset holds one value per variant of its kind; Orca pads shorter vectors by
+# repeating the first value (extend_default_config_length) and so does this export.
+_PRINT_VARIANT_KEYS = frozenset("""
+initial_layer_speed initial_layer_infill_speed outer_wall_speed inner_wall_speed small_perimeter_speed
+small_perimeter_threshold sparse_infill_speed internal_solid_infill_speed top_surface_speed
+enable_overhang_speed overhang_1_4_speed overhang_2_4_speed overhang_3_4_speed overhang_4_4_speed
+slowdown_for_curled_perimeters bridge_speed internal_bridge_speed gap_infill_speed support_speed
+support_interface_speed travel_speed travel_speed_z initial_layer_travel_speed default_acceleration
+bridge_acceleration travel_acceleration initial_layer_travel_acceleration initial_layer_acceleration
+outer_wall_acceleration inner_wall_acceleration sparse_infill_acceleration
+internal_solid_infill_acceleration top_surface_acceleration default_jerk outer_wall_jerk inner_wall_jerk
+infill_jerk top_surface_jerk initial_layer_jerk travel_jerk initial_layer_travel_jerk
+default_junction_deviation print_extruder_id print_extruder_variant top_solid_infill_flow_ratio
+""".split())
+_FILAMENT_VARIANT_KEYS = frozenset("""
+filament_flow_ratio filament_max_volumetric_speed filament_ramming_volumetric_speed
+filament_pre_cooling_temperature filament_ramming_travel_time filament_ramming_volumetric_speed_nc
+filament_pre_cooling_temperature_nc filament_ramming_travel_time_nc filament_retract_length_nc
+filament_preheat_temperature_delta filament_extruder_id filament_extruder_variant
+filament_retraction_length filament_z_hop filament_z_hop_types filament_retract_lift_above
+filament_retract_lift_below filament_retract_lift_enforce filament_retract_restart_extra
+filament_retract_length_toolchange filament_retract_restart_extra_toolchange filament_retraction_speed
+filament_deretraction_speed filament_retraction_minimum_travel filament_retract_when_changing_layer
+filament_wipe filament_wipe_distance filament_retract_before_wipe filament_retract_after_wipe
+filament_long_retractions_when_cut filament_retraction_distances_when_cut long_retractions_when_ec
+retraction_distances_when_ec nozzle_temperature_initial_layer nozzle_temperature
+filament_flush_volumetric_speed filament_flush_temp filament_cooling_before_tower
+volumetric_speed_coefficients filament_adaptive_volumetric_speed filament_ironing_flow
+filament_ironing_spacing filament_ironing_inset filament_ironing_speed enable_pressure_advance
+pressure_advance adaptive_pressure_advance adaptive_pressure_advance_model
+adaptive_pressure_advance_overhangs adaptive_pressure_advance_bridges fan_min_speed fan_max_speed
+additional_cooling_fan_speed filament_minimal_purge_on_wipe_tower filament_multitool_ramming
+filament_multitool_ramming_volume filament_multitool_ramming_flow nozzle_temperature_range_low
+nozzle_temperature_range_high activate_air_filtration activate_air_filtration_during_print
+activate_air_filtration_on_completion during_print_exhaust_fan_speed complete_print_exhaust_fan_speed
+""".split())
+_PRINTER_VARIANT_KEYS = frozenset("""
+nozzle_volume retraction_length z_hop travel_slope retract_lift_above retract_lift_below
+retract_lift_enforce z_hop_types retraction_speed deretraction_speed retraction_minimum_travel
+retract_when_changing_layer wipe wipe_distance retract_before_wipe retract_after_wipe
+retract_length_toolchange retract_restart_extra retract_restart_extra_toolchange
+long_retractions_when_cut retraction_distances_when_cut nozzle_type printer_extruder_id
+printer_extruder_variant hotend_cooling_rate hotend_heating_rate nozzle_flush_dataset
+""".split())
+# Machine limits hold two values (normal, silent) per variant.
+_PRINTER_VARIANT_KEYS_2 = frozenset("""
+machine_max_acceleration_x machine_max_acceleration_y machine_max_acceleration_z
+machine_max_acceleration_e machine_max_acceleration_extruding machine_max_acceleration_retracting
+machine_max_acceleration_travel machine_max_speed_x machine_max_speed_y machine_max_speed_z
+machine_max_speed_e machine_max_jerk_x machine_max_jerk_y machine_max_jerk_z machine_max_jerk_e
+machine_max_junction_deviation
+""".split())
+
+
+def _resize(value: Any, length: int) -> Any:
+    """``value`` as a vector of ``length``: padded with its first value, or cut."""
+    values = value if isinstance(value, list) else [value]
+    if not values or length < 1:
+        return values
+    return (values + [values[0]] * length)[:length]
+
+
+def pad_variants(config: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Size a resolved preset's per-variant vectors the way Orca does on load."""
+    out = dict(config)
+    if kind == "filament":
+        n = len(_vector(out.get("filament_extruder_variant", [None])))
+        groups = [(_FILAMENT_VARIANT_KEYS, n)]
+    elif kind == "process":
+        n = len(_vector(out.get("print_extruder_variant", [None])))
+        groups = [(_PRINT_VARIANT_KEYS, n)]
+    else:
+        n = len(_vector(out["printer_extruder_variant"])) if "printer_extruder_variant" in out else len(
+            as_list(out.get("nozzle_diameter")) or [None])
+        groups = [(_PRINTER_VARIANT_KEYS, n), (_PRINTER_VARIANT_KEYS_2, 2 * n)]
+    for keys, length in groups:
+        for key in keys & out.keys():
+            out[key] = _resize(out[key], length)
+    return out
+
+
+# Vendors and model words for printers that change filament on their own.
+_AUTO_SWAP_VENDORS = {"BBL"}
+_AUTO_SWAP_WORDS = ("MMU", "AMS", "CFS", "Toolchanger", "Tool Changer", "IDEX", "Snapmaker U1", "INDX")
+
+
+def printer_changes_filament(printer: dict[str, Any]) -> bool:
+    """Whether a printer swaps filament without help (AMS, MMU, tool changer)."""
+    if printer.get("vendor") in _AUTO_SWAP_VENDORS:
+        return True
+    # Tool changers; two-extruder IDEX/dual printers still swap by hand when a
+    # print has more colours than tools.
+    if int(printer.get("extruders") or 1) >= 4:
+        return True
+    name = f"{printer.get('model', '')} {printer.get('name', '')}".lower()
+    return any(word.lower() in name for word in _AUTO_SWAP_WORDS)
+
+
+# ------------------------------------------------------------------ swap plan
+
+@dataclass
+class Slot:
+    """One filament of the project."""
+    color: str
+    name: str = ""
+    filament_type: str = "PLA"
+
+
+@dataclass
+class SwapPlan:
+    """Filament 1 prints the base; each swap switches to a slot at a height.
+
+    ``swaps`` holds ``(top_z, slot index)``: the first layer whose top is at
+    ``top_z`` prints with that slot."""
+    slots: list[Slot]
+    swaps: list[tuple[float, int]] = field(default_factory=list)
+
+
+def _hex(color: Any, fallback: str = "#808080") -> str:
+    text = str(color or "").strip()
+    if not text:
+        return fallback
+    if not text.startswith("#"):
+        text = "#" + text
+    if len(text) == 4:
+        text = "#" + "".join(c * 2 for c in text[1:])
+    try:
+        int(text[1:7], 16)
+    except ValueError:
+        return fallback
+    return text[:7].upper()
+
+
+def _slot(material: dict[str, Any]) -> Slot:
+    name = str(material.get("name") or "")
+    brand = str(material.get("brand") or "")
+    if brand and name and not name.lower().startswith(brand.lower()):
+        name = f"{brand} - {name}"
+    return Slot(
+        color=_hex(material.get("color")),
+        name=name,
+        filament_type=str(material.get("filament_type") or material.get("filamentType") or "PLA"),
+    )
+
+
+def swap_plan(
+    stack: Sequence[int],
+    max_layer: int,
+    layer_height: float,
+    background_height: float,
+    materials: Sequence[dict[str, Any]],
+    background_material_index: int | None,
+    background_color: str = "#000000",
+) -> SwapPlan:
+    """The swaps of ``generate_swap_instructions``, as filament slots.
+
+    Layer #1 is the base (``background_height`` thick); ``stack[i]`` is the
+    material of layer #``i + 2``, whose top is at
+    ``background_height + (i + 1) * layer_height``."""
+    stack = [int(m) for m in np.asarray(stack).reshape(-1)]
+    max_layer = min(int(max_layer), len(stack))
+    if background_material_index is not None and 0 <= int(background_material_index) < len(materials):
+        base_index = int(background_material_index)
+        slots = [_slot(materials[base_index])]
+        slot_of = {base_index: 0}
+    else:
+        base_index = None
+        slots = [Slot(color=_hex(background_color, "#000000"), name="Background")]
+        slot_of = {}
+    plan = SwapPlan(slots=slots)
+    current = 0
+    for i in range(max_layer):
+        material = stack[i]
+        if i == 0 and base_index is not None and material == base_index:
+            continue
+        if i > 0 and material == stack[i - 1]:
+            continue
+        if material not in slot_of:
+            if not 0 <= material < len(materials):
+                raise ValueError(f"Layer {i + 2} uses material {material}, but there are only {len(materials)}")
+            slot_of[material] = len(plan.slots)
+            plan.slots.append(_slot(materials[material]))
+        slot = slot_of[material]
+        if slot != current:
+            top_z = round(float(background_height) + (i + 1) * float(layer_height), 6)
+            plan.swaps.append((top_z, slot))
+            current = slot
+    return plan
+
+
+# ----------------------------------------------------------------------- mesh
+
+_STL_RECORD = np.dtype([("normal", "<f4", 3), ("v", "<f4", (3, 3)), ("attr", "<u2")])
+
+
+def read_stl(src: str | bytes | bytearray) -> tuple[np.ndarray, np.ndarray]:
+    """``(vertices (V, 3) float32, triangles (T, 3) int)`` of an STL file or
+    its bytes, with shared vertices merged (3MF meshes are indexed)."""
+    if isinstance(src, (bytes, bytearray)):
+        data = bytes(src)
+    else:
+        with open(src, "rb") as f:
+            data = f.read()
+    if len(data) >= 84:
+        count = struct.unpack("<I", data[80:84])[0]
+        if len(data) == 84 + 50 * count:
+            corners = np.frombuffer(data, dtype=_STL_RECORD, count=count, offset=84)["v"].reshape(-1, 3)
+            return _index_mesh(corners)
+    if data.lstrip()[:5].lower() == b"solid":
+        import trimesh
+
+        mesh = trimesh.load(io.BytesIO(data), file_type="stl", process=False)
+        return _index_mesh(np.asarray(mesh.triangles, dtype=np.float32).reshape(-1, 3))
+    raise ValueError("Not a valid STL file")
+
+
+def _index_mesh(corners: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # + 0.0 turns -0.0 into 0.0, so both merge into one vertex.
+    corners = np.ascontiguousarray(corners, dtype=np.float32) + np.float32(0.0)
+    keys = corners.view(np.dtype((np.void, 12))).reshape(-1)
+    _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
+    vertices = corners[first]
+    triangles = inverse.reshape(-1, 3).astype(np.int64)
+    return vertices, triangles
+
+
+def _write_rows(out, fmt: str, rows: np.ndarray, chunk: int = 200_000) -> None:
+    for start in range(0, len(rows), chunk):
+        out.write("".join(fmt % tuple(r) for r in rows[start:start + chunk].tolist()).encode("ascii"))
+
+
+# ------------------------------------------------------------------- settings
+
+def _filament_preset(printer: dict[str, Any], filament_type: str) -> str:
+    choices = printer["filaments"]
+    wanted = str(filament_type or "PLA").upper().replace(" ", "-")
+    if wanted in choices:
+        return choices[wanted]
+    for known in sorted(choices, key=len, reverse=True):
+        if known in wanted:
+            return choices[known]
+    return choices["PLA"]
+
+
+def _vector(value: Any) -> list:
+    return list(value) if isinstance(value, list) else [value]
+
+
+def project_settings(
+    printer: dict[str, Any],
+    slots: Sequence[Slot],
+    layer_height: float,
+    background_height: float,
+    manual_swaps: bool,
+    profiles: OrcaProfiles,
+) -> dict[str, Any]:
+    """``Metadata/project_settings.config``: the printer's resolved machine,
+    process and filament presets, with the heightmap settings on top."""
+    vendor = printer["vendor"]
+    machine = pad_variants(profiles.resolve(vendor, "machine", printer["name"]), "machine")
+    process = pad_variants(profiles.resolve(vendor, "process", printer["process"]), "process")
+    preset_names = [_filament_preset(printer, s.filament_type) for s in slots]
+    filaments = [pad_variants(profiles.resolve(vendor, "filament", n), "filament") for n in preset_names]
+
+    config: dict[str, Any] = {}
+    config.update({k: v for k, v in machine.items() if k not in _DROP_KEYS})
+    config.update({k: v for k, v in process.items() if k not in _DROP_KEYS})
+
+    filament_keys: list[str] = []
+    for f in filaments:
+        filament_keys.extend(k for k in f if k not in _DROP_KEYS and k not in filament_keys)
+    for key in filament_keys:
+        values = []
+        for f in filaments:
+            value = f.get(key)
+            if value is None:  # take it from a filament that has it
+                value = next(g[key] for g in filaments if key in g)
+                if key in _FILAMENT_VARIANT_KEYS:
+                    value = _resize(value, len(_vector(f.get("filament_extruder_variant", [None]))))
+            values.extend(_vector(value))
+        config[key] = values
+    # Which filament each per-variant entry belongs to (Orca's full_config).
+    config["filament_self_index"] = [
+        str(i + 1) for i, f in enumerate(filaments) for _ in _vector(f.get("filament_extruder_variant", [None]))
+    ]
+
+    process_changes = dict(PROCESS_OVERRIDES)
+    process_changes["layer_height"] = f"{float(layer_height):g}"
+    process_changes["initial_layer_print_height"] = f"{float(background_height):g}"
+
+    printer_changes: dict[str, Any] = {}
+    min_heights = as_list(machine.get("min_layer_height"))
+    if min_heights and any(_float(h, 0.0) > float(layer_height) for h in min_heights):
+        printer_changes["min_layer_height"] = [f"{float(layer_height):g}"] * len(min_heights)
+    if manual_swaps:
+        pause = str(machine.get("machine_pause_gcode") or "").strip() or "M600"
+        printer_changes["manual_filament_change"] = "1"
+        printer_changes["change_filament_gcode"] = f"; AutoForge: swap the filament by hand\n{pause}\n"
+        printer_changes["single_extruder_multi_material"] = "1"
+    config.update(process_changes)
+    config.update(printer_changes)
+    # The prime tower is off, but OrcaSlicer still checks where it would
+    # stand: its default spot (15, 220) is off the bed of every printer less
+    # than 220 mm deep, and such a project refuses to slice.
+    bx0, by0 = printer["bed"][0], printer["bed"][1]
+    config["wipe_tower_x"] = [f"{bx0 + 5:g}"]
+    config["wipe_tower_y"] = [f"{by0 + 5:g}"]
+    config["flush_volumes_matrix"] = flush_matrix(config, [s.color for s in slots])
+    config["flush_volumes_vector"] = ["140"] * (2 * len(slots))
+
+    n = len(slots)
+    config.update({
+        "name": "project_settings",
+        "from": "project",
+        "version": BBS_VERSION,
+        "printer_settings_id": printer["name"],
+        "print_settings_id": printer["process"],
+        "filament_settings_id": preset_names,
+        "filament_colour": [s.color for s in slots],
+        "filament_multi_colour": [s.color for s in slots],
+        "filament_ids": [str(f.get("filament_id") or "") for f in filaments],
+        "print_compatible_printers": as_list(process.get("compatible_printers")),
+        "inherits_group": [""] * (n + 2),
+        # Which settings this project changes on top of the system presets
+        # (print, each filament, printer), so Orca shows them as edits.
+        "different_settings_to_system": [";".join(sorted(process_changes))] + [""] * n + [";".join(sorted(printer_changes))],
+    })
+    return config
+
+
+# ------------------------------------------------------------- flush volumes
+# OrcaSlicer's colour-based purge volumes (FlushVolCalc.cpp, the HSV formula
+# the GUI falls back on), so AMS / tool-changer prints purge as much as Orca
+# itself would plan. The matrix has to be there with one row and column per
+# filament: without it OrcaSlicer 2.5 aborts on multi-extruder printers (it
+# indexes the one-entry default). It is a single n x n block - one block per
+# nozzle made the same printers fail to slice, even with all-zero volumes.
+
+def _rgb2hsv(r: float, g: float, b: float) -> tuple[float, float, float]:
+    cmax, cmin = max(r, g, b), min(r, g, b)
+    delta = cmax - cmin
+    if abs(delta) < 0.001:
+        h = 0.0
+    elif cmax == r:
+        h = 60.0 * math.fmod((g - b) / delta, 6.0)
+    elif cmax == g:
+        h = 60.0 * ((b - r) / delta + 2)
+    else:
+        h = 60.0 * ((r - g) / delta + 4)
+    s = 0.0 if abs(cmax) < 0.001 else delta / cmax
+    return h, s, cmax
+
+
+def _luminance(r: float, g: float, b: float) -> float:
+    return r * 0.3 + g * 0.59 + b * 0.11
+
+
+def flush_volume_rgb(src: str, dst: str) -> int:
+    """Purge volume (mm³) from colour ``src`` to ``dst``, before the nozzle minimum."""
+    a = [int(src[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+    b = [int(dst[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+    h1, s1, v1 = _rgb2hsv(*a)
+    h2, s2, v2 = _rgb2hsv(*b)
+    dx = math.cos(math.radians(h1)) * s1 * v1 - math.cos(math.radians(h2)) * s2 * v2
+    dy = math.sin(math.radians(h1)) * s1 * v1 - math.sin(math.radians(h2)) * s2 * v2
+    hs_dist = min(1.2, math.hypot(dx, dy))
+    from_lumi, to_lumi = _luminance(*a), _luminance(*b)
+    if to_lumi >= from_lumi:
+        lumi_flush = (to_lumi - from_lumi) ** 0.7 * 560.0
+    else:
+        lumi_flush = (from_lumi - to_lumi) * 80.0
+        hs_dist = min(0.67 * v2 + 0.33 * v1, hs_dist)
+    hs_flush = 230.0 * hs_dist
+    volume = math.sqrt(hs_flush ** 2 + lumi_flush ** 2 - 2 * hs_flush * lumi_flush * math.cos(math.radians(120.0)))
+    return int(max(volume, 60.0))
+
+
+def _at(values: Any, index: int, default: Any = None) -> Any:
+    values = _vector(values) if values is not None else []
+    if not values:
+        return default
+    return values[index] if index < len(values) else values[-1]
+
+
+def _min_flush_volume(config: dict[str, Any], nozzle: int, filament: int) -> int:
+    """Orca's get_min_flush_volumes: the nozzle volume, less the filament a
+    long retraction on cut already pulls out."""
+    nozzle_volume = int(_float(_at(config.get("nozzle_volume"), nozzle, 0), 0.0))
+    level = int(_float(config.get("enable_long_retraction_when_cut"), 0.0))
+    machine_on = str(_at(config.get("long_retractions_when_cut"), nozzle, "0")) == "1"
+    retract = _float(_at(config.get("retraction_distances_when_cut"), nozzle, 18), 18.0) if level and machine_on else 0.0
+    filament_on = str(_at(config.get("filament_long_retractions_when_cut"), filament, "0"))
+    if filament_on == "0":
+        retract = 0.0
+    elif filament_on == "1" and level == 2:
+        own = _at(config.get("filament_retraction_distances_when_cut"), filament, "nil")
+        retract = float(int(_float(own, retract))) if own != "nil" else _float(
+            _at(config.get("retraction_distances_when_cut"), nozzle, 18), 18.0)
+    return int(nozzle_volume - math.pi * 1.75 * 1.75 / 4 * retract)
+
+
+def flush_matrix(config: dict[str, Any], colors: Sequence[str]) -> list[str]:
+    """``flush_volumes_matrix``: n x n purge volumes, row = from, column = to."""
+    n = len(colors)
+    out: list[str] = []
+    for i in range(n):
+        minimum = _min_flush_volume(config, 0, i)
+        for j in range(n):
+            volume = 0 if i == j else min(flush_volume_rgb(colors[i], colors[j]) + minimum, _MAX_FLUSH_VOLUME)
+            out.append(str(volume))
+    return out
+
+
+_MAX_FLUSH_VOLUME = 20000
+
+
+def _float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------- 3mf
+
+_CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+ <Default Extension="png" ContentType="image/png"/>
+ <Default Extension="json" ContentType="application/json"/>
+ <Default Extension="config" ContentType="text/plain"/>
+ <Default Extension="xml" ContentType="application/xml"/>
+</Types>"""
+
+_ROOT_RELS = """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>"""
+
+_MODEL_RELS = """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/Objects/object_1.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>"""
+
+_MODEL_NS = (
+    'unit="millimeter" xml:lang="en-US" '
+    'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+    'xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" '
+    'xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p"'
+)
+
+
+def _xml_attr(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace('"', "&quot;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _root_model(title: str, offset: Iterable[float]) -> str:
+    x, y, z = offset
+    uid = lambda: str(_uuid.uuid4())  # noqa: E731
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<model {_MODEL_NS}>
+ <metadata name="Application">BambuStudio-{BBS_VERSION}</metadata>
+ <metadata name="OrcaSlicer">{ORCA_VERSION}</metadata>
+ <metadata name="BambuStudio:3mfVersion">1</metadata>
+ <metadata name="Title">{_xml_attr(title)}</metadata>
+ <resources>
+  <object id="2" p:UUID="{uid()}" type="model">
+   <components>
+    <component p:path="/3D/Objects/object_1.model" objectid="1" p:UUID="{uid()}" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>
+   </components>
+  </object>
+ </resources>
+ <build p:UUID="{uid()}">
+  <item objectid="2" p:UUID="{uid()}" transform="1 0 0 0 1 0 0 0 1 {x:.4f} {y:.4f} {z:.4f}" printable="1"/>
+ </build>
+</model>"""
+
+
+def _model_settings(title: str) -> str:
+    name = _xml_attr(title)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <object id="2">
+    <metadata key="name" value="{name}"/>
+    <metadata key="extruder" value="1"/>
+    <part id="1" subtype="normal_part">
+      <metadata key="name" value="{name}"/>
+      <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+    </part>
+  </object>
+  <plate>
+    <metadata key="plater_id" value="1"/>
+    <metadata key="plater_name" value=""/>
+    <metadata key="locked" value="false"/>
+    <model_instance>
+      <metadata key="object_id" value="2"/>
+      <metadata key="instance_id" value="0"/>
+    </model_instance>
+  </plate>
+</config>"""
+
+
+def _custom_gcodes(plan: SwapPlan) -> str:
+    rows = "".join(
+        f'  <layer top_z="{z:.4f}" type="2" extruder="{slot + 1}" color="{plan.slots[slot].color}" '
+        f'extra="" gcode="tool_change"/>\n'
+        for z, slot in plan.swaps
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<custom_gcodes_per_layer>\n <plate>\n'
+        '  <plate_info id="1"/>\n' + rows + '  <mode value="MultiAsSingle"/>\n </plate>\n</custom_gcodes_per_layer>\n'
+    )
+
+
+def export_3mf(
+    out: str | io.IOBase,
+    stl: str | bytes,
+    plan: SwapPlan,
+    printer_name: str,
+    layer_height: float,
+    background_height: float,
+    manual_swaps: bool | None = None,
+    title: str = "AutoForge",
+    profiles: OrcaProfiles | None = None,
+) -> None:
+    """Write the project for ``printer_name`` (a name from the printer index).
+
+    ``manual_swaps``: pause for a hand swap at each change instead of a tool
+    change; ``None`` picks by printer (see ``printer_changes_filament``).
+    Raises ``ProfileError`` for an unknown printer or a profile that can't
+    be fetched, and ``ValueError`` for a model that doesn't fit the bed."""
+    printer = find_printer(printer_name)
+    if manual_swaps is None:
+        manual_swaps = not printer_changes_filament(printer)
+    profiles = profiles or OrcaProfiles()
+    vertices, triangles = read_stl(stl)
+    if len(triangles) == 0:
+        raise ValueError("The STL has no triangles")
+
+    lo, hi = vertices.min(axis=0).astype(np.float64), vertices.max(axis=0).astype(np.float64)
+    size = hi - lo
+    bx0, by0, bx1, by1 = printer["bed"]
+    if size[0] > bx1 - bx0 + 1e-6 or size[1] > by1 - by0 + 1e-6:
+        raise ValueError(
+            f"The model is {size[0]:.0f} x {size[1]:.0f} mm, but the {printer['model']} bed is only "
+            f"{bx1 - bx0:.0f} x {by1 - by0:.0f} mm"
+        )
+    height = float(printer.get("height") or 0)
+    if height and size[2] > height + 1e-6:
+        raise ValueError(f"The model is {size[2]:.1f} mm tall, but the {printer['model']} prints at most {height:.0f} mm")
+    # Centre on the bed, resting on it.
+    offset = ((bx0 + bx1) / 2 - (lo[0] + hi[0]) / 2, (by0 + by1) / 2 - (lo[1] + hi[1]) / 2, -lo[2])
+
+    settings = project_settings(printer, plan.slots, layer_height, background_height, manual_swaps, profiles)
+
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        zf.writestr("[Content_Types].xml", _CONTENT_TYPES)
+        zf.writestr("_rels/.rels", _ROOT_RELS)
+        zf.writestr("3D/3dmodel.model", _root_model(title, offset))
+        zf.writestr("3D/_rels/3dmodel.model.rels", _MODEL_RELS)
+        with zf.open("3D/Objects/object_1.model", "w", force_zip64=True) as f:
+            f.write((
+                f'<?xml version="1.0" encoding="UTF-8"?>\n<model {_MODEL_NS}>\n'
+                ' <metadata name="BambuStudio:3mfVersion">1</metadata>\n <resources>\n'
+                f'  <object id="1" p:UUID="{_uuid.uuid4()}" type="model">\n   <mesh>\n    <vertices>\n'
+            ).encode("ascii"))
+            _write_rows(f, '     <vertex x="%.9g" y="%.9g" z="%.9g"/>\n', vertices)
+            f.write(b"    </vertices>\n    <triangles>\n")
+            _write_rows(f, '     <triangle v1="%d" v2="%d" v3="%d"/>\n', triangles)
+            f.write(b"    </triangles>\n   </mesh>\n  </object>\n </resources>\n <build/>\n</model>\n")
+        zf.writestr("Metadata/model_settings.config", _model_settings(title))
+        zf.writestr("Metadata/project_settings.config", json.dumps(settings, indent=4, ensure_ascii=False))
+        zf.writestr("Metadata/custom_gcode_per_layer.xml", _custom_gcodes(plan))
+        zf.writestr(
+            "Metadata/slice_info.config",
+            '<?xml version="1.0" encoding="UTF-8"?>\n<config>\n  <header>\n'
+            '    <header_item key="X-BBL-Client-Type" value="slicer"/>\n'
+            f'    <header_item key="X-BBL-Client-Version" value="{BBS_VERSION}"/>\n'
+            f'    <header_item key="OrcaSlicer-Version" value="{ORCA_VERSION}"/>\n'
+            "  </header>\n</config>\n",
+        )
+
+
+__all__ = [
+    "ProfileError", "Slot", "SwapPlan", "export_3mf", "printer_changes_filament",
+    "project_settings", "read_stl", "swap_plan",
+]

@@ -19,7 +19,7 @@ from ..services.optimization_service import get_optimization_service
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-BAMBU_3MF_MEDIA_TYPE = "application/vnd.ms-package.3dmanufacturing-3dmodel+xml"
+MEDIA_TYPE_3MF = "application/vnd.ms-package.3dmanufacturing-3dmodel+xml"
 
 
 def _job_path(job_id: str, filename: str) -> str | None:
@@ -132,114 +132,50 @@ async def _stl_response(job_id: str, path: str, border: BorderSettings | None, f
     return FileResponse(bordered, filename=filename, background=BackgroundTask(os.remove, bordered))
 
 
-def _resolve_project_data(job_id: str, job_dir: str, project: dict[str, Any] | None) -> dict[str, Any]:
-    """Return ``project`` if provided, or reconstruct one from saved job metadata."""
-    if project is not None:
-        return project
+@router.get("/3mf/printers")
+async def list_3mf_printers():
+    """The printers a slicer project can be made for (OrcaSlicer's presets)."""
+    from autoforge.Helper.Export3MF import printer_changes_filament
+    from autoforge.Helper.OrcaProfiles import load_printer_index
 
-    from autoforge.helpers.export_3mf import build_project_dict_from_stack
-    from ..helpers.result_store import load_solution
-
-    solution = load_solution(job_dir)
-    if solution is not None:
-        meta = solution.get("meta") or {}
-        args_meta = meta.get("args") or {}
-        materials = meta.get("materials") or []
-        heights = solution["heights"]
-        max_layer = int(heights.max()) if heights.size else 0
-        base_idx = meta.get("background_material_index")
-        base_uuid = ""
-        if base_idx is not None and 0 <= int(base_idx) < len(materials):
-            base_uuid = str(materials[int(base_idx)].get("uuid") or f"mat_{int(base_idx)}")
-        return build_project_dict_from_stack(
-            solution["stack"],
-            max_layer,
-            args_meta.get("layer_height", 0.04),
-            args_meta.get("background_height", 0.24),
-            meta.get("background_color", "#000000"),
-            materials,
-            base_filament_uuid=base_uuid,
-        )
-
-    settings = get_optimization_service().get_settings(job_id)
+    index = await asyncio.to_thread(load_printer_index)
     return {
-        "settings": settings.model_dump() if settings is not None else {},
-        "colorSliders": [],
-        "activeFilaments": [],
+        "orca_version": index["orca_tag"],
+        "printers": [
+            {
+                "name": p["name"],
+                "vendor": p["vendor"],
+                "model": p["model"],
+                "nozzle": p["nozzle"],
+                "bed": p["bed"],
+                "auto_swaps": printer_changes_filament(p),
+            }
+            for p in index["printers"]
+        ],
     }
 
 
-def _read_optional_swap_instructions(swap_path: str | None) -> str | None:
-    if swap_path and os.path.exists(swap_path):
-        with open(swap_path, "r", encoding="utf-8") as f:
-            return f.read()
-    return None
-
-
-def _resolve_post_swap_instructions(
+def _write_3mf(
     job_id: str,
     job_dir: str,
-    project: dict[str, Any] | None,
-) -> str | None:
-    if os.path.exists(os.path.join(job_dir, EDITED_PNG)):
-        edit_dir = tempfile.mkdtemp(prefix="autoforge_3mf_edit_")
-        try:
-            replacements = _edited_replacements(job_id, job_dir, project, edit_dir)
-            return _read_optional_swap_instructions(replacements.get("swap_instructions.txt"))
-        finally:
-            shutil.rmtree(edit_dir, ignore_errors=True)
-    return _read_optional_swap_instructions(os.path.join(job_dir, "swap_instructions.txt"))
-
-
-async def _3mf_response(
     stl_path: str,
-    project_data: dict[str, Any],
-    filename: str,
-    swap_instructions_text: str | None = None,
-):
-    from autoforge.helpers.export_3mf import export_bambu_3mf
+    project: dict[str, Any] | None,
+    printer: str,
+    manual_swaps: bool | None,
+    title: str,
+    base: dict[str, Any] | None,
+    out_path: str,
+) -> None:
+    """Write the slicer project, turning its failures into HTTP errors."""
+    from autoforge.Helper.OrcaProfiles import ProfileDownloadError, ProfileError
+    from ..helpers.orca_export import ExportUnavailable, write_project_3mf
 
-    fd, out_path = tempfile.mkstemp(suffix=".3mf")
-    os.close(fd)
     try:
-        await asyncio.to_thread(
-            export_bambu_3mf,
-            stl_path,
-            project_data,
-            out_path,
-            swap_instructions_text=swap_instructions_text,
-        )
-    except Exception as exc:
-        if os.path.exists(out_path):
-            os.remove(out_path)
-        logger.warning("Failed to build Bambu .3mf for %s: %s", stl_path, exc)
-        status = 422 if isinstance(exc, ValueError) else 500
-        raise HTTPException(status, f"Could not generate Bambu .3mf: {exc}")
-    except BaseException:
-        if os.path.exists(out_path):
-            os.remove(out_path)
-        raise
-    return FileResponse(
-        out_path,
-        media_type=BAMBU_3MF_MEDIA_TYPE,
-        filename=filename,
-        background=BackgroundTask(os.remove, out_path),
-    )
-
-
-@router.get("/3mf/{job_id}")
-async def download_3mf(job_id: str):
-    path = _job_path(job_id, "final_model_bambu.3mf")
-    if path is not None and os.path.exists(path):
-        return FileResponse(path, media_type=BAMBU_3MF_MEDIA_TYPE, filename=f"{job_id}_bambu.3mf")
-    stl_path = _resolve_or_404(job_id, "final_model.stl", "STL not found")
-    job_dir = os.path.dirname(stl_path)
-    project_data = await asyncio.to_thread(_resolve_project_data, job_id, job_dir, None)
-    swap_text = await asyncio.to_thread(
-        _read_optional_swap_instructions,
-        os.path.join(job_dir, "swap_instructions.txt"),
-    )
-    return await _3mf_response(stl_path, project_data, f"{job_id}_bambu.3mf", swap_instructions_text=swap_text)
+        write_project_3mf(out_path, stl_path, job_dir, project, printer, manual_swaps, title, base)
+    except ProfileDownloadError as e:
+        raise HTTPException(503, str(e))
+    except (ProfileError, ExportUnavailable, ValueError) as e:
+        raise HTTPException(422, str(e))
 
 
 @router.get("/preview/{job_id}")
@@ -331,7 +267,7 @@ _EXPORT_FILES = [
     "swap_instructions.txt",
     "final_loss.txt",
     "project_file.hfp",
-    "final_model_bambu.3mf",
+    "final_model.3mf",
 ]
 
 
@@ -421,37 +357,43 @@ class ExportRequest(BaseModel):
     project: dict[str, Any] | None = None
     # Merged into the STL; defaults to the project settings' border.
     border: BorderSettings | None = None
+    # Slicer project (.3mf): the printer (a name from /3mf/printers), whether
+    # to pause for hand swaps (None: by printer), and the base the UI resolved.
+    printer: str | None = None
+    manual_swaps: bool | None = None
+    base: dict[str, Any] | None = None
 
 
 @router.post("/3mf/{job_id}")
-async def download_3mf_with_options(job_id: str, body: ExportRequest):
-    """Bambu Studio .3mf carrying current slider swaps and optional border."""
+async def download_3mf(job_id: str, body: ExportRequest):
+    """An OrcaSlicer / Bambu Studio project for ``body.printer`` with the
+    current colour layers as filament changes and the border in the model."""
+    if not body.printer:
+        raise HTTPException(422, "Pick a printer for the slicer project")
     stl_path = _resolve_or_404(job_id, "final_model.stl", "STL not found")
     border = body.border
     if border is None:
         saved = ((body.project or {}).get("settings") or {}).get("border")
         border = BorderSettings.model_validate(saved) if saved else None
     prefix = _export_prefix(body.name)
-    filename = f"{prefix}_model_bambu.3mf" if prefix else f"{job_id}_bambu.3mf"
-    bordered = await asyncio.to_thread(_bordered_copy, job_id, stl_path, border)
+    filename = f"{prefix}_model.3mf" if prefix else f"{job_id}.3mf"
+    fd, out_path = tempfile.mkstemp(suffix=".3mf")
+    os.close(fd)
+    bordered = None
     try:
-        effective_stl = bordered or stl_path
-        job_dir = os.path.dirname(stl_path)
-        project_data = await asyncio.to_thread(
-            _resolve_project_data, job_id, job_dir, body.project
+        await asyncio.to_thread(wait_for_pending_mesh, job_id)
+        bordered = await asyncio.to_thread(_bordered_copy, job_id, stl_path, border)
+        await asyncio.to_thread(
+            _write_3mf, job_id, os.path.dirname(stl_path), bordered or stl_path, body.project,
+            body.printer, body.manual_swaps, prefix or job_id, body.base, out_path,
         )
-        swap_text = await asyncio.to_thread(
-            _resolve_post_swap_instructions, job_id, job_dir, body.project
-        )
-        return await _3mf_response(
-            effective_stl,
-            project_data,
-            filename,
-            swap_instructions_text=swap_text,
-        )
+    except BaseException:
+        os.remove(out_path)
+        raise
     finally:
         if bordered and os.path.exists(bordered):
             os.remove(bordered)
+    return FileResponse(out_path, media_type=MEDIA_TYPE_3MF, filename=filename, background=BackgroundTask(os.remove, out_path))
 
 
 @router.post("/export/{job_id}")
@@ -460,7 +402,7 @@ async def export_project_with_file(job_id: str, body: ExportRequest):
     if border is None:
         saved = ((body.project or {}).get("settings") or {}).get("border")
         border = BorderSettings.model_validate(saved) if saved else None
-    return await _export_zip_response(job_id, body.name, body.project, border)
+    return await _export_zip_response(job_id, body.name, body.project, border, body.base)
 
 
 @router.get("/export/{job_id}")
@@ -469,7 +411,11 @@ async def export_project(job_id: str, name: str | None = None):
 
 
 async def _export_zip_response(
-    job_id: str, name: str | None, project: dict[str, Any] | None, border: BorderSettings | None = None
+    job_id: str,
+    name: str | None,
+    project: dict[str, Any] | None,
+    border: BorderSettings | None = None,
+    base: dict[str, Any] | None = None,
 ):
     """Zip up a completed job's output files — STL (or the per-material STLs
     a FlatForge run produced), colored PLY, preview PNG, swap instructions,
@@ -494,7 +440,7 @@ async def _export_zip_response(
         await asyncio.to_thread(wait_for_pending_mesh, job_id)
         replace = await asyncio.to_thread(_edited_replacements, job_id, job_dir, project, edit_dir)
         replace.update(await asyncio.to_thread(_border_replacements, job_id, job_dir, border, edit_dir))
-        replace.update(await asyncio.to_thread(_bambu_3mf_replacement, job_id, job_dir, project, replace, edit_dir))
+        replace.update(await asyncio.to_thread(_3mf_replacement, job_id, job_dir, project, base, prefix, replace, edit_dir))
         added = await asyncio.to_thread(_write_export_zip, zip_path, job_dir, prefix, project, replace)
     except BaseException:
         os.remove(zip_path)
@@ -531,48 +477,40 @@ def _export_arcname(filename: str, prefix: str) -> str:
         "final_model.png": "result.png",
         "final_loss.txt": "loss.txt",
         "project_file.hfp": "hueforge.hfp",
-        "final_model_bambu.3mf": "model_bambu.3mf",
+        "final_model.3mf": "model.3mf",
     }.get(filename, filename)
     return f"{prefix}_{renamed}"
 
 
-def _bambu_3mf_replacement(
+def _3mf_replacement(
     job_id: str,
     job_dir: str,
     project: dict[str, Any] | None,
+    base: dict[str, Any] | None,
+    prefix: str,
     replace: dict[str, str | None],
     edit_dir: str,
 ) -> dict[str, str]:
-    """Generate a fresh ``final_model_bambu.3mf`` for the export zip when the
-    user supplied project edits or a border, or when none is on disk yet."""
+    """The slicer project for the bundle, when the project has a printer
+    picked (File › Slicer project remembers it). It is built from the same
+    STL as the bundle's, border included."""
+    settings = (project or {}).get("settings") or {}
+    printer = settings.get("orca_printer")
     stl_path = replace.get("final_model.stl") or os.path.join(job_dir, "final_model.stl")
-    if not stl_path or not os.path.exists(stl_path):
+    if not printer or not stl_path or not os.path.exists(stl_path):
         return {}
-    existing_3mf = os.path.join(job_dir, "final_model_bambu.3mf")
-    if os.path.exists(existing_3mf) and project is None and "final_model.stl" not in replace:
-        return {}
-
-    from autoforge.helpers.export_3mf import export_bambu_3mf
-
-    out_3mf = os.path.join(edit_dir, "final_model_bambu.3mf")
+    out_path = os.path.join(edit_dir, "final_model.3mf")
     try:
-        project_data = _resolve_project_data(job_id, job_dir, project)
-        swap_path = (
-            replace["swap_instructions.txt"]
-            if "swap_instructions.txt" in replace
-            else os.path.join(job_dir, "swap_instructions.txt")
+        _write_3mf(
+            job_id, job_dir, stl_path, project, printer, settings.get("orca_manual_swaps"),
+            prefix or job_id, base, out_path,
         )
-        swap_text = _read_optional_swap_instructions(swap_path)
-        export_bambu_3mf(stl_path, project_data, out_3mf, swap_instructions_text=swap_text)
-        return {"final_model_bambu.3mf": out_3mf}
-    except Exception as exc:
-        logger.warning("Could not generate Bambu .3mf for %s: %s", job_id, exc)
-        if os.path.exists(out_3mf):
-            try:
-                os.remove(out_3mf)
-            except OSError:
-                pass
+    except HTTPException as e:
+        # The rest of the bundle is still worth having (the profile may just
+        # need internet once); File › Slicer project reports the reason.
+        logger.warning("Leaving the slicer project out of the export of %s: %s", job_id, e.detail)
         return {}
+    return {"final_model.3mf": out_path}
 
 
 def _edited_replacements(job_id: str, job_dir: str, project: dict[str, Any] | None, edit_dir: str) -> dict[str, str | None]:
