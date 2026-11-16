@@ -236,9 +236,14 @@ def test_project_settings_carry_full_presets_and_heightmap_overrides(acme):
     assert cfg["manual_filament_change"] == "1"
     assert cfg["machine_pause_gcode"].rstrip().endswith("M601")
     assert cfg["change_filament_gcode"] == ""
-    # Empty: OrcaSlicer would reset every unlisted option to its own system
-    # preset (VIRTU E3, deltas: refused to slice); empty, it uses this config.
-    assert cfg["different_settings_to_system"] == [""] * (3 + 2)
+    # Every option listed in every section: OrcaSlicer takes the system preset
+    # for anything unlisted (the GUI for everything when the lists are empty).
+    listed = cfg["different_settings_to_system"]
+    assert len(listed) == 3 + 2 and len(set(listed)) == 1
+    keys = set(listed[0].split(";"))
+    assert {"layer_height", "initial_layer_print_height", "sparse_infill_density", "nozzle_temperature",
+            "machine_start_gcode", "min_layer_height"} <= keys
+    assert "printer_settings_id" not in keys and "name" not in keys
     assert "compatible_printers" not in cfg
 
 
@@ -646,7 +651,7 @@ def test_project_holds_every_option_and_lists_no_differences(acme, monkeypatch):
     cfg = E.project_settings(printer, _slots("PLA", "PLA"), 0.08, 0.24, False, acme)
     assert cfg["bed_exclude_area"] == ["0x0"] and cfg["skirt_distance"] == "2"
     assert cfg["filament_notes"] == ["", ""]
-    assert set(cfg["different_settings_to_system"]) == {""}
+    assert "bed_exclude_area" in cfg["different_settings_to_system"][-1].split(";")
 
 
 def test_nozzle_lists_written_as_one_string_are_split():

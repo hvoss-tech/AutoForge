@@ -114,6 +114,12 @@ def _apply_setting(current: Any, mode: str, value: Any) -> Any:
     return one(current)
 
 
+# Project bookkeeping, not settings: never listed in different_settings_to_system.
+_BOOKKEEPING = frozenset({
+    "name", "from", "version", "inherits", "inherits_group", "different_settings_to_system",
+    "print_settings_id", "printer_settings_id", "filament_settings_id", "filament_ids",
+})
+
 # Keys copied from the printer that are not per-filament settings even though
 # they name filaments.
 _DROP_KEYS = frozenset({
@@ -525,6 +531,7 @@ def project_settings(
     config["flush_volumes_vector"] = ["140"] * (2 * len(slots))
 
     n = len(slots)
+    _ALL_OPTIONS = ";".join(sorted(k for k in config if k not in _BOOKKEEPING))
     config.update({
         "name": "project_settings",
         "from": "project",
@@ -537,12 +544,12 @@ def project_settings(
         "filament_ids": [str(f.get("filament_id") or "") for f in filaments],
         "print_compatible_printers": as_list(process.get("compatible_printers")),
         "inherits_group": [""] * (n + 2),
-        # Empty on purpose: for a section with a list here, OrcaSlicer resets
-        # every unlisted option to its own resolution of the system preset
-        # (Preset::load_external_config). Some vendor profiles resolve to
-        # values it then refuses to slice (and every correction made above
-        # would have to be listed); empty, it uses this complete config as is.
-        "different_settings_to_system": [""] * (n + 2),
+        # Every option, in every section (print, each filament, printer).
+        # OrcaSlicer takes the system preset for an option not listed here:
+        # the GUI for all of them when the lists are empty (the project
+        # opened with the printer's stock 0.2 mm profile), the CLI for the
+        # unlisted ones. Listing all keeps every value of this project.
+        "different_settings_to_system": [_ALL_OPTIONS] * (n + 2),
     })
     return config
 
