@@ -34,6 +34,9 @@ class ExportTask:
     error_status: int | None = None
     error: str | None = None
     path: str | None = None
+    # What the export wants the user to know (e.g. the slicer project's
+    # printer preset and nozzle warnings): {"printer", "notes", "warnings"}.
+    info: dict[str, Any] = field(default_factory=dict)
     created: float = field(default_factory=time.monotonic)
 
     def report(self, fraction: float, stage: str) -> None:
@@ -53,6 +56,9 @@ class ExportTask:
             "error": self.error,
             "error_status": self.error_status,
             "cancelled": self.cancelled,
+            "printer": self.info.get("printer"),
+            "notes": list(self.info.get("notes") or []),
+            "warnings": list(self.info.get("warnings") or []),
         }
 
 

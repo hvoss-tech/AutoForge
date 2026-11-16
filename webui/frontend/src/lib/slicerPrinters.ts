@@ -30,30 +30,53 @@ export function modelsOf(printers: SlicerPrinter[], vendor: string): string[] {
   )
 }
 
-/** The presets of one model (its nozzle sizes), the 0.4 mm one first. */
-export function variantsOf(printers: SlicerPrinter[], vendor: string, model: string): SlicerPrinter[] {
+export const DEFAULT_NOZZLE = 0.4
+
+const sameNozzle = (a: string | number, b: number) => Math.abs(Number(a) - b) < 1e-3
+
+/** Order presets by how well their nozzle fits ``nozzle``: the same one,
+ * else the closest, a tie going to the common 0.4 mm. */
+function byNozzleFit(nozzle: number) {
+  const fit = (p: SlicerPrinter) => {
+    const n = Number(p.nozzle)
+    // Rounded: |0.6 - 0.4| is 0.19999999999999996 in floating point, which
+    // broke the tie with |0.2 - 0.4|.
+    const off = (x: number) => Math.round(Math.abs(n - x) * 1e6)
+    return Number.isFinite(n) ? [off(nozzle), off(DEFAULT_NOZZLE)] : [Infinity, Infinity]
+  }
+  return (a: SlicerPrinter, b: SlicerPrinter) => {
+    const [da, sa] = fit(a)
+    const [db, sb] = fit(b)
+    return da - db || sa - sb
+  }
+}
+
+/** The presets of one model (its nozzle sizes), the one for ``nozzle`` first. */
+export function variantsOf(printers: SlicerPrinter[], vendor: string, model: string, nozzle = DEFAULT_NOZZLE): SlicerPrinter[] {
   return printers
     .filter((p) => p.vendor === vendor && p.model === model)
-    .sort((a, b) => Number(b.nozzle === '0.4') - Number(a.nozzle === '0.4') || a.name.localeCompare(b.name, undefined, { numeric: true }))
+    .sort((a, b) => byNozzleFit(nozzle)(a, b) || a.name.localeCompare(b.name, undefined, { numeric: true }))
 }
 
 /** Printers whose name contains every word of ``query`` (any order, any
- * case). Each model's presets stay together with its 0.4 mm one first, so
- * Enter on the top hit picks the usual nozzle. */
-export function searchPrinters(printers: SlicerPrinter[], query: string, limit = 50): SlicerPrinter[] {
+ * case). Each model's presets stay together, the one that fits ``nozzle``
+ * (the configured nozzle, 0.4 mm by default) best first, so Enter on the
+ * top hit picks the right one. */
+export function searchPrinters(printers: SlicerPrinter[], query: string, limit = 50, nozzle = DEFAULT_NOZZLE): SlicerPrinter[] {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean)
   if (words.length === 0) return []
   const matches = printers.filter((p) => {
     const hay = `${p.vendor} ${p.name}`.toLowerCase()
     return words.every((w) => hay.includes(w))
   })
+  const fit = byNozzleFit(nozzle)
   const modelOrder = new Map<string, number>()
   for (const p of matches) if (!modelOrder.has(p.model)) modelOrder.set(p.model, modelOrder.size)
   return matches
     .map((p, i) => ({ p, i }))
     .sort((a, b) =>
       modelOrder.get(a.p.model)! - modelOrder.get(b.p.model)! ||
-      Number(b.p.nozzle === '0.4') - Number(a.p.nozzle === '0.4') ||
+      fit(a.p, b.p) ||
       a.i - b.i,
     )
     .slice(0, limit)
@@ -92,9 +115,36 @@ export const POPULAR_PRINTERS = [
   'Snapmaker U1 (0.4 nozzle)',
 ]
 
-export function popularPrinters(printers: SlicerPrinter[]): SlicerPrinter[] {
+/** The popular printers, each as its preset for ``nozzle`` when it has one. */
+export function popularPrinters(printers: SlicerPrinter[], nozzle = DEFAULT_NOZZLE): SlicerPrinter[] {
   const byName = new Map(printers.map((p) => [p.name, p]))
-  return POPULAR_PRINTERS.map((n) => byName.get(n)).filter((p): p is SlicerPrinter => !!p)
+  return POPULAR_PRINTERS.map((n) => byName.get(n))
+    .filter((p): p is SlicerPrinter => !!p)
+    .map((p) => nozzleMatch(printers, p, nozzle).printer)
+}
+
+export interface NozzleMatch {
+  /** 'same': the preset has the nozzle; 'switched': the printer's preset
+   * for the nozzle is used instead; 'missing': the printer has no preset for
+   * it, so the picked one is used and the user has to set the nozzle. */
+  kind: 'same' | 'switched' | 'missing'
+  printer: SlicerPrinter
+  /** The printer's nozzle sizes (mm), for the warning. */
+  available: number[]
+}
+
+/** Which preset a slicer project for ``picked`` uses with a ``nozzle``
+ * (mm) result: the same rule as the server (OrcaProfiles.printer_for_nozzle). */
+export function nozzleMatch(printers: SlicerPrinter[], picked: SlicerPrinter, nozzle: number | null | undefined): NozzleMatch {
+  const siblings = printers.filter((p) => p.vendor === picked.vendor && p.model === picked.model)
+  const available = [...new Set(siblings.map((p) => Number(p.nozzle)).filter((n) => Number.isFinite(n)))].sort((a, b) => a - b)
+  if (!nozzle || nozzle <= 0 || sameNozzle(picked.nozzle, nozzle)) return { kind: 'same', printer: picked, available }
+  const matches = siblings.filter((p) => sameNozzle(p.nozzle, nozzle))
+  if (matches.length === 0) return { kind: 'missing', printer: picked, available }
+  const styled = picked.name.replace(picked.nozzle, '{n}')
+  const sameStyle = matches.find((p) => styled.replace('{n}', p.nozzle) === p.name)
+  const plainest = [...matches].sort((a, b) => a.name.length - b.name.length || a.name.localeCompare(b.name))[0]
+  return { kind: 'switched', printer: sameStyle ?? plainest, available }
 }
 
 /** "Bambu Lab X1 Carbon 0.4 nozzle" -> "Bambu Lab X1 Carbon"; names that

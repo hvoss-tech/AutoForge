@@ -413,3 +413,53 @@ def test_export_progress_is_monotonic_and_can_stop(acme):
 
     with pytest.raises(E.Cancelled):
         E.export_3mf(io.BytesIO(), _stl_bytes(), _plan(), "Acme One 0.4 nozzle", 0.08, 0.24, progress=stop)
+
+
+# --------------------------------------------------------------------- nozzle
+
+def test_preset_follows_the_results_nozzle(acme):
+    printer, note, warning = OP.printer_for_nozzle("Acme One 0.4 nozzle", 0.4)
+    assert printer["name"] == "Acme One 0.4 nozzle" and note is None and warning is None
+    # Same naming as the picked preset, not the HF variant.
+    printer, note, warning = OP.printer_for_nozzle("Acme One 0.4 nozzle", 0.6)
+    assert printer["name"] == "Acme One 0.6 nozzle" and warning is None
+    assert "0.6 mm" in note
+    printer, _, _ = OP.printer_for_nozzle("Acme One HF0.6 nozzle", 0.6)
+    assert printer["name"] == "Acme One HF0.6 nozzle"
+    assert OP.printer_for_nozzle("Acme One 0.6 nozzle", None)[0]["name"] == "Acme One 0.6 nozzle"
+
+
+def test_missing_nozzle_keeps_the_preset_and_warns(acme):
+    printer, note, warning = OP.printer_for_nozzle("Acme One 0.4 nozzle", 0.8)
+    assert printer["name"] == "Acme One 0.4 nozzle" and note is None
+    assert "no 0.8 mm nozzle preset for the Acme One (only 0.4, 0.6 mm)" in warning
+    assert "set the nozzle diameter to 0.8 mm" in warning
+
+
+def test_export_uses_the_nozzle_preset_and_reports_it(acme):
+    buf = io.BytesIO()
+    info = E.export_3mf(buf, _stl_bytes(), _plan(), "Acme One 0.4 nozzle", 0.08, 0.24, nozzle=0.6)
+    assert info["printer"] == "Acme One 0.6 nozzle" and info["warnings"] == [] and len(info["notes"]) == 1
+    cfg = json.loads(zipfile.ZipFile(io.BytesIO(buf.getvalue())).read("Metadata/project_settings.config"))
+    assert cfg["printer_settings_id"] == "Acme One 0.6 nozzle"
+    assert cfg["nozzle_diameter"] == ["0.6"]
+    info = E.export_3mf(io.BytesIO(), _stl_bytes(), _plan(), "Acme One 0.4 nozzle", 0.08, 0.24, nozzle=1.0)
+    assert info["printer"] == "Acme One 0.4 nozzle" and len(info["warnings"]) == 1
+
+
+def test_cli_warns_about_a_missing_nozzle_preset(acme, tmp_path, capsys):
+    import argparse
+
+    from autoforge.auto_forge import _export_slicer_project, cli_defaults
+    from autoforge.Helper.OutputHelper import generate_stl
+
+    heights = np.full((10, 10), 4)
+    generate_stl(heights.astype(np.float32) * 0.08, str(tmp_path / "final_model.stl"), 0.24, maximum_x_y_size=20)
+    args = argparse.Namespace(**cli_defaults())
+    args.output_folder, args.layer_height, args.background_height = str(tmp_path), 0.08, 0.24
+    args.csv_file, args.json_file = "", ""
+    args.orca_printer, args.nozzle_diameter = "Acme One 0.4 nozzle", 0.8
+    _export_slicer_project(args, np.array([0, 1, 1, 1]), heights, np.array([[0, 0, 0], [1, 0, 0]], np.float32), ["A", "B"], 0)
+    out = capsys.readouterr().out
+    assert "WARNING: OrcaSlicer has no 0.8 mm nozzle preset" in out
+    assert os.path.exists(tmp_path / "final_model.3mf")

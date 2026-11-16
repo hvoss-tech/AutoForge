@@ -43,6 +43,7 @@ export const FileMenu: React.FC = () => {
   const slicerAbort = useRef<AbortController | null>(null)
   const lastSlicerExport = useRef<{ printer: string; manualSwaps: boolean | null } | null>(null)
   const exporting3mf = slicerExport?.status === 'running'
+  const runInputsByJob = useAppStore((s) => s.runInputsByJob)
   const setSettings = useAppStore((s) => s.setSettings)
   const named = (suffix: string, fallback: string) => exportFileName(projectName, suffix, fallback)
   // The border picked in the 3D view goes into every STL download.
@@ -58,6 +59,10 @@ export const FileMenu: React.FC = () => {
   // has no printable model. The swap instructions and the image are made from
   // the color layers as they are, so they work as soon as there are bands.
   const canExport = currentJob?.status === 'completed'
+  // The nozzle the result was made for (the server uses the same): the
+  // run's, else the current setting.
+  const runNozzle = currentJob ? Number(runInputsByJob[currentJob.job_id]?.settings?.nozzle_diameter) : NaN
+  const resultNozzle = Number.isFinite(runNozzle) && runNozzle > 0 ? runNozzle : settings.nozzle_diameter
   const exportHint = canExport ? undefined : 'Needs an optimizer run — the preview before a run has no printable model yet'
   const hasBands = buildPrintPlan(colorSliders, [], settings).bands.length > 0
   const canExportImage = canExport || !!previewImage
@@ -68,8 +73,8 @@ export const FileMenu: React.FC = () => {
   // Opening the menu with a printer picked: load its profiles now, so a
   // click on "Slicer project" doesn't wait for a download.
   useEffect(() => {
-    if (open && canExport && settings.orca_printer) preparePrinter(settings.orca_printer)
-  }, [open, canExport, settings.orca_printer])
+    if (open && canExport && settings.orca_printer) preparePrinter(settings.orca_printer, resultNozzle)
+  }, [open, canExport, settings.orca_printer, resultNozzle])
 
   useEffect(() => {
     if (!open) return
@@ -171,7 +176,7 @@ export const FileMenu: React.FC = () => {
     setSlicerExport({ status: 'running', title, fraction: 0, stage: 'Starting' })
     try {
       const current = useAppStore.getState()
-      const blob = await runSlicerExport(
+      const result = await runSlicerExport(
         jobId,
         {
           name: projectName,
@@ -184,8 +189,15 @@ export const FileMenu: React.FC = () => {
         (p) => setSlicerExport({ status: 'running', title, fraction: p.fraction, stage: p.stage }),
         abort.signal,
       )
-      downloadBlob(blob, named('model.3mf', `${jobId}.3mf`))
-      setSlicerExport({ status: 'done', title, fraction: 1, stage: 'Done' })
+      downloadBlob(result.blob, named('model.3mf', `${jobId}.3mf`))
+      setSlicerExport({
+        status: 'done',
+        title: result.printer ? `Slicer project · ${shortPrinterName(result.printer)}` : title,
+        fraction: 1,
+        stage: 'Done',
+        notes: result.notes,
+        warnings: result.warnings,
+      })
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
         setSlicerExport(null)
@@ -374,6 +386,7 @@ export const FileMenu: React.FC = () => {
         onClose={() => setSlicerDialogOpen(false)}
         rememberedPrinter={settings.orca_printer}
         rememberedManualSwaps={settings.orca_manual_swaps}
+        nozzle={resultNozzle}
         onConfirm={(printer, manualSwaps) => {
           setSlicerDialogOpen(false)
           exportSlicerProject(printer, manualSwaps)

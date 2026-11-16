@@ -1340,11 +1340,16 @@ def _export_slicer_project(args, disc_global, disc_height_image, material_colors
     manual = {"auto": None, "yes": True, "no": False}[args.orca_manual_swaps]
     out = os.path.join(args.output_folder, "final_model.3mf")
     try:
-        export_3mf(
+        info = export_3mf(
             out, os.path.join(args.output_folder, "final_model.stl"), plan, args.orca_printer,
             args.layer_height, args.background_height, manual, title="AutoForge",
+            nozzle=getattr(args, "nozzle_diameter", None),
         )
-        print(f"Slicer project for {args.orca_printer}: {out}")
+        print(f"Slicer project for {info['printer']}: {out}")
+        for message in info["notes"]:
+            print(message)
+        for message in info["warnings"]:
+            print(f"WARNING: {message}")
     except (ProfileError, ValueError) as e:
         print(f"Could not write the slicer project: {e}")
 

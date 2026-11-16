@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { Check, ChevronDown, ChevronUp, Hand, Layers, Printer, Search } from 'lucide-react'
+import { AlertTriangle, Check, ChevronDown, ChevronUp, Hand, Info, Layers, Printer, Search } from 'lucide-react'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
 import {
   bedSize,
@@ -7,6 +7,7 @@ import {
   initialChoice,
   modelsOf,
   nozzleLabel,
+  nozzleMatch,
   popularPrinters,
   searchPrinters,
   shortPrinterName,
@@ -47,12 +48,15 @@ interface Props {
   /** The printer remembered in the project settings, and its swap choice. */
   rememberedPrinter?: string
   rememberedManualSwaps?: boolean | null
+  /** The nozzle (mm) from the settings: presets for it are offered first,
+   * and a printer without one gets a warning. */
+  nozzle?: number
   onConfirm: (printer: string, manualSwaps: boolean) => void
 }
 
 /** The printer picker for slicer projects (OrcaSlicer's printer presets)
  * plus how colour changes happen on it. */
-export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, rememberedPrinter, rememberedManualSwaps, onConfirm }) => {
+export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, rememberedPrinter, rememberedManualSwaps, nozzle, onConfirm }) => {
   const [list, setList] = useState<PrinterList | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
@@ -98,12 +102,14 @@ export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, reme
 
   const printers = list?.printers ?? []
   const selected = printers.find((p) => p.name === name)
-  const popular = useMemo(() => popularPrinters(printers), [printers])
-  const results = useMemo(() => (query.trim() ? searchPrinters(printers, query, 40) : popular), [printers, query, popular])
+  const popular = useMemo(() => popularPrinters(printers, nozzle), [printers, nozzle])
+  const results = useMemo(() => (query.trim() ? searchPrinters(printers, query, 40, nozzle) : popular), [printers, query, popular, nozzle])
+  // What the export will do about the nozzle (the server applies the same rule).
+  const match = selected ? nozzleMatch(printers, selected, nozzle) : null
   const vendors = useMemo(() => vendorsOf(printers), [printers])
   const vendor = selected?.vendor ?? ''
   const models = useMemo(() => (vendor ? modelsOf(printers, vendor) : []), [printers, vendor])
-  const variants = useMemo(() => (selected ? variantsOf(printers, selected.vendor, selected.model) : []), [printers, selected])
+  const variants = useMemo(() => (selected ? variantsOf(printers, selected.vendor, selected.model, nozzle) : []), [printers, selected, nozzle])
 
   // The swap mode follows the printer unless the user chose one for it.
   useEffect(() => {
@@ -112,8 +118,8 @@ export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, reme
 
   // Fetch the chosen printer's profiles now, so the export doesn't wait.
   useEffect(() => {
-    if (open && selected) preparePrinter(selected.name)
-  }, [open, selected])
+    if (open && selected) preparePrinter(selected.name, nozzle)
+  }, [open, selected, nozzle])
 
   const pick = (p: SlicerPrinter) => {
     setName(p.name)
@@ -123,12 +129,12 @@ export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, reme
 
   const chooseVendor = (v: string) => {
     const model = v ? modelsOf(printers, v)[0] : ''
-    const first = model ? variantsOf(printers, v, model)[0] : undefined
+    const first = model ? variantsOf(printers, v, model, nozzle)[0] : undefined
     if (first) setName(first.name)
   }
 
   const chooseModel = (m: string) => {
-    const first = selected && m ? variantsOf(printers, selected.vendor, m)[0] : undefined
+    const first = selected && m ? variantsOf(printers, selected.vendor, m, nozzle)[0] : undefined
     if (first) setName(first.name)
   }
 
@@ -272,6 +278,23 @@ export const SlicerProjectDialog: React.FC<Props> = ({ open, onClose, mode, reme
                   Keep {shortPrinterName(remembered.name)} ({nozzleLabel(remembered)})
                 </button>
               )}
+            </div>
+          )}
+
+          {match && match.kind === 'switched' && (
+            <p className="flex items-start gap-1.5 text-[11px] leading-snug text-cyan-200" data-testid="slicer-nozzle-note">
+              <Info className="w-3.5 h-3.5 mt-px shrink-0" />
+              Your settings use a {nozzle} mm nozzle, so the project uses the {nozzleLabel(match.printer)} preset ({match.printer.name}).
+            </p>
+          )}
+          {match && match.kind === 'missing' && (
+            <div className="flex items-start gap-2 rounded border border-amber-700/70 bg-amber-950/40 px-3 py-2 text-[11px] leading-snug text-amber-200" role="alert" data-testid="slicer-nozzle-warning">
+              <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0 text-amber-400" />
+              <span>
+                OrcaSlicer has no {nozzle} mm nozzle preset for the {match.printer.model} (only {match.available.join(', ')} mm).
+                The project uses the {match.printer.nozzle} mm preset: set the nozzle diameter to {nozzle} mm in OrcaSlicer's
+                printer settings before slicing, or change the nozzle in AutoForge's settings.
+              </span>
             </div>
           )}
 

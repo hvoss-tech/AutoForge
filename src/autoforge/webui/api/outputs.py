@@ -6,6 +6,7 @@ import shutil
 import re
 import tempfile
 import threading
+import urllib.parse
 import zipfile
 from typing import Any
 from fastapi import APIRouter, HTTPException
@@ -167,13 +168,14 @@ def _write_3mf(
     base: dict[str, Any] | None,
     out_path: str,
     progress=None,
-) -> None:
-    """Write the slicer project, turning its failures into HTTP errors."""
+) -> dict[str, Any]:
+    """Write the slicer project, turning its failures into HTTP errors.
+    Returns the preset used and any notes/warnings for the user."""
     from autoforge.Helper.OrcaProfiles import ProfileDownloadError, ProfileError
     from ..helpers.orca_export import ExportUnavailable, write_project_3mf
 
     try:
-        write_project_3mf(out_path, stl_path, job_dir, project, printer, manual_swaps, title, base, progress)
+        return write_project_3mf(out_path, stl_path, job_dir, project, printer, manual_swaps, title, base, progress)
     except ProfileDownloadError as e:
         raise HTTPException(503, str(e))
     except (ProfileError, ExportUnavailable, ValueError) as e:
@@ -186,34 +188,36 @@ _prefetch_lock = threading.Lock()
 
 class PrinterRequest(BaseModel):
     printer: str
+    # The configured nozzle (mm): the export uses that preset, so load it.
+    nozzle: float | None = None
 
 
 @router.post("/3mf/printers/prepare")
 async def prepare_3mf_printer(body: PrinterRequest):
     """Start loading a printer's profiles (downloading them the first time)
     while the user is still choosing, so the export doesn't wait for it."""
-    from autoforge.Helper.OrcaProfiles import ProfileError, find_printer, shared_profiles
+    from autoforge.Helper.OrcaProfiles import ProfileError, printer_for_nozzle, shared_profiles
 
     try:
-        printer = find_printer(body.printer)
+        printer, _, _ = printer_for_nozzle(body.printer, body.nozzle)
     except ProfileError as e:
         raise HTTPException(404, str(e))
     with _prefetch_lock:
-        if body.printer in _prefetching:
-            return {"status": "loading"}
-        _prefetching.add(body.printer)
+        if printer["name"] in _prefetching:
+            return {"status": "loading", "printer": printer["name"]}
+        _prefetching.add(printer["name"])
 
     def run() -> None:
         try:
             shared_profiles().prefetch(printer)
         except Exception as e:  # noqa: BLE001 - the export reports it properly
-            logger.info("Prefetching the profiles of %s failed: %s", body.printer, e)
+            logger.info("Prefetching the profiles of %s failed: %s", printer["name"], e)
         finally:
             with _prefetch_lock:
-                _prefetching.discard(body.printer)
+                _prefetching.discard(printer["name"])
 
     threading.Thread(target=run, name="orca-prefetch", daemon=True).start()
-    return {"status": "loading"}
+    return {"status": "loading", "printer": printer["name"]}
 
 
 @router.get("/preview/{job_id}")
@@ -306,6 +310,7 @@ _EXPORT_FILES = [
     "final_loss.txt",
     "project_file.hfp",
     "final_model.3mf",
+    "slicer_project_warning.txt",
 ]
 
 
@@ -402,8 +407,9 @@ class ExportRequest(BaseModel):
     base: dict[str, Any] | None = None
 
 
-def _build_3mf(job_id: str, body: "ExportRequest", report) -> tuple[str, str]:
-    """Write the slicer project to a temp file: ``(path, download name)``.
+def _build_3mf(job_id: str, body: "ExportRequest", report) -> tuple[str, str, dict[str, Any]]:
+    """Write the slicer project to a temp file: ``(path, download name,
+    info)``, info being the preset used and notes/warnings for the user.
     ``report(fraction, stage)`` gets the progress. HTTPException on failure."""
     if not body.printer:
         raise HTTPException(422, "Pick a printer for the slicer project")
@@ -429,7 +435,7 @@ def _build_3mf(job_id: str, body: "ExportRequest", report) -> tuple[str, str]:
         def scaled(fraction: float, stage: str) -> None:
             report(start + (1.0 - start) * fraction, stage)
 
-        _write_3mf(
+        info = _write_3mf(
             job_id, os.path.dirname(stl_path), bordered or stl_path, body.project,
             body.printer, body.manual_swaps, prefix or job_id, body.base, out_path, scaled,
         )
@@ -439,7 +445,7 @@ def _build_3mf(job_id: str, body: "ExportRequest", report) -> tuple[str, str]:
     finally:
         if bordered and os.path.exists(bordered):
             os.remove(bordered)
-    return out_path, filename
+    return out_path, filename, info
 
 
 @router.post("/3mf/{job_id}")
@@ -447,8 +453,12 @@ async def download_3mf(job_id: str, body: ExportRequest):
     """An OrcaSlicer / Bambu Studio project for ``body.printer`` with the
     current colour layers as filament changes and the border in the model,
     in one request (the webui uses /3mf/{job_id}/start for its progress bar)."""
-    path, filename = await asyncio.to_thread(_build_3mf, job_id, body, lambda fraction, stage: None)
-    return FileResponse(path, media_type=MEDIA_TYPE_3MF, filename=filename, background=BackgroundTask(os.remove, path))
+    path, filename, info = await asyncio.to_thread(_build_3mf, job_id, body, lambda fraction, stage: None)
+    # Which preset was used and any nozzle warning, for scripted callers.
+    headers = {"X-AutoForge-Export-Info": urllib.parse.quote(json.dumps(info))}
+    return FileResponse(
+        path, media_type=MEDIA_TYPE_3MF, filename=filename, headers=headers, background=BackgroundTask(os.remove, path)
+    )
 
 
 @router.post("/3mf/{job_id}/start")
@@ -464,7 +474,8 @@ async def start_3mf(job_id: str, body: ExportRequest):
 
     def work(task) -> str:
         try:
-            path, _ = _build_3mf(job_id, body, task.report)
+            path, _, info = _build_3mf(job_id, body, task.report)
+            task.info = info
         except HTTPException as e:
             raise export_tasks.TaskError(e.status_code, str(e.detail))
         except export_tasks.TaskCancelled:
@@ -613,7 +624,7 @@ def _3mf_replacement(
         return {}
     out_path = os.path.join(edit_dir, "final_model.3mf")
     try:
-        _write_3mf(
+        info = _write_3mf(
             job_id, job_dir, stl_path, project, printer, settings.get("orca_manual_swaps"),
             prefix or job_id, base, out_path,
         )
@@ -622,7 +633,14 @@ def _3mf_replacement(
         # need internet once); File › Slicer project reports the reason.
         logger.warning("Leaving the slicer project out of the export of %s: %s", job_id, e.detail)
         return {}
-    return {"final_model.3mf": out_path}
+    files = {"final_model.3mf": out_path}
+    if info.get("warnings"):
+        # Nobody sees a dialog for the bundle: the warning travels with it.
+        note = os.path.join(edit_dir, "slicer_project_warning.txt")
+        with open(note, "w", encoding="utf-8") as f:
+            f.write(f"Slicer project for {info['printer']}\n\n" + "\n\n".join(info["warnings"]) + "\n")
+        files["slicer_project_warning.txt"] = note
+    return files
 
 
 def _edited_replacements(job_id: str, job_dir: str, project: dict[str, Any] | None, edit_dir: str) -> dict[str, str | None]:

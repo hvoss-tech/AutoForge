@@ -14,16 +14,16 @@ test.setTimeout(300_000)
 
 const SHOTS = process.env.SLICER_SPEC_SCREENSHOTS
 
-async function runOptimization(request: APIRequestContext, baseURL: string) {
+async function runOptimization(request: APIRequestContext, baseURL: string, extra: Record<string, unknown> = {}) {
   await resetBackend(baseURL)
   await activePalette(request)
-  await presetSettings(request, { ...FAST_SETTINGS, orca_printer: '', orca_manual_swaps: null })
+  await presetSettings(request, { ...FAST_SETTINGS, orca_printer: '', orca_manual_swaps: null, ...extra })
   const upload = await request.post('/api/images/upload', {
     multipart: { file: { name: 'cat.png', mimeType: 'image/png', buffer: fs.readFileSync(FIXTURE_IMAGE) } },
   })
   const filename = (await upload.json()).filename
   await presetSettings(request, { input_image: filename })
-  const start = await request.post('/api/optimize/start', { data: { ...FAST_SETTINGS, input_image: filename } })
+  const start = await request.post('/api/optimize/start', { data: { ...FAST_SETTINGS, ...extra, input_image: filename } })
   expect(start.ok(), await start.text()).toBeTruthy()
   const done = await waitForJob(request, (await start.json()).job_id)
   expect(done.status, done.error ?? '').toBe('completed')
@@ -133,4 +133,31 @@ test('a failed export says why and offers another printer', async ({ page, reque
   await expect(byTestId(page, 'export-progress')).toHaveCount(0)
   await expect(byTestId(page, 'slicer-project-dialog')).toBeVisible()
   await expect(byTestId(page, 'slicer-printer-search')).toBeFocused()
+})
+
+test('a nozzle the printer has no preset for is flagged before and after the export', async ({ page, request, baseURL }) => {
+  // OrcaSlicer's X1 Carbon presets: 0.2, 0.4, 0.6 and 0.8 mm - no 0.5.
+  await runOptimization(request, baseURL!, { nozzle_diameter: 0.5 })
+  await openApp(page)
+  await byTestId(page, 'file-menu-btn').click()
+  await byTestId(page, 'download-3mf').click()
+  await expect(byTestId(page, 'slicer-printer-search')).toBeFocused()
+  await page.keyboard.type('x1 carbon')
+  await expect(byTestId(page, 'slicer-printer-result').first()).toContainText('Bambu Lab X1 Carbon')
+  await page.keyboard.press('Enter')
+  await expect(byTestId(page, 'slicer-nozzle-warning')).toContainText('no 0.5 mm nozzle preset for the Bambu Lab X1 Carbon')
+  // the closest preset was picked, not the first in the list (0.2)
+  await expect(byTestId(page, 'slicer-nozzle-warning')).toContainText('uses the 0.4 mm preset')
+  if (SHOTS) await page.screenshot({ path: `${SHOTS}/6-nozzle-warning.png` })
+
+  const download = page.waitForEvent('download')
+  await byTestId(page, 'slicer-export').click()
+  await download
+  // The warning stays until it's read and closed.
+  await expect(byTestId(page, 'export-progress-warning')).toContainText('set the nozzle diameter to 0.5 mm')
+  if (SHOTS) await page.screenshot({ path: `${SHOTS}/7-export-warning.png` })
+  await page.waitForTimeout(3500)
+  await expect(byTestId(page, 'export-progress')).toBeVisible()
+  await byTestId(page, 'export-progress-close').click()
+  await expect(byTestId(page, 'export-progress')).toHaveCount(0)
 })

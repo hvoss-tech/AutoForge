@@ -7,6 +7,9 @@ export interface ExportState {
   fraction: number
   stage: string
   error?: string
+  /** Shown once done: notes (informational) and warnings (to fix by hand). */
+  notes?: string[]
+  warnings?: string[]
 }
 
 interface Props {
@@ -21,12 +24,15 @@ interface Props {
 /** A small card in the corner that shows an export's progress, so a long
  * export neither blocks the app nor leaves the user guessing. */
 export const ExportProgressCard: React.FC<Props> = ({ state, onCancel, onRetry, onDismiss, onChangePrinter }) => {
-  // A finished export says so briefly, then gets out of the way.
+  // A finished export says so briefly, then gets out of the way - unless it
+  // has a warning, which stays until read and closed.
+  const warned = !!state?.warnings?.length
+  const noted = !!state?.notes?.length
   useEffect(() => {
-    if (state?.status !== 'done') return
-    const t = setTimeout(onDismiss, 2500)
+    if (state?.status !== 'done' || warned) return
+    const t = setTimeout(onDismiss, noted ? 7000 : 2500)
     return () => clearTimeout(t)
-  }, [state?.status, onDismiss])
+  }, [state?.status, warned, noted, onDismiss])
 
   if (!state) return null
   const percent = Math.round(state.fraction * 100)
@@ -39,7 +45,8 @@ export const ExportProgressCard: React.FC<Props> = ({ state, onCancel, onRetry, 
     >
       <div className="flex items-center gap-2">
         {state.status === 'running' && <Loader2 className="w-4 h-4 text-cyan-400 animate-spin" />}
-        {state.status === 'done' && <CheckCircle2 className="w-4 h-4 text-green-400" />}
+        {state.status === 'done' && !warned && <CheckCircle2 className="w-4 h-4 text-green-400" />}
+        {state.status === 'done' && warned && <AlertTriangle className="w-4 h-4 text-amber-400" />}
         {state.status === 'error' && <AlertTriangle className="w-4 h-4 text-amber-400" />}
         <span className="flex-1 text-xs font-medium text-gray-100 truncate">{state.title}</span>
         {state.status !== 'running' && (
@@ -90,6 +97,16 @@ export const ExportProgressCard: React.FC<Props> = ({ state, onCancel, onRetry, 
               <span>100%</span>
             )}
           </div>
+          {state.status === 'done' && warned && (
+            <div className="mt-2 rounded border border-amber-700/70 bg-amber-950/40 px-2.5 py-2 text-[11px] leading-snug text-amber-200" data-testid="export-progress-warning">
+              {state.warnings!.map((w) => <p key={w}>{w}</p>)}
+            </div>
+          )}
+          {state.status === 'done' && noted && (
+            <div className="mt-1.5 text-[11px] leading-snug text-gray-400" data-testid="export-progress-note">
+              {state.notes!.map((n) => <p key={n}>{n}</p>)}
+            </div>
+          )}
         </>
       )}
     </div>

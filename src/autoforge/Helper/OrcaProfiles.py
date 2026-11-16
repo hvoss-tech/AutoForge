@@ -474,6 +474,51 @@ def find_printer(name: str) -> dict[str, Any]:
     raise ProfileError(f"Unknown printer {name!r}")
 
 
+def _nozzle_mm(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _same_nozzle(a: Any, b: Any) -> bool:
+    x, y = _nozzle_mm(a), _nozzle_mm(b)
+    return x is not None and y is not None and abs(x - y) < 1e-3
+
+
+def printer_for_nozzle(name: str, nozzle: float | None) -> tuple[dict[str, Any], str | None, str | None]:
+    """The preset of printer ``name`` for a ``nozzle`` (mm): ``(printer,
+    note, warning)``.
+
+    A picked preset with another nozzle is swapped for the same printer's
+    preset with this nozzle (``note`` says so). When the printer has no such
+    preset the picked one stays and ``warning`` tells the user to set the
+    nozzle by hand in the slicer. ``nozzle=None`` keeps the preset as is."""
+    printer = find_printer(name)
+    if nozzle is None or nozzle <= 0 or _same_nozzle(printer["nozzle"], nozzle):
+        return printer, None, None
+    siblings = [
+        p for p in load_printer_index()["printers"]
+        if p["vendor"] == printer["vendor"] and p["model"] == printer["model"]
+    ]
+    matches = [p for p in siblings if _same_nozzle(p["nozzle"], nozzle)]
+    if matches:
+        # Same naming as the picked preset ("... 0.4 nozzle" -> "... 0.6 nozzle"),
+        # else the plainest one (no "HF" etc. variant).
+        styled = printer["name"].replace(printer["nozzle"], "{n}", 1)
+        same_style = [p for p in matches if styled.replace("{n}", p["nozzle"], 1) == p["name"]]
+        chosen = (same_style or sorted(matches, key=lambda p: (len(p["name"]), p["name"])))[0]
+        return chosen, f"Uses the {chosen['name']} preset to match the {nozzle:g} mm nozzle of this result.", None
+    available = sorted({_nozzle_mm(p["nozzle"]) for p in siblings if _nozzle_mm(p["nozzle"]) is not None})
+    have = ", ".join(f"{n:g}" for n in available)
+    warning = (
+        f"OrcaSlicer has no {nozzle:g} mm nozzle preset for the {printer['model']} (only {have} mm). "
+        f"The project uses the {printer['nozzle']} mm preset: set the nozzle diameter to {nozzle:g} mm in "
+        "OrcaSlicer's printer settings before slicing, or pick another printer."
+    )
+    return printer, None, warning
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Regenerate autoforge/data/orca_printers.json from an OrcaSlicer checkout "

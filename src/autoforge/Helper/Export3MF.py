@@ -27,7 +27,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
-from autoforge.Helper.OrcaProfiles import OrcaProfiles, ProfileError, as_list, find_printer, shared_profiles
+from autoforge.Helper.OrcaProfiles import OrcaProfiles, ProfileError, as_list, printer_for_nozzle, shared_profiles
 
 # Matches what OrcaSlicer 2.5.0 writes into its own projects.
 ORCA_VERSION = "2.5.0"
@@ -629,8 +629,14 @@ def export_3mf(
     title: str = "AutoForge",
     profiles: OrcaProfiles | None = None,
     progress: Progress | None = None,
-) -> None:
+    nozzle: float | None = None,
+) -> dict[str, Any]:
     """Write the project for ``printer_name`` (a name from the printer index).
+
+    ``nozzle``: the nozzle (mm) the result was made for. The printer's preset
+    for that nozzle is used; without one the picked preset stays and the
+    result carries a warning. Returns ``{"printer": preset used, "notes":
+    [...], "warnings": [...]}``.
 
     ``manual_swaps``: pause for a hand swap at each change instead of a tool
     change; ``None`` picks by printer (see ``printer_changes_filament``).
@@ -639,7 +645,7 @@ def export_3mf(
     profile that can't be fetched, and ``ValueError`` for a model that
     doesn't fit the bed."""
     report = progress or (lambda fraction, stage: None)
-    printer = find_printer(printer_name)
+    printer, note, warning = printer_for_nozzle(printer_name, nozzle)
     if manual_swaps is None:
         manual_swaps = not printer_changes_filament(printer)
     profiles = profiles or shared_profiles()
@@ -708,6 +714,7 @@ def export_3mf(
             "  </header>\n</config>\n",
         )
     report(1.0, "Done")
+    return {"printer": printer["name"], "notes": [note] if note else [], "warnings": [warning] if warning else []}
 
 
 __all__ = [

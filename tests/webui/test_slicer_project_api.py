@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -41,7 +42,7 @@ def client():
     return TestClient(create_app())
 
 
-def _job(stack=(0, 0, 1, 1, 2, 2), base_index=0, size_mm=30):
+def _job(stack=(0, 0, 1, 1, 2, 2), base_index=0, size_mm=30, nozzle=None):
     """A completed job with an STL and the saved solution it came from."""
     from autoforge.webui.config import config
     from autoforge.webui.helpers.result_store import SOLUTION_FILE
@@ -56,7 +57,8 @@ def _job(stack=(0, 0, 1, 1, 2, 2), base_index=0, size_mm=30):
     heights[:5, :5] = 2
     generate_stl(heights.astype(np.float32) * LH, os.path.join(job_dir, "final_model.stl"), BG, maximum_x_y_size=size_mm)
     meta = {
-        "version": 1, "materials": MATERIALS, "args": {"layer_height": LH, "background_height": BG},
+        "version": 1, "materials": MATERIALS,
+        "args": {"layer_height": LH, "background_height": BG, **({"nozzle_diameter": nozzle} if nozzle else {})},
         "background_color": "#000000", "background_material_index": base_index,
     }
     np.savez_compressed(
@@ -186,6 +188,7 @@ def test_zip_has_a_3mf_only_once_a_printer_was_picked(client, acme):
     r = client.post(f"/api/outputs/export/{job_id}", json={"name": "Cat", "project": project, "base": {"filament_uuid": "u-black"}})
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
         assert "Cat_model.3mf" in zf.namelist()
+        assert not any("warning" in n for n in zf.namelist())  # nozzle fits: nothing to warn about
         swaps, cfg = _swaps(zf.read("Cat_model.3mf"))
     assert cfg["filament_colour"] == ["#000000", "#FF0000"]
     assert swaps == [("0.3200", "2")]
@@ -321,3 +324,58 @@ def test_prepare_loads_the_printer_profiles_ahead(client, acme):
     while ("Acme", "machine", "Acme One 0.4 nozzle") not in profiles._resolved and time.monotonic() < end:
         time.sleep(0.02)
     assert ("Acme", "filament", "Acme PETG @Acme One") in profiles._resolved
+
+
+# --------------------------------------------------------------------- nozzle
+
+def test_export_switches_to_the_runs_nozzle_preset(client, acme):
+    job_id, _ = _job(nozzle=0.6)
+    task_id = client.post(f"/api/outputs/3mf/{job_id}/start", json={"printer": "Acme One 0.4 nozzle"}).json()["task_id"]
+    status, _ = _wait(client, task_id)
+    assert status["printer"] == "Acme One 0.6 nozzle"
+    assert status["warnings"] == [] and "0.6 mm" in status["notes"][0]
+    _, cfg = _swaps(client.get(f"/api/outputs/tasks/{task_id}/file").content)
+    assert cfg["printer_settings_id"] == "Acme One 0.6 nozzle"
+
+
+def test_the_runs_nozzle_beats_the_current_setting(client, acme):
+    """The heightmap was made for the run's nozzle; a nozzle changed in the
+    settings afterwards (no new run yet) doesn't count."""
+    job_id, _ = _job(nozzle=0.6)
+    body = {"printer": "Acme One 0.4 nozzle", "project": _project([], nozzle_diameter=0.4)}
+    r = client.post(f"/api/outputs/3mf/{job_id}", json=body)
+    assert json.loads(urllib.parse.unquote(r.headers["x-autoforge-export-info"]))["printer"] == "Acme One 0.6 nozzle"
+
+
+def test_settings_nozzle_counts_when_the_run_has_none(client, acme):
+    job_id, _ = _job()
+    body = {"printer": "Acme One 0.4 nozzle", "project": _project([], nozzle_diameter=0.6)}
+    r = client.post(f"/api/outputs/3mf/{job_id}", json=body)
+    assert json.loads(urllib.parse.unquote(r.headers["x-autoforge-export-info"]))["printer"] == "Acme One 0.6 nozzle"
+
+
+def test_missing_nozzle_preset_warns_but_exports(client, acme):
+    job_id, _ = _job(nozzle=0.8)
+    task_id = client.post(f"/api/outputs/3mf/{job_id}/start", json={"printer": "Acme One 0.4 nozzle"}).json()["task_id"]
+    status, _ = _wait(client, task_id)
+    assert status["error"] is None and status["printer"] == "Acme One 0.4 nozzle"
+    assert "no 0.8 mm nozzle preset" in status["warnings"][0]
+    assert client.get(f"/api/outputs/tasks/{task_id}/file").status_code == 200
+
+    # the export bundle carries the warning next to the project
+    project = _project([{"layer": 6, "filament_uuid": "u-red", "enabled": True}], orca_printer="Acme One 0.4 nozzle")
+    names = zipfile.ZipFile(io.BytesIO(client.post(f"/api/outputs/export/{job_id}", json={"name": "Cat", "project": project}).content))
+    assert "Cat_model.3mf" in names.namelist()
+    assert "no 0.8 mm nozzle preset" in names.read("Cat_slicer_project_warning.txt").decode()
+
+
+def test_prepare_loads_the_preset_for_the_nozzle(client, acme):
+    import time
+
+    r = client.post("/api/outputs/3mf/printers/prepare", json={"printer": "Acme One 0.4 nozzle", "nozzle": 0.6})
+    assert r.json()["printer"] == "Acme One 0.6 nozzle"
+    profiles = OP.shared_profiles()
+    end = time.monotonic() + 10
+    while ("Acme", "machine", "Acme One 0.6 nozzle") not in profiles._resolved and time.monotonic() < end:
+        time.sleep(0.02)
+    assert ("Acme", "machine", "Acme One 0.6 nozzle") in profiles._resolved

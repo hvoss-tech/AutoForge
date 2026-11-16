@@ -399,6 +399,7 @@ export const SettingsModal: React.FC = () => {
               onClose={() => setPrinterDialogOpen(false)}
               rememberedPrinter={settings.orca_printer}
               rememberedManualSwaps={settings.orca_manual_swaps}
+              nozzle={settings.nozzle_diameter}
               onConfirm={(printer, manualSwaps) => {
                 setPrinterDialogOpen(false)
                 setSettings({ ...useAppStore.getState().settings, orca_printer: printer, orca_manual_swaps: manualSwaps })

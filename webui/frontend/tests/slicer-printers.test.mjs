@@ -11,6 +11,8 @@ import {
   searchPrinters,
   variantsOf,
   vendorsOf,
+  nozzleMatch,
+  popularPrinters,
 } from '../src/lib/slicerPrinters.ts'
 
 const p = (vendor, model, nozzle, auto_swaps = false) => ({
@@ -87,4 +89,41 @@ test('short names and nozzle labels', async () => {
   assert.equal(nozzleLabel({ ...p('Prusa', 'Prusa MK4S', '0.4'), name: 'Prusa MK4S HF0.4 nozzle' }), 'HF0.4 nozzle')
   // in the curated order, only the ones the server lists
   assert.deepEqual(popularPrinters(printers).map((x) => x.name), ['Bambu Lab A1 mini 0.4 nozzle', 'Bambu Lab X1 Carbon 0.4 nozzle', 'Anycubic Kobra 3 0.4 nozzle'])
+})
+
+test('the configured nozzle decides which preset comes first', () => {
+  const list = [p('BBL', 'Bambu Lab X1 Carbon', '0.2', true), p('BBL', 'Bambu Lab X1 Carbon', '0.4', true), p('BBL', 'Bambu Lab X1 Carbon', '0.6', true)]
+  assert.equal(searchPrinters(list, 'x1', 50, 0.6)[0].nozzle, '0.6')
+  assert.equal(variantsOf(list, 'BBL', 'Bambu Lab X1 Carbon', 0.2)[0].nozzle, '0.2')
+  // no 0.5 preset: the closest nozzle first, a tie goes to the usual 0.4
+  assert.equal(searchPrinters(list, 'x1', 50, 0.5)[0].nozzle, '0.4')
+  assert.equal(searchPrinters(list, 'x1', 50, 0.25)[0].nozzle, '0.2')
+  assert.deepEqual(variantsOf(list, 'BBL', 'Bambu Lab X1 Carbon', 0.55).map((x) => x.nozzle), ['0.6', '0.4', '0.2'])
+  const pop = [p('BBL', 'Bambu Lab A1 mini', '0.4', true), p('BBL', 'Bambu Lab A1 mini', '0.6', true)]
+  assert.deepEqual(popularPrinters(pop, 0.6).map((x) => x.name), ['Bambu Lab A1 mini 0.6 nozzle'])
+  assert.deepEqual(popularPrinters(pop, 0.8).map((x) => x.name), ['Bambu Lab A1 mini 0.4 nozzle'])
+})
+
+test('nozzle match mirrors the server: same, switched (same naming), missing', () => {
+  const x04 = p('Prusa', 'Prusa MK4S', '0.4')
+  const x06 = p('Prusa', 'Prusa MK4S', '0.6')
+  const hf06 = { ...p('Prusa', 'Prusa MK4S', '0.6'), name: 'Prusa MK4S HF0.6 nozzle' }
+  const list = [x04, hf06, x06]
+  assert.equal(nozzleMatch(list, x04, 0.4).kind, 'same')
+  assert.equal(nozzleMatch(list, x04, null).kind, 'same')
+  const switched = nozzleMatch(list, x04, 0.6)
+  assert.equal(switched.kind, 'switched')
+  assert.equal(switched.printer.name, 'Prusa MK4S 0.6 nozzle')
+  assert.equal(nozzleMatch(list, hf06, 0.6).kind, 'same')
+  const missing = nozzleMatch(list, x04, 0.8)
+  assert.equal(missing.kind, 'missing')
+  assert.equal(missing.printer.name, x04.name)
+  assert.deepEqual(missing.available, [0.4, 0.6])
+})
+
+test('picking a printer for slicer projects does not make the result stale', async () => {
+  const { staleReasons } = await import('../src/lib/staleResult.ts')
+  const run = { settings: { iterations: 100, orca_printer: '', orca_manual_swaps: null }, filamentUuids: [] }
+  const now = { iterations: 100, orca_printer: 'Bambu Lab X1 Carbon 0.4 nozzle', orca_manual_swaps: false }
+  assert.deepEqual(staleReasons(run, now, []), [])
 })

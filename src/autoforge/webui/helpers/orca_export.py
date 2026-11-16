@@ -36,6 +36,21 @@ def _library_filaments() -> dict[str, dict[str, Any]]:
     return {f.uuid: f.model_dump() for f in get_filament_service().list() if f.uuid}
 
 
+def run_nozzle(job_dir: str, project: dict[str, Any] | None) -> float | None:
+    """The nozzle (mm) the result was made for: the run's own, else the
+    project settings'. None when neither says."""
+    solution = load_solution(job_dir)
+    args = ((solution or {}).get("meta") or {}).get("args") or {}
+    settings = (project or {}).get("settings") or {}
+    for value in (args.get("nozzle_diameter"), settings.get("nozzle_diameter")):
+        try:
+            if value is not None and float(value) > 0:
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def export_plan(job_dir: str, project: dict[str, Any] | None, base: dict[str, Any] | None = None) -> tuple[SwapPlan, float, float]:
     """``(plan, layer_height, background_height)`` for the result in ``job_dir``.
 
@@ -120,9 +135,10 @@ def write_project_3mf(
     title: str,
     base: dict[str, Any] | None = None,
     progress=None,
-) -> None:
+) -> dict[str, Any]:
+    """Write the project; returns export_3mf's info (preset used, notes, warnings)."""
     plan, layer_height, background_height = export_plan(job_dir, project, base)
-    export_3mf(
+    return export_3mf(
         out_path, stl_path, plan, printer, layer_height, background_height, manual_swaps,
-        title=title, progress=progress,
+        title=title, progress=progress, nozzle=run_nozzle(job_dir, project),
     )
