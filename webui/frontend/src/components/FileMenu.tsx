@@ -1,6 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { projectFileData, useAppStore } from '../store/appStore'
-import { Box, ChevronDown, FilePlus, FileText, FolderOpen, Image as ImageIcon, PackageOpen, Save, Layers } from 'lucide-react'
+import { Box, ChevronDown, FilePlus, FileText, FolderOpen, Image as ImageIcon, PackageOpen, Printer, Save, Layers } from 'lucide-react'
 import { buildPrintPlan, printPlanText } from '../lib/printPlan'
 import { withEffectiveBaseColor } from '../lib/baseColor'
 import { describeApiError } from '../lib/apiError'
@@ -8,6 +8,10 @@ import { onUiCommand } from '../lib/uiEvents'
 import { exportFileName } from '../lib/project'
 import { downloadBlob } from '../lib/download'
 import { describeBorder, normalizeBorder } from '../lib/border'
+import { SlicerProjectDialog } from './SlicerProjectDialog'
+import { ExportProgressCard, type ExportState } from './ExportProgressCard'
+import { preparePrinter, runSlicerExport } from '../lib/slicerExport'
+import { shortPrinterName } from '../lib/slicerPrinters'
 
 
 const itemClass =
@@ -34,6 +38,13 @@ export const FileMenu: React.FC = () => {
   const projectName = useAppStore((s) => s.projectName)
   const pushToast = useAppStore((s) => s.pushToast)
   const [exporting, setExporting] = useState(false)
+  const [slicerDialogOpen, setSlicerDialogOpen] = useState(false)
+  const [slicerExport, setSlicerExport] = useState<ExportState | null>(null)
+  const slicerAbort = useRef<AbortController | null>(null)
+  const lastSlicerExport = useRef<{ printer: string; manualSwaps: boolean | null; printSettings: boolean } | null>(null)
+  const exporting3mf = slicerExport?.status === 'running'
+  const runInputsByJob = useAppStore((s) => s.runInputsByJob)
+  const setSettings = useAppStore((s) => s.setSettings)
   const named = (suffix: string, fallback: string) => exportFileName(projectName, suffix, fallback)
   // The border picked in the 3D view goes into every STL download.
   const border = normalizeBorder(settings.border)
@@ -48,12 +59,22 @@ export const FileMenu: React.FC = () => {
   // has no printable model. The swap instructions and the image are made from
   // the color layers as they are, so they work as soon as there are bands.
   const canExport = currentJob?.status === 'completed'
+  // The nozzle the result was made for (the server uses the same): the
+  // run's, else the current setting.
+  const runNozzle = currentJob ? Number(runInputsByJob[currentJob.job_id]?.settings?.nozzle_diameter) : NaN
+  const resultNozzle = Number.isFinite(runNozzle) && runNozzle > 0 ? runNozzle : settings.nozzle_diameter
   const exportHint = canExport ? undefined : 'Needs an optimizer run — the preview before a run has no printable model yet'
   const hasBands = buildPrintPlan(colorSliders, [], settings).bands.length > 0
   const canExportImage = canExport || !!previewImage
   const jobActive = !!currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
 
   useEffect(() => onUiCommand('open-file-menu', () => setOpen(true)), [])
+
+  // Opening the menu with a printer picked: load its profiles now, so a
+  // click on "Slicer project" doesn't wait for a download.
+  useEffect(() => {
+    if (open && canExport && settings.orca_printer) preparePrinter(settings.orca_printer, resultNozzle)
+  }, [open, canExport, settings.orca_printer, resultNozzle])
 
   useEffect(() => {
     if (!open) return
@@ -130,12 +151,78 @@ export const FileMenu: React.FC = () => {
           name: projectName,
           project: projectFileData(useAppStore.getState()),
           border,
+          base: useAppStore.getState().resolvedBase,
         }),
       })
     } finally {
       setExporting(false)
     }
   }
+
+  // The slicer project carries the colour layers as they are now and the
+  // base the pipeline resolved. It runs in the background with a progress
+  // card; the printer is remembered in the project, so the next export (and
+  // the .zip) use it without asking again.
+  const exportSlicerProject = async (printer: string, manualSwaps: boolean | null, printSettings: boolean) => {
+    if (!jobId || exporting3mf) return
+    lastSlicerExport.current = { printer, manualSwaps, printSettings }
+    const state = useAppStore.getState()
+    if (
+      manualSwaps !== null &&
+      (state.settings.orca_printer !== printer ||
+        state.settings.orca_manual_swaps !== manualSwaps ||
+        (state.settings.orca_autoforge_settings !== false) !== printSettings)
+    ) {
+      setSettings({ ...state.settings, orca_printer: printer, orca_manual_swaps: manualSwaps, orca_autoforge_settings: printSettings })
+    }
+    const title = `Slicer project · ${shortPrinterName(printer)}`
+    const abort = new AbortController()
+    slicerAbort.current = abort
+    setSlicerExport({ status: 'running', title, fraction: 0, stage: 'Starting' })
+    try {
+      const current = useAppStore.getState()
+      const result = await runSlicerExport(
+        jobId,
+        {
+          name: projectName,
+          project: { ...projectFileData(current), settings: withEffectiveBaseColor(current.settings, current.resolvedBase) },
+          border,
+          base: current.resolvedBase,
+          printer,
+          manual_swaps: manualSwaps,
+          autoforge_settings: printSettings,
+        },
+        (p) => setSlicerExport({ status: 'running', title, fraction: p.fraction, stage: p.stage }),
+        abort.signal,
+      )
+      downloadBlob(result.blob, named('model.3mf', `${jobId}.3mf`))
+      setSlicerExport({
+        status: 'done',
+        title: result.printer ? `Slicer project · ${shortPrinterName(result.printer)}` : title,
+        fraction: 1,
+        stage: 'Done',
+        notes: result.notes,
+        warnings: result.warnings,
+      })
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        setSlicerExport(null)
+      } else {
+        setSlicerExport({ status: 'error', title, fraction: 0, stage: '', error: err instanceof Error ? err.message : 'Export failed' })
+      }
+    } finally {
+      slicerAbort.current = null
+    }
+  }
+
+  // One click when a printer is known; otherwise ask for it first.
+  const handleSlicerProject = () => {
+    setOpen(false)
+    if (settings.orca_printer) exportSlicerProject(settings.orca_printer, settings.orca_manual_swaps ?? null, settings.orca_autoforge_settings !== false)
+    else setSlicerDialogOpen(true)
+  }
+
+  const dismissSlicerExport = useCallback(() => setSlicerExport(null), [])
 
   const handleInstructions = () => {
     setOpen(false)
@@ -248,6 +335,36 @@ export const FileMenu: React.FC = () => {
               <Box className="w-3.5 h-3.5" /> 3D model (.stl)
             </button>
           )}
+          <button
+            onClick={handleSlicerProject}
+            disabled={!canExport || isFlatforge || exporting3mf}
+            title={isFlatforge ? 'FlatForge prints one STL per colour; the slicer project is for layer-swap prints' : exportHint}
+            className={itemClass}
+            role="menuitem"
+            data-testid="download-3mf"
+          >
+            <Printer className="w-3.5 h-3.5" />
+            <span className="flex-1 min-w-0">
+              <span className="block">{exporting3mf ? 'Exporting slicer project…' : 'Slicer project (.3mf)'}</span>
+              <span className="block text-[11px] text-gray-400 truncate" data-testid="download-3mf-printer">
+                {settings.orca_printer ? `for ${shortPrinterName(settings.orca_printer)}` : 'Choose your printer…'}
+              </span>
+            </span>
+          </button>
+          {settings.orca_printer && (
+            <button
+              onClick={() => {
+                setOpen(false)
+                setSlicerDialogOpen(true)
+              }}
+              disabled={!canExport || isFlatforge || exporting3mf}
+              className={`${itemClass} pl-8 text-gray-400`}
+              role="menuitem"
+              data-testid="download-3mf-change-printer"
+            >
+              Other printer or settings…
+            </button>
+          )}
           <button onClick={handleInstructions} disabled={!hasBands} title={hasBands ? undefined : 'Add color layers first'} className={itemClass} role="menuitem" data-testid="download-instructions">
             <FileText className="w-3.5 h-3.5" /> Swap instructions (.txt)
           </button>
@@ -264,9 +381,37 @@ export const FileMenu: React.FC = () => {
           )}
           <p className="px-3 pt-1 pb-1 text-[11px] text-gray-400">
             Swap instructions, image and the .zip follow your edits; the separate .hfp is the optimizer's output.
+            {settings.orca_printer ? ' The .zip includes the slicer project.' : ''}
           </p>
         </div>
       )}
+
+      <SlicerProjectDialog
+        open={slicerDialogOpen}
+        mode="export"
+        onClose={() => setSlicerDialogOpen(false)}
+        rememberedPrinter={settings.orca_printer}
+        rememberedManualSwaps={settings.orca_manual_swaps}
+        rememberedAutoforgeSettings={settings.orca_autoforge_settings}
+        nozzle={resultNozzle}
+        onConfirm={(printer, manualSwaps, printSettings) => {
+          setSlicerDialogOpen(false)
+          exportSlicerProject(printer, manualSwaps, printSettings)
+        }}
+      />
+      <ExportProgressCard
+        state={slicerExport}
+        onCancel={() => slicerAbort.current?.abort()}
+        onRetry={() => {
+          const last = lastSlicerExport.current
+          if (last) exportSlicerProject(last.printer, last.manualSwaps, last.printSettings)
+        }}
+        onDismiss={dismissSlicerExport}
+        onChangePrinter={() => {
+          setSlicerExport(null)
+          setSlicerDialogOpen(true)
+        }}
+      />
 
       <input ref={fileInputRef} type="file" accept="application/json,.json" className="hidden" onChange={handleFileSelected} data-testid="file-menu-load-input" />
 

@@ -644,6 +644,29 @@ def build_parser() -> configargparse.ArgParser:
     )
 
     parser.add_argument(
+        "--orca_printer",
+        type=str,
+        default="",
+        help="Also write final_model.3mf, an OrcaSlicer / Bambu Studio project for this printer "
+        "(an OrcaSlicer printer preset name, e.g. 'Bambu Lab X1 Carbon 0.4 nozzle') with every swap "
+        "as a filament change. The printer's profile is downloaded from OrcaSlicer's GitHub once.",
+    )
+    parser.add_argument(
+        "--orca_autoforge_settings",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="In the slicer project, use AutoForge print settings for colour-layer prints (1 wall, all solid, "
+        "monotonic top, slower first layer, ...). On by default.",
+    )
+    parser.add_argument(
+        "--orca_manual_swaps",
+        choices=["auto", "yes", "no"],
+        default="auto",
+        help="In the slicer project, pause for a hand swap at each change (yes) or let the printer "
+        "change filament (no: AMS, MMU, tool changer). auto picks by printer.",
+    )
+
+    parser.add_argument(
         "--cap_layers",
         type=int,
         default=0,
@@ -1296,6 +1319,49 @@ def best_heights_at_output_res(
     return out
 
 
+def _export_slicer_project(args, disc_global, disc_height_image, material_colors_np, material_names, base_material):
+    """``final_model.3mf``: an OrcaSlicer / Bambu Studio project for
+    ``--orca_printer`` with the swaps as filament changes. A failure (no
+    internet for the printer's profile, a model too big for its bed) is
+    reported and leaves the other outputs alone."""
+    from autoforge.Helper.Export3MF import export_3mf, swap_plan
+    from autoforge.Helper.OrcaProfiles import ProfileError
+
+    types = []
+    try:
+        types = [str(rec.get("Type") or "PLA") for rec in load_materials_data(args)]
+    except Exception:
+        pass
+    materials = [
+        {
+            "color": "#" + "".join(f"{int(round(float(c) * 255)):02X}" for c in material_colors_np[i][:3]),
+            "name": str(material_names[i]) if i < len(material_names) else f"Filament {i + 1}",
+            "filament_type": types[i] if i < len(types) and types[i] != "nan" else "PLA",
+        }
+        for i in range(len(material_colors_np))
+    ]
+    plan = swap_plan(
+        disc_global, int(np.max(disc_height_image)), args.layer_height, args.background_height,
+        materials, base_material, args.background_color,
+    )
+    manual = {"auto": None, "yes": True, "no": False}[args.orca_manual_swaps]
+    out = os.path.join(args.output_folder, "final_model.3mf")
+    try:
+        info = export_3mf(
+            out, os.path.join(args.output_folder, "final_model.stl"), plan, args.orca_printer,
+            args.layer_height, args.background_height, manual, title="AutoForge",
+            nozzle=getattr(args, "nozzle_diameter", None),
+            autoforge_settings=getattr(args, "orca_autoforge_settings", True),
+        )
+        print(f"Slicer project for {info['printer']}: {out}")
+        for message in info["notes"]:
+            print(message)
+        for message in info["warnings"]:
+            print(f"WARNING: {message}")
+    except (ProfileError, ValueError) as e:
+        print(f"Could not write the slicer project: {e}")
+
+
 def _post_optimize_and_export(
     args,
     optimizer: FilamentOptimizer,
@@ -1544,6 +1610,16 @@ def _post_optimize_and_export(
                     os.path.join(args.output_folder, "final_model.stl"),
                     args.csv_file,
                 )
+
+                if getattr(args, "orca_printer", ""):
+                    _export_slicer_project(
+                        args,
+                        disc_global.cpu().numpy(),
+                        disc_height_image.cpu().numpy(),
+                        material_colors_np,
+                        material_names,
+                        optimizer.base_material,
+                    )
 
             print("All done. Outputs in:", args.output_folder)
             print("Happy Printing!")

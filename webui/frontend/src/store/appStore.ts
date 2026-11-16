@@ -456,6 +456,9 @@ export const defaultSettings: OptimizationSettings = {
   height_guidance: null,
   height_regions: '',
   border: DEFAULT_BORDER,
+  orca_printer: '',
+  orca_manual_swaps: null,
+  orca_autoforge_settings: true,
   visualize: false,
 }
 

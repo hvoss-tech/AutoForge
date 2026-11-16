@@ -1,5 +1,5 @@
-import React from 'react'
-import { ChevronDown, ChevronRight, Info, RotateCcw, Settings, X } from 'lucide-react'
+import React, { useState } from 'react'
+import { ChevronDown, ChevronRight, Info, Printer, RotateCcw, Settings, X } from 'lucide-react'
 import { defaultSettings, useAppStore } from '../store/appStore'
 import { NumberInput } from './ui/number-input'
 import type { OptimizationSettings as SettingsType } from '../types'
@@ -9,6 +9,8 @@ import { FilamentPicker } from './FilamentPicker'
 import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { RunLimitsEditor } from './RunLimits'
 import { BEST_OF_MAX } from '../lib/bestOf'
+import { SlicerProjectDialog } from './SlicerProjectDialog'
+import { shortPrinterName } from '../lib/slicerPrinters'
 
 type FieldType = 'number' | 'boolean' | 'select' | 'color'
 
@@ -71,6 +73,7 @@ export const SettingsModal: React.FC = () => {
   const setSettingsModalOpen = useAppStore((s) => s.setSettingsModalOpen)
   const settings = useAppStore((s) => s.settings)
   const setSettings = useAppStore((s) => s.setSettings)
+  const [printerDialogOpen, setPrinterDialogOpen] = useState(false)
   const currentJob = useAppStore((s) => s.currentJob)
   const requestConfirm = useAppStore((s) => s.requestConfirm)
   const resolvedBase = useAppStore((s) => s.resolvedBase)
@@ -103,11 +106,21 @@ export const SettingsModal: React.FC = () => {
   const handleReset = async () => {
     const ok = await requestConfirm({
       title: 'Reset settings?',
-      message: 'All settings go back to their defaults. Your image, filaments and color layers are not affected.',
+      message: 'All settings go back to their defaults. Your image, filaments, color layers and printer are not affected.',
       confirmLabel: 'Reset',
       danger: true,
     })
-    if (ok) setSettings({ ...defaultSettings, input_image: useAppStore.getState().settings.input_image })
+    if (ok) {
+      // The printer describes your machine, not a run; it stays.
+      const current = useAppStore.getState().settings
+      setSettings({
+        ...defaultSettings,
+        input_image: current.input_image,
+        orca_printer: current.orca_printer,
+        orca_manual_swaps: current.orca_manual_swaps,
+        orca_autoforge_settings: current.orca_autoforge_settings,
+      })
+    }
   }
 
   const jobActive = !!currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
@@ -337,6 +350,69 @@ export const SettingsModal: React.FC = () => {
           <section>
             <h3 className="text-xs font-semibold text-gray-200 mb-2">Print</h3>
             <div className="grid grid-cols-2 gap-x-6 gap-y-4">{BASIC_FIELDS.map((f) => renderField(f, true))}</div>
+          </section>
+
+          <section data-testid="settings-printer">
+            <h3 className="text-xs font-semibold text-gray-200 mb-2">Printer</h3>
+            <div className="flex items-center gap-3 rounded border border-gray-700 px-3 py-2">
+              <Printer className="w-4 h-4 text-gray-400 shrink-0" />
+              <div className="flex-1 min-w-0">
+                {settings.orca_printer ? (
+                  <>
+                    <div className="text-xs text-gray-100 truncate" data-testid="settings-printer-name">{settings.orca_printer}</div>
+                    <div className="text-[11px] text-gray-400">
+                      {settings.orca_manual_swaps === null || settings.orca_manual_swaps === undefined
+                        ? 'Colour changes: as the printer supports'
+                        : settings.orca_manual_swaps
+                          ? 'Colour changes: the print pauses, you swap by hand'
+                          : 'Colour changes: the printer swaps filament itself'}
+                      {settings.orca_autoforge_settings === false ? ' · printer\'s own print profile' : ' · AutoForge print settings'}
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-xs text-gray-400" data-testid="settings-printer-name">
+                    None yet. You'll be asked the first time you export a slicer project.
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={() => setPrinterDialogOpen(true)}
+                className="px-2 py-1 text-xs rounded border border-gray-600 text-gray-200 hover:bg-gray-800"
+                data-testid="settings-printer-choose"
+              >
+                {settings.orca_printer ? 'Change…' : 'Choose…'}
+              </button>
+              {settings.orca_printer && (
+                <button
+                  onClick={() => setSettings({ ...settings, orca_printer: '', orca_manual_swaps: null })}
+                  className="px-2 py-1 text-xs rounded text-gray-400 hover:text-gray-100 hover:bg-gray-800"
+                  data-testid="settings-printer-forget"
+                >
+                  Forget
+                </button>
+              )}
+            </div>
+            <p className="text-[11px] text-gray-400 mt-1.5">
+              For File › Slicer project (.3mf): an OrcaSlicer project with every colour change in place. The export .zip includes it too.
+            </p>
+            <SlicerProjectDialog
+              open={printerDialogOpen}
+              mode="choose"
+              onClose={() => setPrinterDialogOpen(false)}
+              rememberedPrinter={settings.orca_printer}
+              rememberedManualSwaps={settings.orca_manual_swaps}
+              rememberedAutoforgeSettings={settings.orca_autoforge_settings}
+              nozzle={settings.nozzle_diameter}
+              onConfirm={(printer, manualSwaps, printSettings) => {
+                setPrinterDialogOpen(false)
+                setSettings({
+                  ...useAppStore.getState().settings,
+                  orca_printer: printer,
+                  orca_manual_swaps: manualSwaps,
+                  orca_autoforge_settings: printSettings,
+                })
+              }}
+            />
           </section>
 
           <section className="border border-gray-700 rounded">

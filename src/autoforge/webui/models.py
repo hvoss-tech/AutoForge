@@ -217,6 +217,13 @@ class OptimizationSettings(CamelCaseModel):
     height_guidance: Optional[HeightGuidanceSettings] = None
     height_regions: str = ""
     border: BorderSettings = Field(default_factory=BorderSettings)
+    # The printer of File › Slicer project (an OrcaSlicer printer preset
+    # name, '' = none picked yet) and whether its colour changes pause for a
+    # hand swap (None: decided by the printer). Not optimizer inputs.
+    orca_printer: str = ""
+    orca_manual_swaps: Optional[bool] = None
+    # Apply the AutoForge print settings (Export3MF.AUTOFORGE_PRINT_SETTINGS).
+    orca_autoforge_settings: bool = True
     visualize: bool = False
 
     @model_validator(mode="after")

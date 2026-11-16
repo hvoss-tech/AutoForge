@@ -22,6 +22,10 @@ const IGNORED = new Set([
   'output_folder',
   // Always changes together with input_image, which names the change.
   'image_edit',
+  // The printer of File › Slicer project; it doesn't change the result.
+  'orca_printer',
+  'orca_manual_swaps',
+  'orca_autoforge_settings',
 ])
 
 /** Settings keys that changed since the run, plus 'active_filaments' when

@@ -86,6 +86,13 @@ export interface OptimizationSettings {
   height_regions: string
   /** Border around the exported model (lib/border); not an optimizer input. */
   border: BorderSettings
+  /** Printer of File › Slicer project (an OrcaSlicer preset name; '' = none
+   * picked yet) and whether its colour changes pause for a hand swap
+   * (null: decided by the printer). Not optimizer inputs. */
+  orca_printer?: string
+  orca_manual_swaps?: boolean | null
+  /** Use AutoForge print settings in the slicer project (on unless turned off). */
+  orca_autoforge_settings?: boolean
   visualize: boolean
 }
 

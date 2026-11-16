@@ -5,6 +5,8 @@ import os
 import shutil
 import re
 import tempfile
+import threading
+import urllib.parse
 import zipfile
 from typing import Any
 from fastapi import APIRouter, HTTPException
@@ -16,7 +18,11 @@ from ..helpers.mesh_persist import wait_for_pending_mesh
 from ..models import BorderSettings
 from ..services.optimization_service import get_optimization_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+MEDIA_TYPE_3MF = "application/vnd.ms-package.3dmanufacturing-3dmodel+xml"
+
 
 def _job_path(job_id: str, filename: str) -> str | None:
     """Resolve a job's output file, refusing to escape checkpoints_path.
@@ -128,6 +134,96 @@ async def _stl_response(job_id: str, path: str, border: BorderSettings | None, f
     return FileResponse(bordered, filename=filename, background=BackgroundTask(os.remove, bordered))
 
 
+@router.get("/3mf/printers")
+async def list_3mf_printers():
+    """The printers a slicer project can be made for (OrcaSlicer's presets)."""
+    from autoforge.Helper.Export3MF import AUTOFORGE_PRINT_SETTINGS_SUMMARY, printer_changes_filament
+    from autoforge.Helper.OrcaProfiles import load_printer_index
+
+    index = await asyncio.to_thread(load_printer_index)
+    return {
+        "orca_version": index["orca_tag"],
+        "autoforge_settings": AUTOFORGE_PRINT_SETTINGS_SUMMARY,
+        "printers": [
+            {
+                "name": p["name"],
+                "vendor": p["vendor"],
+                "model": p["model"],
+                "nozzle": p["nozzle"],
+                "bed": p["bed"],
+                "auto_swaps": printer_changes_filament(p),
+            }
+            for p in index["printers"]
+        ],
+    }
+
+
+def _write_3mf(
+    job_id: str,
+    job_dir: str,
+    stl_path: str,
+    project: dict[str, Any] | None,
+    printer: str,
+    manual_swaps: bool | None,
+    title: str,
+    base: dict[str, Any] | None,
+    out_path: str,
+    progress=None,
+    autoforge_settings: bool = True,
+) -> dict[str, Any]:
+    """Write the slicer project, turning its failures into HTTP errors.
+    Returns the preset used and any notes/warnings for the user."""
+    from autoforge.Helper.OrcaProfiles import ProfileDownloadError, ProfileError
+    from ..helpers.orca_export import ExportUnavailable, write_project_3mf
+
+    try:
+        return write_project_3mf(
+            out_path, stl_path, job_dir, project, printer, manual_swaps, title, base, progress, autoforge_settings
+        )
+    except ProfileDownloadError as e:
+        raise HTTPException(503, str(e))
+    except (ProfileError, ExportUnavailable, ValueError) as e:
+        raise HTTPException(422, str(e))
+
+
+_prefetching: set[str] = set()
+_prefetch_lock = threading.Lock()
+
+
+class PrinterRequest(BaseModel):
+    printer: str
+    # The configured nozzle (mm): the export uses that preset, so load it.
+    nozzle: float | None = None
+
+
+@router.post("/3mf/printers/prepare")
+async def prepare_3mf_printer(body: PrinterRequest):
+    """Start loading a printer's profiles (downloading them the first time)
+    while the user is still choosing, so the export doesn't wait for it."""
+    from autoforge.Helper.OrcaProfiles import ProfileError, printer_for_nozzle, shared_profiles
+
+    try:
+        printer, _, _ = printer_for_nozzle(body.printer, body.nozzle)
+    except ProfileError as e:
+        raise HTTPException(404, str(e))
+    with _prefetch_lock:
+        if printer["name"] in _prefetching:
+            return {"status": "loading", "printer": printer["name"]}
+        _prefetching.add(printer["name"])
+
+    def run() -> None:
+        try:
+            shared_profiles().prefetch(printer)
+        except Exception as e:  # noqa: BLE001 - the export reports it properly
+            logger.info("Prefetching the profiles of %s failed: %s", printer["name"], e)
+        finally:
+            with _prefetch_lock:
+                _prefetching.discard(printer["name"])
+
+    threading.Thread(target=run, name="orca-prefetch", daemon=True).start()
+    return {"status": "loading", "printer": printer["name"]}
+
+
 @router.get("/preview/{job_id}")
 async def download_preview(job_id: str):
     path = _resolve_or_404(job_id, "final_model.png", "Preview not found")
@@ -217,6 +313,8 @@ _EXPORT_FILES = [
     "swap_instructions.txt",
     "final_loss.txt",
     "project_file.hfp",
+    "final_model.3mf",
+    "slicer_project_warning.txt",
 ]
 
 
@@ -306,6 +404,126 @@ class ExportRequest(BaseModel):
     project: dict[str, Any] | None = None
     # Merged into the STL; defaults to the project settings' border.
     border: BorderSettings | None = None
+    # Slicer project (.3mf): the printer (a name from /3mf/printers), whether
+    # to pause for hand swaps (None: by printer), and the base the UI resolved.
+    printer: str | None = None
+    manual_swaps: bool | None = None
+    # AutoForge print settings (Export3MF.AUTOFORGE_PRINT_SETTINGS); None means on.
+    autoforge_settings: bool | None = None
+    base: dict[str, Any] | None = None
+
+
+def _build_3mf(job_id: str, body: "ExportRequest", report) -> tuple[str, str, dict[str, Any]]:
+    """Write the slicer project to a temp file: ``(path, download name,
+    info)``, info being the preset used and notes/warnings for the user.
+    ``report(fraction, stage)`` gets the progress. HTTPException on failure."""
+    if not body.printer:
+        raise HTTPException(422, "Pick a printer for the slicer project")
+    stl_path = _resolve_or_404(job_id, "final_model.stl", "STL not found")
+    border = body.border
+    if border is None:
+        saved = ((body.project or {}).get("settings") or {}).get("border")
+        border = BorderSettings.model_validate(saved) if saved else None
+    prefix = _export_prefix(body.name)
+    filename = f"{prefix}_model.3mf" if prefix else f"{job_id}.3mf"
+    fd, out_path = tempfile.mkstemp(suffix=".3mf")
+    os.close(fd)
+    bordered = None
+    try:
+        report(0.0, "Preparing the model")
+        wait_for_pending_mesh(job_id)
+        if border is not None and border.spec().active:
+            report(0.01, "Adding the border")
+        bordered = _bordered_copy(job_id, stl_path, border)
+        # The border takes the first 10 % when there is one.
+        start = 0.1 if bordered else 0.0
+
+        def scaled(fraction: float, stage: str) -> None:
+            report(start + (1.0 - start) * fraction, stage)
+
+        info = _write_3mf(
+            job_id, os.path.dirname(stl_path), bordered or stl_path, body.project,
+            body.printer, body.manual_swaps, prefix or job_id, body.base, out_path, scaled,
+            body.autoforge_settings is not False,
+        )
+    except BaseException:
+        os.remove(out_path)
+        raise
+    finally:
+        if bordered and os.path.exists(bordered):
+            os.remove(bordered)
+    return out_path, filename, info
+
+
+@router.post("/3mf/{job_id}")
+async def download_3mf(job_id: str, body: ExportRequest):
+    """An OrcaSlicer / Bambu Studio project for ``body.printer`` with the
+    current colour layers as filament changes and the border in the model,
+    in one request (the webui uses /3mf/{job_id}/start for its progress bar)."""
+    path, filename, info = await asyncio.to_thread(_build_3mf, job_id, body, lambda fraction, stage: None)
+    # Which preset was used and any nozzle warning, for scripted callers.
+    headers = {"X-AutoForge-Export-Info": urllib.parse.quote(json.dumps(info))}
+    return FileResponse(
+        path, media_type=MEDIA_TYPE_3MF, filename=filename, headers=headers, background=BackgroundTask(os.remove, path)
+    )
+
+
+@router.post("/3mf/{job_id}/start")
+async def start_3mf(job_id: str, body: ExportRequest):
+    """Start the slicer project in the background; poll /tasks/{id} for its
+    progress and fetch /tasks/{id}/file when it's done."""
+    from ..helpers import export_tasks
+
+    if not body.printer:
+        raise HTTPException(422, "Pick a printer for the slicer project")
+    _resolve_or_404(job_id, "final_model.stl", "STL not found")
+    prefix = _export_prefix(body.name)
+
+    def work(task) -> str:
+        try:
+            path, _, info = _build_3mf(job_id, body, task.report)
+            task.info = info
+        except HTTPException as e:
+            raise export_tasks.TaskError(e.status_code, str(e.detail))
+        except export_tasks.TaskCancelled:
+            raise
+        except Exception:
+            logger.exception("Slicer project export of %s failed", job_id)
+            raise
+        return path
+
+    task = export_tasks.start(f"{prefix}_model.3mf" if prefix else f"{job_id}.3mf", work)
+    return task.status()
+
+
+@router.get("/tasks/{task_id}")
+async def export_task_status(task_id: str):
+    from ..helpers import export_tasks
+
+    task = export_tasks.get(task_id)
+    if task is None:
+        raise HTTPException(404, "Unknown export")
+    return task.status()
+
+
+@router.delete("/tasks/{task_id}")
+async def cancel_export_task(task_id: str):
+    from ..helpers import export_tasks
+
+    if not export_tasks.cancel(task_id):
+        raise HTTPException(404, "Unknown export")
+    return {"cancelled": True}
+
+
+@router.get("/tasks/{task_id}/file")
+async def export_task_file(task_id: str):
+    from ..helpers import export_tasks
+
+    taken = export_tasks.take_file(task_id)
+    if taken is None:
+        raise HTTPException(404, "The export isn't ready, failed, or was already downloaded")
+    path, filename = taken
+    return FileResponse(path, media_type=MEDIA_TYPE_3MF, filename=filename, background=BackgroundTask(os.remove, path))
 
 
 @router.post("/export/{job_id}")
@@ -314,7 +532,7 @@ async def export_project_with_file(job_id: str, body: ExportRequest):
     if border is None:
         saved = ((body.project or {}).get("settings") or {}).get("border")
         border = BorderSettings.model_validate(saved) if saved else None
-    return await _export_zip_response(job_id, body.name, body.project, border)
+    return await _export_zip_response(job_id, body.name, body.project, border, body.base)
 
 
 @router.get("/export/{job_id}")
@@ -323,7 +541,11 @@ async def export_project(job_id: str, name: str | None = None):
 
 
 async def _export_zip_response(
-    job_id: str, name: str | None, project: dict[str, Any] | None, border: BorderSettings | None = None
+    job_id: str,
+    name: str | None,
+    project: dict[str, Any] | None,
+    border: BorderSettings | None = None,
+    base: dict[str, Any] | None = None,
 ):
     """Zip up a completed job's output files — STL (or the per-material STLs
     a FlatForge run produced), colored PLY, preview PNG, swap instructions,
@@ -348,6 +570,7 @@ async def _export_zip_response(
         await asyncio.to_thread(wait_for_pending_mesh, job_id)
         replace = await asyncio.to_thread(_edited_replacements, job_id, job_dir, project, edit_dir)
         replace.update(await asyncio.to_thread(_border_replacements, job_id, job_dir, border, edit_dir))
+        replace.update(await asyncio.to_thread(_3mf_replacement, job_id, job_dir, project, base, prefix, replace, edit_dir))
         added = await asyncio.to_thread(_write_export_zip, zip_path, job_dir, prefix, project, replace)
     except BaseException:
         os.remove(zip_path)
@@ -384,8 +607,47 @@ def _export_arcname(filename: str, prefix: str) -> str:
         "final_model.png": "result.png",
         "final_loss.txt": "loss.txt",
         "project_file.hfp": "hueforge.hfp",
+        "final_model.3mf": "model.3mf",
     }.get(filename, filename)
     return f"{prefix}_{renamed}"
+
+
+def _3mf_replacement(
+    job_id: str,
+    job_dir: str,
+    project: dict[str, Any] | None,
+    base: dict[str, Any] | None,
+    prefix: str,
+    replace: dict[str, str | None],
+    edit_dir: str,
+) -> dict[str, str]:
+    """The slicer project for the bundle, when the project has a printer
+    picked (File › Slicer project remembers it). It is built from the same
+    STL as the bundle's, border included."""
+    settings = (project or {}).get("settings") or {}
+    printer = settings.get("orca_printer")
+    stl_path = replace.get("final_model.stl") or os.path.join(job_dir, "final_model.stl")
+    if not printer or not stl_path or not os.path.exists(stl_path):
+        return {}
+    out_path = os.path.join(edit_dir, "final_model.3mf")
+    try:
+        info = _write_3mf(
+            job_id, job_dir, stl_path, project, printer, settings.get("orca_manual_swaps"),
+            prefix or job_id, base, out_path, None, settings.get("orca_autoforge_settings") is not False,
+        )
+    except HTTPException as e:
+        # The rest of the bundle is still worth having (the profile may just
+        # need internet once); File › Slicer project reports the reason.
+        logger.warning("Leaving the slicer project out of the export of %s: %s", job_id, e.detail)
+        return {}
+    files = {"final_model.3mf": out_path}
+    if info.get("warnings"):
+        # Nobody sees a dialog for the bundle: the warning travels with it.
+        note = os.path.join(edit_dir, "slicer_project_warning.txt")
+        with open(note, "w", encoding="utf-8") as f:
+            f.write(f"Slicer project for {info['printer']}\n\n" + "\n\n".join(info["warnings"]) + "\n")
+        files["slicer_project_warning.txt"] = note
+    return files
 
 
 def _edited_replacements(job_id: str, job_dir: str, project: dict[str, Any] | None, edit_dir: str) -> dict[str, str | None]:
