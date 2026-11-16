@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { projectFileData, useAppStore } from '../store/appStore'
-import { Box, ChevronDown, FilePlus, FileText, FolderOpen, Image as ImageIcon, PackageOpen, Save, Layers } from 'lucide-react'
+import { Box, ChevronDown, FilePlus, FileText, FolderOpen, Image as ImageIcon, PackageOpen, Printer, Save, Layers } from 'lucide-react'
 import { buildPrintPlan, printPlanText } from '../lib/printPlan'
 import { withEffectiveBaseColor } from '../lib/baseColor'
 import { describeApiError } from '../lib/apiError'
@@ -8,6 +8,7 @@ import { onUiCommand } from '../lib/uiEvents'
 import { exportFileName } from '../lib/project'
 import { downloadBlob } from '../lib/download'
 import { describeBorder, normalizeBorder } from '../lib/border'
+import { SlicerProjectDialog } from './SlicerProjectDialog'
 
 
 const itemClass =
@@ -35,6 +36,8 @@ export const FileMenu: React.FC = () => {
   const pushToast = useAppStore((s) => s.pushToast)
   const [exporting, setExporting] = useState(false)
   const [exporting3mf, setExporting3mf] = useState(false)
+  const [slicerDialogOpen, setSlicerDialogOpen] = useState(false)
+  const setSettings = useAppStore((s) => s.setSettings)
   const named = (suffix: string, fallback: string) => exportFileName(projectName, suffix, fallback)
   // The border picked in the 3D view goes into every STL download.
   const border = normalizeBorder(settings.border)
@@ -131,6 +134,7 @@ export const FileMenu: React.FC = () => {
           name: projectName,
           project: projectFileData(useAppStore.getState()),
           border,
+          base: useAppStore.getState().resolvedBase,
         }),
       })
     } finally {
@@ -138,27 +142,38 @@ export const FileMenu: React.FC = () => {
     }
   }
 
-  const handleExport3mf = async () => {
+  // The slicer project carries the colour layers as they are now and the
+  // base the pipeline resolved; the printer is remembered in the project, so
+  // the next .zip includes a .3mf for it too.
+  const handleExport3mf = async (printer: string, manualSwaps: boolean) => {
     if (!jobId || exporting3mf) return
     setExporting3mf(true)
-    pushToast('Preparing Bambu .3mf — the download starts when it is ready', 'info')
+    const state = useAppStore.getState()
+    if (state.settings.orca_printer !== printer || state.settings.orca_manual_swaps !== manualSwaps) {
+      setSettings({ ...state.settings, orca_printer: printer, orca_manual_swaps: manualSwaps })
+    }
+    pushToast('Preparing the slicer project — the download starts when it is ready', 'info')
     try {
-      const state = useAppStore.getState()
+      const current = useAppStore.getState()
       const project = {
-        ...projectFileData(state),
-        settings: withEffectiveBaseColor(state.settings, state.resolvedBase),
+        ...projectFileData(current),
+        settings: withEffectiveBaseColor(current.settings, current.resolvedBase),
       }
-      await downloadFromServer(`/api/outputs/3mf/${jobId}`, named('model_bambu.3mf', 'final_model_bambu.3mf'), {
+      await downloadFromServer(`/api/outputs/3mf/${jobId}`, named('model.3mf', `${jobId}.3mf`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: projectName,
           project,
           border,
+          base: current.resolvedBase,
+          printer,
+          manual_swaps: manualSwaps,
         }),
       })
     } finally {
       setExporting3mf(false)
+      setSlicerDialogOpen(false)
     }
   }
 
@@ -274,14 +289,17 @@ export const FileMenu: React.FC = () => {
             </button>
           )}
           <button
-            onClick={handleExport3mf}
+            onClick={() => {
+              setOpen(false)
+              setSlicerDialogOpen(true)
+            }}
             disabled={!canExport || isFlatforge || exporting3mf}
-            title={isFlatforge ? 'Bambu .3mf layer-swap export is only available for single-STL runs' : exportHint}
+            title={isFlatforge ? 'FlatForge prints one STL per colour; the slicer project is for layer-swap prints' : exportHint}
             className={itemClass}
             role="menuitem"
             data-testid="download-3mf"
           >
-            <Box className="w-3.5 h-3.5" /> {exporting3mf ? 'Preparing .3mf…' : 'Bambu project (.3mf)'}
+            <Printer className="w-3.5 h-3.5" /> {exporting3mf ? 'Preparing .3mf…' : 'Slicer project (.3mf)…'}
           </button>
           <button onClick={handleInstructions} disabled={!hasBands} title={hasBands ? undefined : 'Add color layers first'} className={itemClass} role="menuitem" data-testid="download-instructions">
             <FileText className="w-3.5 h-3.5" /> Swap instructions (.txt)
@@ -302,6 +320,15 @@ export const FileMenu: React.FC = () => {
           </p>
         </div>
       )}
+
+      <SlicerProjectDialog
+        open={slicerDialogOpen}
+        onClose={() => setSlicerDialogOpen(false)}
+        rememberedPrinter={settings.orca_printer}
+        rememberedManualSwaps={settings.orca_manual_swaps}
+        exporting={exporting3mf}
+        onExport={handleExport3mf}
+      />
 
       <input ref={fileInputRef} type="file" accept="application/json,.json" className="hidden" onChange={handleFileSelected} data-testid="file-menu-load-input" />
 
