@@ -373,3 +373,43 @@ def test_cli_writes_the_slicer_project_only_when_asked(acme, tmp_path, capsys):
     _export_slicer_project(args, np.array([0, 1, 1, 1]), heights, colors, ["A", "B"], 0)
     assert "Could not write the slicer project" in capsys.readouterr().out
     assert not os.path.exists(tmp_path / "final_model.3mf")
+
+
+def test_fast_vertex_merge_equals_unique():
+    rng = np.random.default_rng(0)
+    pool = rng.normal(size=(500, 3)).astype(np.float32)
+    corners = pool[rng.integers(0, 500, size=3000)]
+    vertices, triangles = E._index_mesh(corners)
+    expected = np.unique(corners, axis=0)
+    assert len(vertices) == len(expected)
+    np.testing.assert_array_equal(vertices[triangles].reshape(-1, 3), corners)
+
+
+def test_read_stl_reuses_the_last_parse(tmp_path, monkeypatch):
+    path = tmp_path / "m.stl"
+    path.write_bytes(_stl_bytes())
+    calls = []
+    original = E._read_stl
+    monkeypatch.setattr(E, "_read_stl", lambda src: calls.append(src) or original(src))
+    E.read_stl(str(path))
+    E.read_stl(str(path))
+    assert len(calls) == 1
+    path.write_bytes(_stl_bytes((5.0, 5.0, 1.0)))  # changed file: parsed again
+    os.utime(path, ns=(1, 1))
+    assert len(E.read_stl(str(path))[1]) == 12 and len(calls) == 2
+
+
+def test_export_progress_is_monotonic_and_can_stop(acme):
+    seen = []
+    E.export_3mf(io.BytesIO(), _stl_bytes(), _plan(), "Acme One 0.4 nozzle", 0.08, 0.24,
+                 progress=lambda f, stage: seen.append((f, stage)))
+    fractions = [f for f, _ in seen]
+    assert fractions == sorted(fractions) and fractions[-1] == 1.0
+    assert "Writing the 3mf" in {s for _, s in seen}
+
+    def stop(fraction, stage):
+        if stage == "Writing the 3mf":
+            raise E.Cancelled()
+
+    with pytest.raises(E.Cancelled):
+        E.export_3mf(io.BytesIO(), _stl_bytes(), _plan(), "Acme One 0.4 nozzle", 0.08, 0.24, progress=stop)

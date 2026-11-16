@@ -102,13 +102,23 @@ class LocalProfileSource:
 
 
 class GitHubProfileSource:
-    """Profiles fetched from OrcaSlicer's repository at ``tag``, cached on disk."""
+    """Profiles fetched from OrcaSlicer's repository at ``tag``, cached on disk.
 
-    _lock = threading.Lock()
+    Different files download in parallel; two threads asking for the same
+    file wait for one download."""
+
+    _locks_guard = threading.Lock()
+    _locks: dict[str, threading.Lock] = {}
 
     def __init__(self, cache_dir: str, tag: str = ORCA_TAG):
         self.cache_dir = os.path.join(cache_dir, tag)
         self.tag = tag
+        self.downloads = 0  # files fetched from GitHub (not the cache)
+
+    @classmethod
+    def _lock_for(cls, path: str) -> threading.Lock:
+        with cls._locks_guard:
+            return cls._locks.setdefault(path, threading.Lock())
 
     def _download(self, path: str) -> bytes:
         url = RAW_URL.format(tag=self.tag, path=urllib.parse.quote(path))
@@ -131,9 +141,10 @@ class GitHubProfileSource:
     def read(self, path: str) -> Any:
         cached = os.path.join(self.cache_dir, *path.split("/"))
         if not os.path.exists(cached):
-            with self._lock:
+            with self._lock_for(cached):
                 if not os.path.exists(cached):
                     data = self._download(path)
+                    self.downloads += 1
                     _load_json_bytes(data, path)  # don't cache an error page
                     os.makedirs(os.path.dirname(cached), exist_ok=True)
                     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cached), suffix=".part")
@@ -150,6 +161,20 @@ def default_cache_dir() -> str:
         return env
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
     return os.path.join(base, "autoforge", "orca-profiles")
+
+
+_shared: dict[tuple[str, str], "OrcaProfiles"] = {}
+_shared_lock = threading.Lock()
+
+
+def shared_profiles() -> "OrcaProfiles":
+    """One OrcaProfiles per profile source, kept for the process, so resolved
+    presets (and a prefetch) carry over from one export to the next."""
+    key = (os.environ.get("AUTOFORGE_ORCA_PROFILES") or "", default_cache_dir())
+    with _shared_lock:
+        if key not in _shared:
+            _shared[key] = OrcaProfiles(default_source())
+        return _shared[key]
 
 
 def default_source():
@@ -172,13 +197,16 @@ class OrcaProfiles:
     def index(self, vendor: str) -> dict[str, dict[str, str]]:
         """{kind: {preset name: sub_path}} from the vendor's ``<vendor>.json``."""
         with self._lock:
-            if vendor not in self._indexes:
-                data = self.source.read(f"{vendor}.json")
-                self._indexes[vendor] = {
-                    kind: {e["name"]: e["sub_path"] for e in data.get(key) or [] if "name" in e and "sub_path" in e}
-                    for kind, key in _KIND_LISTS.items()
-                }
-            return self._indexes[vendor]
+            if vendor in self._indexes:
+                return self._indexes[vendor]
+        # Read outside the lock: other presets keep loading meanwhile.
+        data = self.source.read(f"{vendor}.json")
+        index = {
+            kind: {e["name"]: e["sub_path"] for e in data.get(key) or [] if "name" in e and "sub_path" in e}
+            for kind, key in _KIND_LISTS.items()
+        }
+        with self._lock:
+            return self._indexes.setdefault(vendor, index)
 
     def locate(self, vendor: str, kind: str, name: str) -> tuple[str, str]:
         """(vendor, sub_path) of a preset; filaments fall back to Orca's library."""
@@ -193,11 +221,13 @@ class OrcaProfiles:
 
     def raw(self, vendor: str, kind: str, name: str) -> tuple[str, dict[str, Any]]:
         where, sub_path = self.locate(vendor, kind, name)
+        key = (where, sub_path)
         with self._lock:
-            key = (where, sub_path)
-            if key not in self._raw:
-                self._raw[key] = self.source.read(f"{where}/{sub_path}")
-            return where, self._raw[key]
+            if key in self._raw:
+                return where, self._raw[key]
+        data = self.source.read(f"{where}/{sub_path}")
+        with self._lock:
+            return where, self._raw.setdefault(key, data)
 
     def resolve(self, vendor: str, kind: str, name: str, _seen: tuple = ()) -> dict[str, Any]:
         """The preset's flat config (settings only, plus ``filament_id``)."""
@@ -225,6 +255,22 @@ class OrcaProfiles:
         with self._lock:
             self._resolved[key] = config
         return dict(config)
+
+    def prefetch(self, printer: dict[str, Any]) -> None:
+        """Load everything a project for ``printer`` (an index entry) needs:
+        its machine, process and filament presets, in parallel - so the
+        export itself doesn't wait for GitHub."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        vendor = printer["vendor"]
+        self.index(vendor)
+        if vendor != FILAMENT_LIBRARY:
+            self.index(FILAMENT_LIBRARY)
+        jobs = [("machine", printer["name"]), ("process", printer["process"])]
+        jobs += [("filament", n) for n in dict.fromkeys(printer["filaments"].values())]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for future in [pool.submit(self.resolve, vendor, kind, name) for kind, name in jobs]:
+                future.result()
 
     def is_instance(self, vendor: str, kind: str, name: str) -> bool:
         return str(self.raw(vendor, kind, name)[1].get("instantiation", "")).lower() == "true"

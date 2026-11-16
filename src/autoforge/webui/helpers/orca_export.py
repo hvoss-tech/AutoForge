@@ -119,6 +119,10 @@ def write_project_3mf(
     manual_swaps: bool | None,
     title: str,
     base: dict[str, Any] | None = None,
+    progress=None,
 ) -> None:
     plan, layer_height, background_height = export_plan(job_dir, project, base)
-    export_3mf(out_path, stl_path, plan, printer, layer_height, background_height, manual_swaps, title=title)
+    export_3mf(
+        out_path, stl_path, plan, printer, layer_height, background_height, manual_swaps,
+        title=title, progress=progress,
+    )

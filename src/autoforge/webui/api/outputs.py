@@ -5,6 +5,7 @@ import os
 import shutil
 import re
 import tempfile
+import threading
 import zipfile
 from typing import Any
 from fastapi import APIRouter, HTTPException
@@ -165,17 +166,54 @@ def _write_3mf(
     title: str,
     base: dict[str, Any] | None,
     out_path: str,
+    progress=None,
 ) -> None:
     """Write the slicer project, turning its failures into HTTP errors."""
     from autoforge.Helper.OrcaProfiles import ProfileDownloadError, ProfileError
     from ..helpers.orca_export import ExportUnavailable, write_project_3mf
 
     try:
-        write_project_3mf(out_path, stl_path, job_dir, project, printer, manual_swaps, title, base)
+        write_project_3mf(out_path, stl_path, job_dir, project, printer, manual_swaps, title, base, progress)
     except ProfileDownloadError as e:
         raise HTTPException(503, str(e))
     except (ProfileError, ExportUnavailable, ValueError) as e:
         raise HTTPException(422, str(e))
+
+
+_prefetching: set[str] = set()
+_prefetch_lock = threading.Lock()
+
+
+class PrinterRequest(BaseModel):
+    printer: str
+
+
+@router.post("/3mf/printers/prepare")
+async def prepare_3mf_printer(body: PrinterRequest):
+    """Start loading a printer's profiles (downloading them the first time)
+    while the user is still choosing, so the export doesn't wait for it."""
+    from autoforge.Helper.OrcaProfiles import ProfileError, find_printer, shared_profiles
+
+    try:
+        printer = find_printer(body.printer)
+    except ProfileError as e:
+        raise HTTPException(404, str(e))
+    with _prefetch_lock:
+        if body.printer in _prefetching:
+            return {"status": "loading"}
+        _prefetching.add(body.printer)
+
+    def run() -> None:
+        try:
+            shared_profiles().prefetch(printer)
+        except Exception as e:  # noqa: BLE001 - the export reports it properly
+            logger.info("Prefetching the profiles of %s failed: %s", body.printer, e)
+        finally:
+            with _prefetch_lock:
+                _prefetching.discard(body.printer)
+
+    threading.Thread(target=run, name="orca-prefetch", daemon=True).start()
+    return {"status": "loading"}
 
 
 @router.get("/preview/{job_id}")
@@ -364,10 +402,9 @@ class ExportRequest(BaseModel):
     base: dict[str, Any] | None = None
 
 
-@router.post("/3mf/{job_id}")
-async def download_3mf(job_id: str, body: ExportRequest):
-    """An OrcaSlicer / Bambu Studio project for ``body.printer`` with the
-    current colour layers as filament changes and the border in the model."""
+def _build_3mf(job_id: str, body: "ExportRequest", report) -> tuple[str, str]:
+    """Write the slicer project to a temp file: ``(path, download name)``.
+    ``report(fraction, stage)`` gets the progress. HTTPException on failure."""
     if not body.printer:
         raise HTTPException(422, "Pick a printer for the slicer project")
     stl_path = _resolve_or_404(job_id, "final_model.stl", "STL not found")
@@ -381,11 +418,20 @@ async def download_3mf(job_id: str, body: ExportRequest):
     os.close(fd)
     bordered = None
     try:
-        await asyncio.to_thread(wait_for_pending_mesh, job_id)
-        bordered = await asyncio.to_thread(_bordered_copy, job_id, stl_path, border)
-        await asyncio.to_thread(
-            _write_3mf, job_id, os.path.dirname(stl_path), bordered or stl_path, body.project,
-            body.printer, body.manual_swaps, prefix or job_id, body.base, out_path,
+        report(0.0, "Preparing the model")
+        wait_for_pending_mesh(job_id)
+        if border is not None and border.spec().active:
+            report(0.01, "Adding the border")
+        bordered = _bordered_copy(job_id, stl_path, border)
+        # The border takes the first 10 % when there is one.
+        start = 0.1 if bordered else 0.0
+
+        def scaled(fraction: float, stage: str) -> None:
+            report(start + (1.0 - start) * fraction, stage)
+
+        _write_3mf(
+            job_id, os.path.dirname(stl_path), bordered or stl_path, body.project,
+            body.printer, body.manual_swaps, prefix or job_id, body.base, out_path, scaled,
         )
     except BaseException:
         os.remove(out_path)
@@ -393,7 +439,73 @@ async def download_3mf(job_id: str, body: ExportRequest):
     finally:
         if bordered and os.path.exists(bordered):
             os.remove(bordered)
-    return FileResponse(out_path, media_type=MEDIA_TYPE_3MF, filename=filename, background=BackgroundTask(os.remove, out_path))
+    return out_path, filename
+
+
+@router.post("/3mf/{job_id}")
+async def download_3mf(job_id: str, body: ExportRequest):
+    """An OrcaSlicer / Bambu Studio project for ``body.printer`` with the
+    current colour layers as filament changes and the border in the model,
+    in one request (the webui uses /3mf/{job_id}/start for its progress bar)."""
+    path, filename = await asyncio.to_thread(_build_3mf, job_id, body, lambda fraction, stage: None)
+    return FileResponse(path, media_type=MEDIA_TYPE_3MF, filename=filename, background=BackgroundTask(os.remove, path))
+
+
+@router.post("/3mf/{job_id}/start")
+async def start_3mf(job_id: str, body: ExportRequest):
+    """Start the slicer project in the background; poll /tasks/{id} for its
+    progress and fetch /tasks/{id}/file when it's done."""
+    from ..helpers import export_tasks
+
+    if not body.printer:
+        raise HTTPException(422, "Pick a printer for the slicer project")
+    _resolve_or_404(job_id, "final_model.stl", "STL not found")
+    prefix = _export_prefix(body.name)
+
+    def work(task) -> str:
+        try:
+            path, _ = _build_3mf(job_id, body, task.report)
+        except HTTPException as e:
+            raise export_tasks.TaskError(e.status_code, str(e.detail))
+        except export_tasks.TaskCancelled:
+            raise
+        except Exception:
+            logger.exception("Slicer project export of %s failed", job_id)
+            raise
+        return path
+
+    task = export_tasks.start(f"{prefix}_model.3mf" if prefix else f"{job_id}.3mf", work)
+    return task.status()
+
+
+@router.get("/tasks/{task_id}")
+async def export_task_status(task_id: str):
+    from ..helpers import export_tasks
+
+    task = export_tasks.get(task_id)
+    if task is None:
+        raise HTTPException(404, "Unknown export")
+    return task.status()
+
+
+@router.delete("/tasks/{task_id}")
+async def cancel_export_task(task_id: str):
+    from ..helpers import export_tasks
+
+    if not export_tasks.cancel(task_id):
+        raise HTTPException(404, "Unknown export")
+    return {"cancelled": True}
+
+
+@router.get("/tasks/{task_id}/file")
+async def export_task_file(task_id: str):
+    from ..helpers import export_tasks
+
+    taken = export_tasks.take_file(task_id)
+    if taken is None:
+        raise HTTPException(404, "The export isn't ready, failed, or was already downloaded")
+    path, filename = taken
+    return FileResponse(path, media_type=MEDIA_TYPE_3MF, filename=filename, background=BackgroundTask(os.remove, path))
 
 
 @router.post("/export/{job_id}")

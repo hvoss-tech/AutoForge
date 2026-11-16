@@ -241,3 +241,83 @@ def test_swaps_use_the_runs_layer_height_not_edited_settings(client, acme):
     swaps, cfg = _swaps(client.post(f"/api/outputs/3mf/{job_id}", json=body).content)
     assert swaps == [("0.4800", "2")]
     assert cfg["layer_height"] == "0.08" and cfg["initial_layer_print_height"] == "0.24"
+
+
+# ------------------------------------------------- background export + progress
+
+def _wait(client, task_id, timeout=30):
+    import time
+
+    seen = []
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        status = client.get(f"/api/outputs/tasks/{task_id}").json()
+        seen.append(status["progress"])
+        if status["done"]:
+            return status, seen
+        time.sleep(0.02)
+    raise AssertionError("export did not finish")
+
+
+def test_background_export_reports_progress_and_hands_the_file_out_once(client, acme):
+    job_id, _ = _job()
+    r = client.post(f"/api/outputs/3mf/{job_id}/start", json={"printer": "Acme One 0.4 nozzle", "name": "Cat"})
+    assert r.status_code == 200
+    task_id = r.json()["task_id"]
+    status, seen = _wait(client, task_id)
+    assert status["error"] is None and status["progress"] == 1.0
+    assert seen == sorted(seen)  # never goes backwards
+    f = client.get(f"/api/outputs/tasks/{task_id}/file")
+    assert f.status_code == 200
+    assert 'filename="Cat_model.3mf"' in f.headers["content-disposition"]
+    swaps, _ = _swaps(f.content)
+    assert swaps == [("0.4800", "2"), ("0.6400", "3")]
+    assert client.get(f"/api/outputs/tasks/{task_id}/file").status_code == 404
+
+
+def test_background_export_failure_carries_its_status(client, acme):
+    job_id, _ = _job(size_mm=260)
+    task_id = client.post(f"/api/outputs/3mf/{job_id}/start", json={"printer": "Acme One 0.4 nozzle"}).json()["task_id"]
+    status, _ = _wait(client, task_id)
+    assert status["error_status"] == 422 and "bed" in status["error"]
+    assert client.get(f"/api/outputs/tasks/{task_id}/file").status_code == 404
+    assert client.post(f"/api/outputs/3mf/{job_id}/start", json={}).status_code == 422
+    assert client.get("/api/outputs/tasks/nope").status_code == 404
+
+
+def test_cancelled_export_leaves_no_file(client, acme, tmp_path, monkeypatch):
+    import threading
+
+    from autoforge.Helper import Export3MF as E
+
+    job_id, _ = _job()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    gate = threading.Event()
+    original = E.read_stl
+
+    def slow_read(src):
+        gate.wait(10)
+        return original(src)
+
+    monkeypatch.setattr(E, "read_stl", slow_read)
+    task_id = client.post(f"/api/outputs/3mf/{job_id}/start", json={"printer": "Acme One 0.4 nozzle"}).json()["task_id"]
+    assert client.delete(f"/api/outputs/tasks/{task_id}").status_code == 200
+    gate.set()
+    status, _ = _wait(client, task_id)
+    assert status["cancelled"]
+    assert client.get(f"/api/outputs/tasks/{task_id}/file").status_code == 404
+    assert os.listdir(scratch) == []
+
+
+def test_prepare_loads_the_printer_profiles_ahead(client, acme):
+    import time
+
+    assert client.post("/api/outputs/3mf/printers/prepare", json={"printer": "Nope"}).status_code == 404
+    assert client.post("/api/outputs/3mf/printers/prepare", json={"printer": "Acme One 0.4 nozzle"}).status_code == 200
+    profiles = OP.shared_profiles()
+    end = time.monotonic() + 10
+    while ("Acme", "machine", "Acme One 0.4 nozzle") not in profiles._resolved and time.monotonic() < end:
+        time.sleep(0.02)
+    assert ("Acme", "filament", "Acme PETG @Acme One") in profiles._resolved
