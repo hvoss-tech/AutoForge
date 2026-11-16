@@ -67,3 +67,24 @@ test('swap mode: the remembered choice for that printer, else what the printer c
   assert.equal(defaultManualSwaps(x1, true, mk4.name), false)
   assert.equal(defaultManualSwaps(undefined, false, ''), true)
 })
+
+test('search puts the 0.4 mm nozzle of each printer first (Enter picks it)', () => {
+  const list = [p('BBL', 'Bambu Lab X1 Carbon', '0.2', true), p('BBL', 'Bambu Lab X1 Carbon', '0.4', true), p('BBL', 'Bambu Lab X1 Carbon', '0.6', true), p('BBL', 'Bambu Lab X1E', '0.2', true), p('BBL', 'Bambu Lab X1E', '0.4', true)]
+  assert.deepEqual(searchPrinters(list, 'x1').map((x) => x.name), [
+    'Bambu Lab X1 Carbon 0.4 nozzle', 'Bambu Lab X1 Carbon 0.2 nozzle', 'Bambu Lab X1 Carbon 0.6 nozzle',
+    'Bambu Lab X1E 0.4 nozzle', 'Bambu Lab X1E 0.2 nozzle',
+  ])
+})
+
+test('short names and nozzle labels', async () => {
+  const { shortPrinterName, nozzleLabel, popularPrinters } = await import('../src/lib/slicerPrinters.ts')
+  assert.equal(shortPrinterName('Bambu Lab X1 Carbon 0.4 nozzle'), 'Bambu Lab X1 Carbon')
+  assert.equal(shortPrinterName('Snapmaker U1 (0.4 nozzle)'), 'Snapmaker U1')
+  assert.equal(shortPrinterName('Snapmaker U1 (0.4+0.6 nozzle)'), 'Snapmaker U1')
+  assert.equal(shortPrinterName('FELIX Pro 3 0.25mm nozzle'), 'FELIX Pro 3')
+  assert.equal(shortPrinterName('Raise3D Pro3 0.4 nozzle (Dual)'), 'Raise3D Pro3 0.4 nozzle (Dual)')
+  assert.equal(nozzleLabel(p('BBL', 'Bambu Lab X1 Carbon', '0.4')), '0.4 mm')
+  assert.equal(nozzleLabel({ ...p('Prusa', 'Prusa MK4S', '0.4'), name: 'Prusa MK4S HF0.4 nozzle' }), 'HF0.4 nozzle')
+  // in the curated order, only the ones the server lists
+  assert.deepEqual(popularPrinters(printers).map((x) => x.name), ['Bambu Lab A1 mini 0.4 nozzle', 'Bambu Lab X1 Carbon 0.4 nozzle', 'Anycubic Kobra 3 0.4 nozzle'])
+})
