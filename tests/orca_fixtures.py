@@ -36,6 +36,11 @@ def make_profiles(root):
             "printer_model": "Acme One", "printer_variant": "0.6", "nozzle_diameter": ["0.6"],
             "default_print_profile": "0.20mm Standard @Acme One", "default_filament_profile": ["Acme PLA @Acme One"],
         },
+        "Acme One 0.2 nozzle": {
+            "type": "machine", "name": "Acme One 0.2 nozzle", "inherits": "fdm_acme_common", "instantiation": "true",
+            "printer_model": "Acme One", "printer_variant": "0.2", "nozzle_diameter": ["0.2"],
+            "default_print_profile": "0.20mm Standard @Acme One", "default_filament_profile": ["Acme PLA @Acme One"],
+        },
         "Acme One HF0.6 nozzle": {
             "type": "machine", "name": "Acme One HF0.6 nozzle", "inherits": "fdm_acme_common", "instantiation": "true",
             "printer_model": "Acme One", "printer_variant": "HF0.6", "nozzle_diameter": ["0.6"],
@@ -75,7 +80,7 @@ def make_profiles(root):
         "0.20mm Standard @Acme One": {
             "type": "process", "name": "0.20mm Standard @Acme One", "inherits": "fdm_process_acme",
             "instantiation": "true",
-            "compatible_printers": ["Acme One 0.4 nozzle", "Acme One 0.6 nozzle", "Acme One HF0.6 nozzle", "Acme Duo 0.4 nozzle", "Acme Belt 0.4 nozzle", "Acme Big 0.5 nozzle"],
+            "compatible_printers": ["Acme One 0.4 nozzle", "Acme One 0.6 nozzle", "Acme One HF0.6 nozzle", "Acme One 0.2 nozzle", "Acme Duo 0.4 nozzle", "Acme Belt 0.4 nozzle", "Acme Big 0.5 nozzle"],
         },
         "0.16mm Optimal @Acme Lost": {
             "type": "process", "name": "0.16mm Optimal @Acme Lost", "inherits": "fdm_process_acme",
@@ -100,7 +105,7 @@ def make_profiles(root):
             "type": "filament", "name": "Acme PLA @Acme One", "inherits": "fdm_filament_acme", "instantiation": "true",
             "include": ["acme_template_variants"], "filament_id": "ACME1",
             "filament_type": ["PLA"], "filament_diameter": ["1.75"],
-            "compatible_printers": ["Acme One 0.4 nozzle", "Acme One 0.6 nozzle", "Acme One HF0.6 nozzle", "Acme Duo 0.4 nozzle", "Acme Belt 0.4 nozzle", "Acme Lost 0.4 nozzle"],
+            "compatible_printers": ["Acme One 0.4 nozzle", "Acme One 0.6 nozzle", "Acme One HF0.6 nozzle", "Acme One 0.2 nozzle", "Acme Duo 0.4 nozzle", "Acme Belt 0.4 nozzle", "Acme Lost 0.4 nozzle"],
         },
         "Acme PETG @Acme One": {
             "type": "filament", "name": "Acme PETG @Acme One", "inherits": "fdm_filament_acme", "instantiation": "true",

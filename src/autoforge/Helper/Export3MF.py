@@ -16,6 +16,7 @@ import io
 import json
 import math
 import os
+import re
 import struct
 import threading
 import uuid as _uuid
@@ -27,7 +28,9 @@ from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
-from autoforge.Helper.OrcaProfiles import OrcaProfiles, ProfileError, as_list, printer_for_nozzle, shared_profiles
+from autoforge.Helper.OrcaProfiles import (
+    OrcaProfiles, ProfileError, as_list, load_printer_index, nozzle_list, printer_for_nozzle, shared_profiles,
+)
 
 # Matches what OrcaSlicer 2.5.0 writes into its own projects.
 ORCA_VERSION = "2.5.0"
@@ -37,14 +40,80 @@ BBS_VERSION = "02.08.01.55"
 PROCESS_OVERRIDES = {
     # Light has to pass through solid plastic for the colours to mix.
     "sparse_infill_density": "100%",
-    "sparse_infill_pattern": "zig-zag",  # Orca's name for rectilinear
+    "sparse_infill_pattern": "rectilinear",
     # Purging happens in the nozzle / poop chute; a tower would stand next to the picture.
     "enable_prime_tower": "0",
     "enable_support": "0",
     # A brim would have to be cut off the picture; ironing smears the thin colour layers.
     "brim_type": "no_brim",
     "ironing_type": "no ironing",
+    # Pointless at 100 % infill, and with it on OrcaSlicer 2.5 failed to
+    # slice heightmaps on the Dremel 3D20/3D45 profiles.
+    "detect_narrow_internal_solid_infill": "0",
 }
+# Optional "AutoForge print settings" for more reliable colour-layer prints,
+# based on published presets for colour-layer (filament painting) prints and
+# the process settings of existing colour-layer 3MF exports. ("set", v) sets
+# a value; ("max", v) / ("min", v) only lower / raise a printer's own value,
+# so a printer that is already gentler keeps its setting.
+AUTOFORGE_PRINT_SETTINGS: dict[str, tuple[str, Any]] = {
+    # One wall, everything else solid infill: no sparse/solid switching
+    # between layers, so every colour layer has the same structure.
+    "wall_loops": ("set", "1"),
+    "bottom_shell_layers": ("set", "999"),
+    "bottom_shell_thickness": ("set", "0"),
+    "top_shell_layers": ("set", "1"),
+    "top_shell_thickness": ("set", "0"),
+    "top_surface_pattern": ("set", "monotonic"),
+    "bottom_surface_pattern": ("set", "rectilinear"),
+    "internal_solid_infill_pattern": ("set", "alignedrectilinear"),
+    "ensure_vertical_shell_thickness": ("set", "none"),
+    # Keep small colour islands instead of dropping them as gaps.
+    "filter_out_gap_fill": ("set", "0"),
+    # Classic walls: Arachne crashed OrcaSlicer 2.4 on AutoForge heightmaps.
+    "wall_generator": ("set", "classic"),
+    # No G2/G3 arcs: firmware without arc support prints them wrong.
+    "enable_arc_fitting": ("set", "disabled"),
+    "enable_overhang_speed": ("set", "0"),
+    # Gentler on the thin layers and the large flat base.
+    "initial_layer_speed": ("max", 30),
+    "initial_layer_infill_speed": ("max", 50),
+    "outer_wall_speed": ("max", 100),
+    "top_surface_speed": ("max", 100),
+    # Prime the nozzle before the base layer.
+    "skirt_loops": ("min", 1),
+}
+
+# For the UI: what the AutoForge print settings change, in words.
+AUTOFORGE_PRINT_SETTINGS_SUMMARY = [
+    "1 wall; every layer solid (bottom shells 999, top shell 1 layer)",
+    "Monotonic top surface, rectilinear bottom, aligned rectilinear solid infill",
+    "Classic wall generator, no vertical shell thickening, small gaps kept",
+    "Arc fitting and overhang slowdown off",
+    "Slower first layer (≤30 mm/s, infill ≤50), outer walls and top surface ≤100 mm/s",
+    "A skirt loop to prime the nozzle",
+]
+
+
+def _apply_setting(current: Any, mode: str, value: Any) -> Any:
+    """``value`` in ``current``'s shape (scalar or per-variant vector)."""
+    def one(old: Any) -> Any:
+        if mode == "set":
+            return str(value)
+        try:
+            number = float(old)
+        except (TypeError, ValueError):
+            return old  # "nil" or a percentage: leave the printer's value
+        limited = min(number, float(value)) if mode == "max" else max(number, float(value))
+        return f"{limited:g}"
+
+    if isinstance(current, list):
+        return [one(v) for v in current] if current else [one(None) if mode == "set" else str(value)]
+    if current is None and mode != "set":
+        return str(value)
+    return one(current)
+
+
 # Keys copied from the printer that are not per-filament settings even though
 # they name filaments.
 _DROP_KEYS = frozenset({
@@ -350,14 +419,28 @@ def project_settings(
     background_height: float,
     manual_swaps: bool,
     profiles: OrcaProfiles,
+    autoforge_settings: bool = False,
+    notes: list[str] | None = None,
 ) -> dict[str, Any]:
     """``Metadata/project_settings.config``: the printer's resolved machine,
-    process and filament presets, with the heightmap settings on top."""
+    process and filament presets, with the heightmap settings on top (and
+    AUTOFORGE_PRINT_SETTINGS when ``autoforge_settings``)."""
     vendor = printer["vendor"]
-    machine = pad_variants(profiles.resolve(vendor, "machine", printer["name"]), "machine")
-    process = pad_variants(profiles.resolve(vendor, "process", printer["process"]), "process")
+    defaults = load_printer_index().get("defaults") or {}
+
+    def complete(config: dict[str, Any], kind: str) -> dict[str, Any]:
+        # Every option, as in OrcaSlicer's own projects: one the presets
+        # leave out would be taken from whatever printer OrcaSlicer has
+        # loaded (another printer's bed exclusion area made delta printers
+        # refuse to slice).
+        for key, value in (defaults.get(kind) or {}).items():
+            config.setdefault(key, value)
+        return pad_variants(config, kind)
+
+    machine = complete(profiles.resolve(vendor, "machine", printer["name"]), "machine")
+    process = complete(profiles.resolve(vendor, "process", printer["process"]), "process")
     preset_names = [_filament_preset(printer, s.filament_type) for s in slots]
-    filaments = [pad_variants(profiles.resolve(vendor, "filament", n), "filament") for n in preset_names]
+    filaments = [complete(profiles.resolve(vendor, "filament", n), "filament") for n in preset_names]
 
     config: dict[str, Any] = {}
     config.update({k: v for k, v in machine.items() if k not in _DROP_KEYS})
@@ -381,9 +464,28 @@ def project_settings(
         str(i + 1) for i, f in enumerate(filaments) for _ in _vector(f.get("filament_extruder_variant", [None]))
     ]
 
-    process_changes = dict(PROCESS_OVERRIDES)
+    process_changes: dict[str, Any] = {}
+    if autoforge_settings:
+        variants = len(_vector(process.get("print_extruder_variant", [None])))
+        for key, (mode, value) in AUTOFORGE_PRINT_SETTINGS.items():
+            current = config.get(key)
+            if current is None and key in _PRINT_VARIANT_KEYS:
+                # Not in the profile (Orca's default): one value per variant.
+                changed: Any = [str(value)] * variants
+            else:
+                changed = _apply_setting(current, mode, value)
+            if changed != current:
+                process_changes[key] = changed
+    process_changes.update(PROCESS_OVERRIDES)
+    first_layer = first_layer_height(background_height, layer_height, machine.get("nozzle_diameter"))
+    if notes is not None and abs(first_layer - float(background_height)) > 1e-9:
+        notes.append(
+            f"The {float(background_height):g} mm base is thicker than this printer's nozzle can print in one layer: "
+            f"it is printed as a {first_layer:g} mm first layer plus {float(layer_height):g} mm layers. "
+            "The colour changes stay at the same heights."
+        )
     process_changes["layer_height"] = f"{float(layer_height):g}"
-    process_changes["initial_layer_print_height"] = f"{float(background_height):g}"
+    process_changes["initial_layer_print_height"] = f"{first_layer:g}"
 
     printer_changes: dict[str, Any] = {}
     min_heights = as_list(machine.get("min_layer_height"))
@@ -402,6 +504,10 @@ def project_settings(
     bx0, by0 = printer["bed"][0], printer["bed"][1]
     config["wipe_tower_x"] = [f"{bx0 + 5:g}"]
     config["wipe_tower_y"] = [f"{by0 + 5:g}"]
+    make_orca_consistent(config, printer["vendor"] == "BBL")
+    index = load_printer_index()
+    fill_nil_values(config, set(index.get("nullable") or []), defaults, set(index.get("int_options") or []))
+    clamp_to_orca_ranges(config, index.get("option_ranges") or {})
     config["flush_volumes_matrix"] = flush_matrix(config, [s.color for s in slots])
     config["flush_volumes_vector"] = ["140"] * (2 * len(slots))
 
@@ -418,9 +524,12 @@ def project_settings(
         "filament_ids": [str(f.get("filament_id") or "") for f in filaments],
         "print_compatible_printers": as_list(process.get("compatible_printers")),
         "inherits_group": [""] * (n + 2),
-        # Which settings this project changes on top of the system presets
-        # (print, each filament, printer), so Orca shows them as edits.
-        "different_settings_to_system": [";".join(sorted(process_changes))] + [""] * n + [";".join(sorted(printer_changes))],
+        # Empty on purpose: for a section with a list here, OrcaSlicer resets
+        # every unlisted option to its own resolution of the system preset
+        # (Preset::load_external_config). Some vendor profiles resolve to
+        # values it then refuses to slice (and every correction made above
+        # would have to be listed); empty, it uses this complete config as is.
+        "different_settings_to_system": [""] * (n + 2),
     })
     return config
 
@@ -509,6 +618,217 @@ def flush_matrix(config: dict[str, Any], colors: Sequence[str]) -> list[str]:
 
 
 _MAX_FLUSH_VOLUME = 20000
+
+
+def first_layer_height(background_height: float, layer_height: float, nozzle_diameter: Any) -> float:
+    """The first layer for a ``background_height`` base on this printer.
+
+    OrcaSlicer refuses layers thicker than the smallest nozzle ("Layer height
+    cannot exceed nozzle diameter"), so a 0.24 mm base on a 0.2 mm nozzle
+    becomes a 0.16 mm first layer plus one 0.08 mm layer: whole layers below
+    the base's top, so every colour change still lands on a layer top.
+    ValueError when even the layer height is too thick for the nozzle."""
+    nozzles = [n for n in (_float(v, 0.0) for v in nozzle_list(nozzle_diameter)) if n > 0]
+    base, layer = float(background_height), float(layer_height)
+    if not nozzles:
+        return base
+    smallest = min(nozzles)
+    if layer > smallest + 1e-9:
+        raise ValueError(
+            f"{layer:g} mm layers are thicker than the printer's {smallest:g} mm nozzle can print; "
+            "use a smaller layer height or a printer with a bigger nozzle"
+        )
+    if base <= smallest + 1e-9:
+        return base
+    first = base - math.ceil((base - smallest) / layer - 1e-9) * layer
+    return round(first, 6)
+
+
+def _clamp_one(value: Any, low: float | None, high: float | None) -> Any:
+    text = str(value).strip()
+    if text == "nil":
+        return value
+    percent = text.endswith("%")
+    try:
+        number = float(text[:-1] if percent else text)
+    except ValueError:
+        return value
+    clamped = number
+    if low is not None and clamped < low:
+        clamped = low
+    if high is not None and clamped > high:
+        clamped = high
+    if clamped == number:
+        return value
+    return f"{clamped:g}%" if percent else f"{clamped:g}"
+
+
+_G92_ANY = re.compile(r"^[ \t]*[gG]92[ \t]*[eE](0(\.0*)?|\.0+)[ \t]*(;.*)?$", re.M)
+_G92_EXACT = re.compile(r"^[ \t]*G92[ \t]*E(0(\.0*)?|\.0+)[ \t]*(;.*)?$", re.M)
+# OrcaSlicer's plate types and the filament option holding each one's bed temperature.
+_BED_TYPES = [
+    ("Textured PEI Plate", "textured_plate_temp"), ("High Temp Plate", "hot_plate_temp"),
+    ("Cool Plate", "cool_plate_temp"), ("Engineering Plate", "eng_plate_temp"),
+    ("Textured Cool Plate", "textured_cool_plate_temp"), ("Supertack Plate", "supertack_plate_temp"),
+]
+
+
+_WALL_SEQUENCE = {
+    "inner wall/outer wall/infill": "inner wall/outer wall",
+    "infill/inner wall/outer wall": "inner wall/outer wall",
+    "outer wall/inner wall/infill": "outer wall/inner wall",
+    "infill/outer wall/inner wall": "outer wall/inner wall",
+    "inner-outer-inner wall/infill": "inner-outer-inner wall",
+}
+
+
+def convert_legacy_options(config: dict[str, Any]) -> list[str]:
+    """Rewrite the legacy options OrcaSlicer converts on load (ConfigBase::
+    load_from_json + handle_legacy). For these two it also adds the new keys
+    to different_settings_to_system, which makes it reset every other option
+    of the project to the system preset (Prusa MK3S's wall_infill_order
+    turned a whole project back into the stock 0.2 mm profile)."""
+    changed = []
+    order = config.pop("wall_infill_order", None)
+    if order is not None:
+        order = str(order)
+        if order in _WALL_SEQUENCE:
+            config["wall_sequence"] = _WALL_SEQUENCE[order]
+        config["is_infill_first"] = "1" if order.startswith("infill/") else "0"
+        changed += ["wall_infill_order", "wall_sequence", "is_infill_first"]
+    if str(config.get("support_type")) == "hybrid(auto)":
+        config["support_type"] = "tree(auto)"
+        config["support_style"] = "tree_hybrid"
+        changed += ["support_type", "support_style"]
+    return changed
+
+
+def make_orca_consistent(config: dict[str, Any], is_bbl: bool) -> list[str]:
+    """Fix the contradictions in some vendor profiles that OrcaSlicer refuses
+    to slice (Print::validate / PrintConfig validate), the way its messages
+    ask. Returns the keys changed."""
+    changed = convert_legacy_options(config)
+    relative = str(_vector(config.get("use_relative_e_distances", "1"))[0]) == "1"
+    # Some profiles write single G-code options as a one-element list.
+    def text(key: str) -> str:
+        value = config.get(key)
+        return str((value[0] if value else "") if isinstance(value, list) else (value or ""))
+
+    before = text("before_layer_change_gcode")
+    layer = text("layer_change_gcode")
+    if relative:
+        # Lower-case "g92 e0" is refused; Marlin needs a reset every layer.
+        def upper(m: "re.Match[str]") -> str:  # only the letters change
+            return re.sub(r"^([ \t]*)[gG]92([ \t]*)[eE]", r"\1G92\2E", m.group(0))
+
+        fixed_before = _G92_ANY.sub(upper, before)
+        fixed_layer = _G92_ANY.sub(upper, layer)
+        # OrcaSlicer's source limits this to Marlin, but OrcaSlicer 2.5.0 as
+        # shipped also refused a Klipper profile without it (Anycubic Kobra
+        # S1 Max). G92 E0 is a plain extruder reset on every firmware.
+        if (not is_bbl
+                and not _G92_EXACT.search(fixed_before) and not _G92_EXACT.search(fixed_layer)):
+            fixed_layer = (fixed_layer.rstrip("\n") + "\n" if fixed_layer.strip() else "") + "G92 E0 ; reset extruder (relative E)\n"
+    else:
+        # Absolute E: OrcaSlicer tracks E itself, a reset is refused.
+        fixed_before = _G92_ANY.sub("", before)
+        fixed_layer = _G92_ANY.sub("", layer)
+    for key, old, new in (("before_layer_change_gcode", before, fixed_before), ("layer_change_gcode", layer, fixed_layer)):
+        if new != old:
+            config[key] = [new] if isinstance(config.get(key), list) else new
+            changed.append(key)
+
+    # Firmware retraction can't be combined with wipe. Always listed as
+    # changed: OrcaSlicer's own resolution of such a profile can have wipe
+    # on even where ours has it off, and it uses its own for unlisted keys.
+    if str(config.get("use_firmware_retraction", "0")) == "1":
+        wipe = config.get("wipe")
+        config["wipe"] = ["0"] * max(1, len(wipe) if isinstance(wipe, list) else 1)
+        changed.append("wipe")
+        value = config.get("filament_wipe")
+        if isinstance(value, list) and any(str(v) == "1" for v in value):
+            config["filament_wipe"] = ["0" if str(v) == "1" else v for v in value]
+            changed.append("filament_wipe")
+
+    # A bridge line may not be wider than the smallest nozzle.
+    nozzles = [n for n in (_float(v, 0.0) for v in nozzle_list(config.get("nozzle_diameter"))) if n > 0]
+    if nozzles and config.get("bridge_line_width") is not None:
+        raw = str(_vector(config["bridge_line_width"])[0])
+        width = _float(raw.rstrip("%"), 0.0) * (max(nozzles) / 100 if raw.endswith("%") else 1)
+        if width > min(nozzles) + 1e-9:
+            config["bridge_line_width"] = f"{min(nozzles):g}"
+            changed.append("bridge_line_width")
+
+    # [""] is no script, but the OrcaSlicer CLI refuses any non-empty list.
+    scripts = config.get("post_process")
+    if isinstance(scripts, list) and scripts and not any(str(v).strip() for v in scripts):
+        config["post_process"] = []
+        changed.append("post_process")
+
+    # A plate type every filament has a bed temperature for (0 = unsupported).
+    def supported(temp_key: str) -> bool:
+        temps = config.get(temp_key)
+        return temps is None or all(_float(t, 0.0) > 0 for t in _vector(temps))
+
+    preferred = str(config.get("default_bed_type") or config.get("curr_bed_type") or "")
+    keys = dict(_BED_TYPES)
+    if not (preferred in keys and supported(keys[preferred])):
+        preferred = next((name for name, key in _BED_TYPES if supported(key)), "Textured PEI Plate")
+    if config.get("curr_bed_type") != preferred:
+        config["curr_bed_type"] = preferred
+        changed.append("curr_bed_type")
+    return changed
+
+
+def fill_nil_values(config: dict[str, Any], nullable: set[str], defaults: dict[str, Any],
+                    int_options: set[str] | None = None) -> list[str]:
+    """Replace "nil" ("use the printer's value") where OrcaSlicer refuses it:
+    options that aren't nullable, and integer ones, whose nil fails its range
+    check (Anycubic Kobra S1 Max's filament_flush_temp). A filament override
+    gets the printer's own value, anything else OrcaSlicer's default."""
+    int_options = int_options or set()
+    if not nullable and not int_options:
+        return []
+    flat = {}
+    for section in defaults.values():
+        flat.update(section)
+    changed = []
+    for key, value in list(config.items()):
+        if not isinstance(value, list) or "nil" not in value:
+            continue
+        if key in nullable and key not in int_options:
+            continue
+        base = config.get(key[len("filament_"):]) if key.startswith("filament_") else None
+        fallback = _vector(base)[0] if base not in (None, [], "nil", ["nil"]) else _vector(flat.get(key, ["0"]))[0]
+        if str(fallback) == "nil":
+            fallback = "0"
+        config[key] = [fallback if v == "nil" else v for v in value]
+        changed.append(key)
+    return changed
+
+
+def clamp_to_orca_ranges(config: dict[str, Any], ranges: dict[str, Any]) -> list[str]:
+    """Bring values into OrcaSlicer's allowed range for each option.
+
+    Some vendor profiles carry values OrcaSlicer itself refuses a project
+    for ("Param values in 3mf/config error: ... not in range", e.g. an
+    exhaust fan at 255 where 0..100 is allowed). Returns the keys changed."""
+    changed = []
+    # Filament overrides (filament_z_hop, ...) are checked against their
+    # printer option's range once OrcaSlicer applies them.
+    ranges = dict(ranges)
+    for key in list(config):
+        if key.startswith("filament_") and key not in ranges and key[len("filament_"):] in ranges:
+            ranges[key] = ranges[key[len("filament_"):]]
+    for key, (low, high) in ranges.items():
+        if key not in config:
+            continue
+        value = config[key]
+        fixed = [_clamp_one(v, low, high) for v in value] if isinstance(value, list) else _clamp_one(value, low, high)
+        if fixed != value:
+            config[key] = fixed
+            changed.append(key)
+    return changed
 
 
 def _float(value: Any, default: float) -> float:
@@ -630,9 +950,12 @@ def export_3mf(
     profiles: OrcaProfiles | None = None,
     progress: Progress | None = None,
     nozzle: float | None = None,
+    autoforge_settings: bool = False,
 ) -> dict[str, Any]:
     """Write the project for ``printer_name`` (a name from the printer index).
 
+    ``autoforge_settings``: also apply AUTOFORGE_PRINT_SETTINGS (more reliable
+    colour-layer prints).
     ``nozzle``: the nozzle (mm) the result was made for. The printer's preset
     for that nozzle is used; without one the picked preset stays and the
     result carries a warning. Returns ``{"printer": preset used, "notes":
@@ -650,11 +973,13 @@ def export_3mf(
         manual_swaps = not printer_changes_filament(printer)
     profiles = profiles or shared_profiles()
 
+    notes: list[str] = []
     report(0.02, "Loading the printer settings")
     with ThreadPoolExecutor(max_workers=1) as pool:
         # The presets (maybe a download) and the STL load side by side.
         settings_job = pool.submit(
-            project_settings, printer, plan.slots, layer_height, background_height, manual_swaps, profiles
+            project_settings, printer, plan.slots, layer_height, background_height, manual_swaps, profiles,
+            autoforge_settings, notes,
         )
         report(0.05, "Reading the model")
         vertices, triangles = read_stl(stl)
@@ -714,7 +1039,7 @@ def export_3mf(
             "  </header>\n</config>\n",
         )
     report(1.0, "Done")
-    return {"printer": printer["name"], "notes": [note] if note else [], "warnings": [warning] if warning else []}
+    return {"printer": printer["name"], "notes": ([note] if note else []) + notes, "warnings": [warning] if warning else []}
 
 
 __all__ = [

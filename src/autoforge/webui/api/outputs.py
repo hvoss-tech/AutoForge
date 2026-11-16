@@ -137,12 +137,13 @@ async def _stl_response(job_id: str, path: str, border: BorderSettings | None, f
 @router.get("/3mf/printers")
 async def list_3mf_printers():
     """The printers a slicer project can be made for (OrcaSlicer's presets)."""
-    from autoforge.Helper.Export3MF import printer_changes_filament
+    from autoforge.Helper.Export3MF import AUTOFORGE_PRINT_SETTINGS_SUMMARY, printer_changes_filament
     from autoforge.Helper.OrcaProfiles import load_printer_index
 
     index = await asyncio.to_thread(load_printer_index)
     return {
         "orca_version": index["orca_tag"],
+        "autoforge_settings": AUTOFORGE_PRINT_SETTINGS_SUMMARY,
         "printers": [
             {
                 "name": p["name"],
@@ -168,6 +169,7 @@ def _write_3mf(
     base: dict[str, Any] | None,
     out_path: str,
     progress=None,
+    autoforge_settings: bool = True,
 ) -> dict[str, Any]:
     """Write the slicer project, turning its failures into HTTP errors.
     Returns the preset used and any notes/warnings for the user."""
@@ -175,7 +177,9 @@ def _write_3mf(
     from ..helpers.orca_export import ExportUnavailable, write_project_3mf
 
     try:
-        return write_project_3mf(out_path, stl_path, job_dir, project, printer, manual_swaps, title, base, progress)
+        return write_project_3mf(
+            out_path, stl_path, job_dir, project, printer, manual_swaps, title, base, progress, autoforge_settings
+        )
     except ProfileDownloadError as e:
         raise HTTPException(503, str(e))
     except (ProfileError, ExportUnavailable, ValueError) as e:
@@ -404,6 +408,8 @@ class ExportRequest(BaseModel):
     # to pause for hand swaps (None: by printer), and the base the UI resolved.
     printer: str | None = None
     manual_swaps: bool | None = None
+    # AutoForge print settings (Export3MF.AUTOFORGE_PRINT_SETTINGS); None means on.
+    autoforge_settings: bool | None = None
     base: dict[str, Any] | None = None
 
 
@@ -438,6 +444,7 @@ def _build_3mf(job_id: str, body: "ExportRequest", report) -> tuple[str, str, di
         info = _write_3mf(
             job_id, os.path.dirname(stl_path), bordered or stl_path, body.project,
             body.printer, body.manual_swaps, prefix or job_id, body.base, out_path, scaled,
+            body.autoforge_settings is not False,
         )
     except BaseException:
         os.remove(out_path)
@@ -626,7 +633,7 @@ def _3mf_replacement(
     try:
         info = _write_3mf(
             job_id, job_dir, stl_path, project, printer, settings.get("orca_manual_swaps"),
-            prefix or job_id, base, out_path,
+            prefix or job_id, base, out_path, None, settings.get("orca_autoforge_settings") is not False,
         )
     except HTTPException as e:
         # The rest of the bundle is still worth having (the profile may just

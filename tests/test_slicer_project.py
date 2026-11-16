@@ -235,11 +235,9 @@ def test_project_settings_carry_full_presets_and_heightmap_overrides(acme):
     assert cfg["min_layer_height"] == ["0.04"]  # the printer's 0.07 would clamp 0.04 layers
     assert cfg["manual_filament_change"] == "1"
     assert cfg["change_filament_gcode"].rstrip().endswith("M601")
-    changed = cfg["different_settings_to_system"]
-    assert len(changed) == 3 + 2  # print, one per filament, printer
-    assert set(changed[0].split(";")) == set(E.PROCESS_OVERRIDES) | {"layer_height", "initial_layer_print_height"}
-    assert changed[1:4] == ["", "", ""]
-    assert {"min_layer_height", "manual_filament_change", "change_filament_gcode"} <= set(changed[-1].split(";"))
+    # Empty: OrcaSlicer would reset every unlisted option to its own system
+    # preset (VIRTU E3, deltas: refused to slice); empty, it uses this config.
+    assert cfg["different_settings_to_system"] == [""] * (3 + 2)
     assert "compatible_printers" not in cfg
 
 
@@ -432,7 +430,7 @@ def test_preset_follows_the_results_nozzle(acme):
 def test_missing_nozzle_keeps_the_preset_and_warns(acme):
     printer, note, warning = OP.printer_for_nozzle("Acme One 0.4 nozzle", 0.8)
     assert printer["name"] == "Acme One 0.4 nozzle" and note is None
-    assert "no 0.8 mm nozzle preset for the Acme One (only 0.4, 0.6 mm)" in warning
+    assert "no 0.8 mm nozzle preset for the Acme One (only 0.2, 0.4, 0.6 mm)" in warning
     assert "set the nozzle diameter to 0.8 mm" in warning
 
 
@@ -463,3 +461,265 @@ def test_cli_warns_about_a_missing_nozzle_preset(acme, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "WARNING: OrcaSlicer has no 0.8 mm nozzle preset" in out
     assert os.path.exists(tmp_path / "final_model.3mf")
+
+
+# ---------------------------------------------------------- AutoForge print settings
+
+def test_print_settings_are_applied_only_when_asked(acme):
+    printer = OP.find_printer("Acme One 0.4 nozzle")
+    plain = E.project_settings(printer, _slots("PLA", "PLA"), 0.08, 0.24, False, acme)
+    tuned = E.project_settings(printer, _slots("PLA", "PLA"), 0.08, 0.24, False, acme, autoforge_settings=True)
+    assert "wall_loops" not in plain and plain["outer_wall_speed"] == ["200"]
+    assert tuned["wall_loops"] == "1"
+    assert tuned["bottom_shell_layers"] == "999" and tuned["top_shell_layers"] == "1"
+    assert tuned["top_surface_pattern"] == "monotonic"
+    assert tuned["sparse_infill_pattern"] == plain["sparse_infill_pattern"] == "rectilinear"
+    assert tuned["wall_generator"] == "classic" and tuned["enable_arc_fitting"] == "disabled"
+    # a cap keeps the profile's vector shape
+    assert tuned["outer_wall_speed"] == ["100"]
+    # not in the profile: written per print variant
+    assert tuned["initial_layer_speed"] == ["30"]
+    assert tuned["skirt_loops"] == "1"
+
+
+def test_print_setting_caps_never_speed_a_printer_up(acme):
+    assert E._apply_setting(["60", "300"], "max", 100) == ["60", "100"]
+    assert E._apply_setting("2", "min", 1) == "2"
+    assert E._apply_setting("0", "min", 1) == "1"
+    assert E._apply_setting(["nil"], "max", 100) == ["nil"]  # Orca's "use the default" stays
+    assert E._apply_setting("50%", "max", 100) == "50%"
+
+
+def test_every_print_setting_is_a_known_orca_key():
+    """A typo would be ignored by OrcaSlicer without a word; the bundled
+    Orca project keys (from an Orca 2.5 export) list what exists."""
+    known = set(json.load(open(os.path.join(os.path.dirname(__file__), "data", "orca25_project_keys.json"))))
+    assert set(E.AUTOFORGE_PRINT_SETTINGS) <= known
+    assert set(E.PROCESS_OVERRIDES) <= known
+
+
+# ------------------------------------------------ what OrcaSlicer would refuse
+
+def test_option_ranges_come_from_orcas_print_config(tmp_path):
+    cpp = tmp_path / "PrintConfig.cpp"
+    cpp.write_text("""
+    const int max_temp = 1500;
+    def = this->add("complete_print_exhaust_fan_speed", coInts);
+    def->min = 0;
+    def->max = 100;
+    def = this->add_nullable("retraction_distances_when_cut", coFloats);
+    def->min = 10;
+    def->max = 18;
+    def = this->add("nozzle_temperature", coInts);
+    def->min = 0;
+    def->max = max_temp;
+    def = this->add("chamber_temperature", coInts);
+    def->min = -max_temp;
+    def = this->add("some_string", coString);
+    def->min = SOMETHING_ELSE;
+    """)
+    assert OP.extract_option_ranges(str(cpp)) == {
+        "complete_print_exhaust_fan_speed": [0.0, 100.0],
+        "retraction_distances_when_cut": [10.0, 18.0],
+        "nozzle_temperature": [0.0, 1500.0],
+        "chamber_temperature": [-1500.0, None],
+    }
+
+
+def test_bundled_index_has_orcas_option_ranges():
+    ranges = OP.load_printer_index()["option_ranges"]
+    assert ranges["retraction_distances_when_cut"] == [10.0, 18.0]
+    assert ranges["complete_print_exhaust_fan_speed"] == [0.0, 100.0]
+
+
+def test_out_of_range_profile_values_are_clamped():
+    """Creality K2 (30 mm cut retraction) and Cubicon (exhaust fan 255) had
+    values OrcaSlicer refuses a project for."""
+    cfg = {
+        "retraction_distances_when_cut": ["30", "nil", "12"],
+        "complete_print_exhaust_fan_speed": ["255", "60"],
+        "wall_loops": "3",
+        "top_surface_speed": "150%",
+    }
+    ranges = {"retraction_distances_when_cut": [10, 18], "complete_print_exhaust_fan_speed": [0, 100],
+              "wall_loops": [0, 1000], "top_surface_speed": [0, 100]}
+    changed = E.clamp_to_orca_ranges(cfg, ranges)
+    assert cfg["retraction_distances_when_cut"] == ["18", "nil", "12"]
+    assert cfg["complete_print_exhaust_fan_speed"] == ["100", "60"]
+    assert cfg["wall_loops"] == "3" and cfg["top_surface_speed"] == "100%"
+    assert sorted(changed) == ["complete_print_exhaust_fan_speed", "retraction_distances_when_cut", "top_surface_speed"]
+
+
+@pytest.mark.parametrize("base, layer, nozzle, first", [
+    (0.24, 0.08, ["0.4"], 0.24),
+    (0.24, 0.08, ["0.2"], 0.16),
+    (0.24, 0.04, ["0.2"], 0.2),
+    (0.24, 0.08, ["0.8", "0.4"], 0.24),
+    (0.24, 0.08, ["0.8", "0.2"], 0.16),  # the smallest nozzle counts
+    (0.3, 0.1, "0.25", 0.2),
+])
+def test_first_layer_fits_the_nozzle_and_keeps_layer_tops(base, layer, nozzle, first):
+    got = E.first_layer_height(base, layer, nozzle)
+    assert got == pytest.approx(first)
+    smallest = min(float(n) for n in (nozzle if isinstance(nozzle, list) else [nozzle]))
+    assert got <= smallest + 1e-9
+    steps = (base - got) / layer
+    assert steps == pytest.approx(round(steps))  # the base top is a layer top
+
+
+def test_layers_thicker_than_the_nozzle_are_refused():
+    with pytest.raises(ValueError, match="nozzle"):
+        E.first_layer_height(0.24, 0.25, ["0.2"])
+
+
+def test_small_nozzle_export_splits_the_base_and_says_so(acme):
+    buf = io.BytesIO()
+    info = E.export_3mf(buf, _stl_bytes(), _plan(), "Acme One 0.4 nozzle", 0.08, 0.24, nozzle=0.2)
+    assert info["printer"] == "Acme One 0.2 nozzle"
+    assert any("0.16 mm first layer" in n for n in info["notes"])
+    cfg = json.loads(zipfile.ZipFile(io.BytesIO(buf.getvalue())).read("Metadata/project_settings.config"))
+    assert cfg["initial_layer_print_height"] == "0.16"
+    layers = ET.fromstring(zipfile.ZipFile(io.BytesIO(buf.getvalue())).read("Metadata/custom_gcode_per_layer.xml")).findall(".//layer")
+    assert [l.attrib["top_z"] for l in layers] == ["0.3200", "0.4000", "0.4800"]
+
+
+def test_vendor_profile_contradictions_are_resolved_like_orca_asks():
+    # relative E on Marlin needs a reset each layer
+    cfg = {"use_relative_e_distances": "1", "gcode_flavor": "marlin", "layer_change_gcode": ";AFTER", "before_layer_change_gcode": ""}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert cfg["layer_change_gcode"].splitlines()[-1].startswith("G92 E0")
+    # ... on Klipper too (OrcaSlicer 2.5.0 refused a Klipper profile without it)
+    cfg = {"use_relative_e_distances": "1", "gcode_flavor": "klipper", "layer_change_gcode": ";AFTER"}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert "G92 E0" in cfg["layer_change_gcode"]
+    # ... but not on Bambu printers, which don't need it
+    cfg = {"use_relative_e_distances": "1", "gcode_flavor": "marlin", "layer_change_gcode": ";AFTER"}
+    E.make_orca_consistent(cfg, is_bbl=True)
+    assert cfg["layer_change_gcode"] == ";AFTER"
+    # lower case is refused: made upper case
+    cfg = {"use_relative_e_distances": "1", "gcode_flavor": "klipper", "before_layer_change_gcode": "g92 e0 ; reset"}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert cfg["before_layer_change_gcode"] == "G92 E0 ; reset"
+    # absolute E: the reset goes (Dremel 3D40)
+    cfg = {"use_relative_e_distances": "0", "before_layer_change_gcode": ";BEFORE\nG92 E0\nM117", "layer_change_gcode": ""}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert "G92" not in cfg["before_layer_change_gcode"] and "M117" in cfg["before_layer_change_gcode"]
+    # firmware retraction and wipe (VIRTU E3, E3NG)
+    cfg = {"use_firmware_retraction": "1", "wipe": ["1", "1"], "filament_wipe": ["nil", "1"]}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert cfg["wipe"] == ["0", "0"] and cfg["filament_wipe"] == ["nil", "0"]
+    # bridge line wider than the smaller nozzle (Snapmaker U1 0.4+0.6)
+    cfg = {"nozzle_diameter": ["0.4", "0.6"], "bridge_line_width": "100%"}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert cfg["bridge_line_width"] == "0.4"
+    # a plate type all filaments have a bed temperature for (Creality K2 Pro)
+    cfg = {"cool_plate_temp": ["0", "0"], "textured_plate_temp": ["55", "60"]}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert cfg["curr_bed_type"] == "Textured PEI Plate"
+    cfg = {"default_bed_type": "Cool Plate", "cool_plate_temp": ["35"], "textured_plate_temp": ["55"]}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert cfg["curr_bed_type"] == "Cool Plate"
+    # an empty script entry is no script (the CLI refuses any)
+    cfg = {"post_process": [""]}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert cfg["post_process"] == []
+    cfg = {"post_process": ["/usr/bin/thumbs"]}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert cfg["post_process"] == ["/usr/bin/thumbs"]
+
+
+def test_filament_overrides_get_their_printer_options_range():
+    cfg = {"filament_retraction_distances_when_cut": ["30", "nil"]}
+    E.clamp_to_orca_ranges(cfg, {"retraction_distances_when_cut": [10, 18]})
+    assert cfg["filament_retraction_distances_when_cut"] == ["18", "nil"]
+
+
+def test_project_holds_every_option_and_lists_no_differences(acme, monkeypatch):
+    """OrcaSlicer fills a missing option from whatever printer it has loaded
+    and resets unlisted ones to its own system preset; a complete config with
+    empty difference lists is used exactly as written."""
+    index = dict(OP.load_printer_index())
+    index["defaults"] = {"machine": {"bed_exclude_area": ["0x0"]}, "process": {"skirt_distance": "2"}, "filament": {"filament_notes": [""]}}
+    monkeypatch.setattr(OP, "_index_cache", index)
+    printer = OP.find_printer("Acme One 0.4 nozzle")
+    cfg = E.project_settings(printer, _slots("PLA", "PLA"), 0.08, 0.24, False, acme)
+    assert cfg["bed_exclude_area"] == ["0x0"] and cfg["skirt_distance"] == "2"
+    assert cfg["filament_notes"] == ["", ""]
+    assert set(cfg["different_settings_to_system"]) == {""}
+
+
+def test_nozzle_lists_written_as_one_string_are_split():
+    assert OP.nozzle_list(["0.4,0.4"]) == ["0.4", "0.4"]
+    assert OP.nozzle_list("0.4") == ["0.4"]
+    assert E.first_layer_height(0.24, 0.08, ["0.6,0.2"]) == pytest.approx(0.16)
+
+
+def test_bundled_index_has_no_pellet_nozzles():
+    names = {p["name"] for p in OP.load_printer_index()["printers"]}
+    assert not names & {"Ginger G1 5.0 nozzle", "Ginger G1 8.0 nozzle", "FELIX Food Single 4.00mm nozzle"}
+    assert all(float(p["nozzle"]) <= OP.MAX_NOZZLE_MM for p in OP.load_printer_index()["printers"])
+
+
+def test_gcode_written_as_a_list_stays_gcode():
+    """Prusa MK4S / CORE One write layer_change_gcode as ["..."]; turning
+    that into the text "['...']" made OrcaSlicer refuse to slice."""
+    cfg = {"use_relative_e_distances": "1", "gcode_flavor": "marlin2",
+           "layer_change_gcode": [";AFTER_LAYER_CHANGE\n;[layer_z]"], "before_layer_change_gcode": [";BEFORE"]}
+    E.make_orca_consistent(cfg, is_bbl=False)
+    assert isinstance(cfg["layer_change_gcode"], list)
+    assert cfg["layer_change_gcode"][0].startswith(";AFTER_LAYER_CHANGE\n;[layer_z]\nG92 E0")
+    assert cfg["before_layer_change_gcode"] == [";BEFORE"]
+
+
+@pytest.mark.parametrize("order, sequence, infill_first", [
+    ("infill/outer wall/inner wall", "outer wall/inner wall", "1"),
+    ("inner wall/outer wall/infill", "inner wall/outer wall", "0"),
+    ("inner-outer-inner wall/infill", "inner-outer-inner wall", "0"),
+])
+def test_legacy_wall_order_is_converted_like_orca_does(order, sequence, infill_first):
+    """Left in, OrcaSlicer converts it on load and marks the project as
+    changed - and then resets the whole project to the system preset."""
+    cfg = {"wall_infill_order": order}
+    E.convert_legacy_options(cfg)
+    assert "wall_infill_order" not in cfg
+    assert cfg["wall_sequence"] == sequence and cfg["is_infill_first"] == infill_first
+
+
+def test_legacy_hybrid_support_is_converted():
+    cfg = {"support_type": "hybrid(auto)"}
+    E.convert_legacy_options(cfg)
+    assert cfg == {"support_type": "tree(auto)", "support_style": "tree_hybrid"}
+
+
+def test_nil_only_stays_where_orca_allows_it():
+    cfg = {"filament_flush_temp": ["nil", "220"], "filament_retraction_length": ["nil", "0.8"], "name": "x"}
+    changed = E.fill_nil_values(cfg, {"filament_retraction_length"}, {"filament": {"filament_flush_temp": ["0"]}})
+    assert cfg["filament_flush_temp"] == ["0", "220"]
+    assert cfg["filament_retraction_length"] == ["nil", "0.8"]
+    assert changed == ["filament_flush_temp"]
+
+
+def test_bundled_index_knows_nullable_and_integer_options():
+    index = OP.load_printer_index()
+    assert "filament_retraction_length" in index["nullable"]
+    assert "filament_flush_temp" in index["nullable"] and "filament_flush_temp" in index["int_options"]
+
+
+def test_nil_in_integer_options_takes_the_printers_value():
+    """Kobra S1 Max: filament_flush_temp "nil" is nullable but an int, and
+    OrcaSlicer's range check refuses an int nil."""
+    cfg = {"filament_flush_temp": ["nil", "nil"], "flush_temp": ["230"],
+           "filament_retraction_length": ["nil", "nil"], "retraction_length": ["0.8"]}
+    E.fill_nil_values(cfg, {"filament_flush_temp", "filament_retraction_length"}, {}, {"filament_flush_temp"})
+    assert cfg["filament_flush_temp"] == ["230", "230"]
+    assert cfg["filament_retraction_length"] == ["nil", "nil"]  # a float nil is fine
+
+
+def test_nullable_options_come_from_orcas_print_config(tmp_path):
+    cpp = tmp_path / "PrintConfig.cpp"
+    cpp.write_text(
+        'const std::vector<std::string> filament_extruder_override_keys = {\n    "filament_z_hop", "filament_wipe"\n};\n'
+        'def = this->add("filament_flush_temp", coInts);\n'
+        'def = this->add("long_retractions_when_cut", coBools);\n    def->nullable = true;\n'
+    )
+    assert OP.extract_nullable_options(str(cpp)) == ["filament_wipe", "filament_z_hop", "long_retractions_when_cut"]

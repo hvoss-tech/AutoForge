@@ -321,9 +321,10 @@ def test_prepare_loads_the_printer_profiles_ahead(client, acme):
     assert client.post("/api/outputs/3mf/printers/prepare", json={"printer": "Acme One 0.4 nozzle"}).status_code == 200
     profiles = OP.shared_profiles()
     end = time.monotonic() + 10
-    while ("Acme", "machine", "Acme One 0.4 nozzle") not in profiles._resolved and time.monotonic() < end:
+    wanted = [("Acme", "machine", "Acme One 0.4 nozzle"), ("Acme", "filament", "Acme PETG @Acme One")]
+    while not all(k in profiles._resolved for k in wanted) and time.monotonic() < end:
         time.sleep(0.02)
-    assert ("Acme", "filament", "Acme PETG @Acme One") in profiles._resolved
+    assert all(k in profiles._resolved for k in wanted)
 
 
 # --------------------------------------------------------------------- nozzle
@@ -379,3 +380,24 @@ def test_prepare_loads_the_preset_for_the_nozzle(client, acme):
     while ("Acme", "machine", "Acme One 0.6 nozzle") not in profiles._resolved and time.monotonic() < end:
         time.sleep(0.02)
     assert ("Acme", "machine", "Acme One 0.6 nozzle") in profiles._resolved
+
+
+# ---------------------------------------------------------- AutoForge print settings
+
+def test_print_settings_on_by_default_and_can_be_turned_off(client, acme):
+    job_id, _ = _job()
+    _, on = _swaps(client.post(f"/api/outputs/3mf/{job_id}", json={"printer": "Acme One 0.4 nozzle"}).content)
+    _, off = _swaps(client.post(f"/api/outputs/3mf/{job_id}", json={"printer": "Acme One 0.4 nozzle", "autoforge_settings": False}).content)
+    assert on["wall_loops"] == "1" and on["top_surface_pattern"] == "monotonic"
+    assert "wall_loops" not in off and off["outer_wall_speed"] == ["200"]
+    data = client.get("/api/outputs/3mf/printers").json()
+    assert any("wall" in line for line in data["autoforge_settings"])
+
+
+def test_zip_follows_the_remembered_print_settings_choice(client, acme):
+    job_id, _ = _job()
+    sliders = [{"layer": 6, "filament_uuid": "u-red", "enabled": True}]
+    project = _project(sliders, orca_printer="Acme One 0.4 nozzle", orca_autoforge_settings=False)
+    zf = zipfile.ZipFile(io.BytesIO(client.post(f"/api/outputs/export/{job_id}", json={"name": "Cat", "project": project}).content))
+    _, cfg = _swaps(zf.read("Cat_model.3mf"))
+    assert "wall_loops" not in cfg

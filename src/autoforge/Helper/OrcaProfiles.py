@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import urllib.error
@@ -287,6 +288,17 @@ def as_list(value) -> list:
     return [v.strip() for v in str(value).split(",")]
 
 
+def nozzle_list(value) -> list[str]:
+    """``nozzle_diameter`` as one entry per extruder; some profiles write
+    ``["0.4,0.4"]``."""
+    return [part.strip() for item in as_list(value) for part in str(item).split(",") if part.strip()]
+
+
+# A picture of 0.04-0.1 mm colour layers needs a fine nozzle: pellet and
+# large-format extruders (5 mm and up) can't print one at all.
+MAX_NOZZLE_MM = 1.2
+
+
 def _bed_rect(printable_area) -> list[float]:
     xs, ys = [], []
     for point in as_list(printable_area):
@@ -401,7 +413,157 @@ def _default_process(profiles: OrcaProfiles, vendor: str, printer: str, cfg: dic
     return sorted(candidates, key=lambda n: ("standard" not in n.lower(), "0.20mm" not in n, n))[0]
 
 
-def build_printer_index(profiles_dir: str) -> dict[str, Any]:
+_ADD_RE = re.compile(r'this->add(?:_nullable)?\("([a-z0-9_]+)"')
+_OVERRIDE_LIST_RE = re.compile(r"filament_extruder_override_keys\s*=\s*\{(.*?)\};", re.S)
+
+
+_TYPE_RE = re.compile(r'this->add(?:_nullable)?\("([a-z0-9_]+)",\s*(co[A-Za-z]+)')
+
+
+def extract_int_options(print_config_cpp: str) -> list[str]:
+    """Integer options. Their "nil" is stored as the largest int, which
+    OrcaSlicer's range check refuses even where the option is nullable."""
+    with open(print_config_cpp, encoding="utf-8") as f:
+        text = f.read()
+    types = dict(_TYPE_RE.findall(text))
+    ints = {k for k, t in types.items() if t in ("coInt", "coInts")}
+    m = _OVERRIDE_LIST_RE.search(text)
+    if m:  # filament overrides take their printer option's type
+        for key in re.findall(r'"([a-z0-9_]+)"', m.group(1)):
+            if types.get(key[len("filament_"):]) in ("coInt", "coInts"):
+                ints.add(key)
+    return sorted(ints)
+
+
+def extract_nullable_options(print_config_cpp: str) -> list[str]:
+    """Options that may hold "nil" (OrcaSlicer refuses it anywhere else):
+    the filament overrides of printer options (filament_extruder_override_keys,
+    declared with add_nullable in a loop) and those set ``def->nullable = true``."""
+    with open(print_config_cpp, encoding="utf-8") as f:
+        text = f.read()
+    nullable = set()
+    m = _OVERRIDE_LIST_RE.search(text)
+    if m:
+        nullable.update(re.findall(r'"([a-z0-9_]+)"', m.group(1)))
+    current = None
+    for line in text.splitlines():
+        added = _ADD_RE.search(line)
+        if added:
+            current = added.group(1)
+        elif current and re.search(r"def->nullable\s*=\s*true", line):
+            nullable.add(current)
+    return sorted(nullable)
+_LIMIT_RE = re.compile(r"def->(min|max)\s*=\s*([^;]+);")
+
+
+def extract_option_ranges(print_config_cpp: str) -> dict[str, list[float | None]]:
+    """{option: [min, max]} from OrcaSlicer's PrintConfig.cpp - the ranges
+    it refuses a project for ("not in range") when a value lies outside."""
+    constants = {"max_temp": 1500.0}
+    ranges: dict[str, list[float | None]] = {}
+    current = None
+    with open(print_config_cpp, encoding="utf-8") as f:
+        for line in f:
+            m = _ADD_RE.search(line)
+            if m:
+                current = m.group(1)
+                continue
+            m = _LIMIT_RE.search(line)
+            if not m or current is None:
+                continue
+            raw = m.group(2).strip().rstrip("f")
+            sign = -1.0 if raw.startswith("-") else 1.0
+            name = raw.lstrip("-").strip()
+            try:
+                value = sign * (constants[name] if name in constants else float(name))
+            except ValueError:
+                continue
+            entry = ranges.setdefault(current, [None, None])
+            entry[0 if m.group(1) == "min" else 1] = value
+    return ranges
+
+
+_LIST_RE = re.compile(r"static std::vector<std::string> s_Preset_(print|filament|machine_limits|printer)_options\s*\{(.*?)\};", re.S)
+
+
+def extract_preset_sections(preset_cpp: str) -> dict[str, list[str]]:
+    """{"process"|"filament"|"machine": [option, ...]} - which preset each
+    option belongs to, from OrcaSlicer's Preset.cpp."""
+    with open(preset_cpp, encoding="utf-8") as f:
+        text = re.sub(r"/\*.*?\*/", "", f.read(), flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    sections: dict[str, list[str]] = {"process": [], "filament": [], "machine": []}
+    for kind, body in _LIST_RE.findall(text):
+        target = {"print": "process", "filament": "filament"}.get(kind, "machine")
+        sections[target].extend(re.findall(r'"([a-z0-9_]+)"', body))
+    return sections
+
+
+# Printers whose OrcaSlicer projects give the defaults: single-extruder ones
+# without variants first, so per-extruder values come as one entry.
+_DEFAULT_SOURCES = [
+    "FLSun Q5 0.4 nozzle", "Voron 2.4 350 0.4 nozzle", "Prusa MK4 0.4 nozzle",
+    "Elegoo Neptune 4 Max 0.4 nozzle", "Bambu Lab X1 Carbon 0.4 nozzle",
+]
+
+
+def extract_orca_defaults(profiles: "OrcaProfiles", index: dict[str, Any], sections: dict[str, list[str]],
+                          orca_command: list[str], work_dir: str) -> dict[str, dict[str, Any]]:
+    """Orca's default value of every option, per preset section.
+
+    A project only holding what the presets set is not enough: OrcaSlicer
+    takes a missing option from whatever it has loaded (another printer's
+    bed exclusion area made every delta printer refuse to slice). OrcaSlicer's
+    own project export has every option, with the built-in default where the
+    presets set nothing - so each option's default is read from the export of
+    a printer whose presets don't set it. Needs the OrcaSlicer CLI."""
+    import subprocess
+    import zipfile
+
+    import numpy as np
+
+    os.makedirs(work_dir, exist_ok=True)
+    stl = os.path.join(work_dir, "box.stl")
+    # A closed 10 mm cube (OrcaSlicer refuses a lone triangle).
+    c = [[x, y, z] for x in (0, 10) for y in (0, 10) for z in (0, 10)]
+    faces = [(0, 2, 1), (1, 2, 3), (4, 5, 6), (5, 7, 6), (0, 1, 4), (1, 5, 4),
+             (2, 6, 3), (3, 6, 7), (0, 4, 2), (2, 4, 6), (1, 3, 5), (3, 7, 5)]
+    with open(stl, "wb") as f:
+        f.write(bytes(80) + np.uint32(len(faces)).tobytes())
+        for face in faces:
+            f.write(np.zeros(3, np.float32).tobytes() + np.array([c[i] for i in face], np.float32).tobytes() + b"\0\0")
+    by_name = {p["name"]: p for p in index["printers"]}
+    sources = []
+    for name in _DEFAULT_SOURCES:
+        printer = by_name[name]
+        files, own = [], {}
+        for kind, preset in (("machine", printer["name"]), ("process", printer["process"]),
+                             ("filament", printer["filaments"]["PLA"])):
+            cfg = profiles.resolve(printer["vendor"], kind, preset)
+            own[kind] = set(cfg)
+            cfg.update({"type": kind, "name": preset, "from": "system", "instantiation": "true"})
+            path = os.path.join(work_dir, f"{len(sources)}_{kind}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f)
+            files.append(path)
+        out = os.path.join(work_dir, f"{len(sources)}.3mf")
+        subprocess.run(orca_command + ["--load-settings", f"{files[0]};{files[1]}", "--load-filaments", files[2],
+                                       "--export-3mf", os.path.basename(out), "--outputdir", work_dir, stl],
+                       cwd=work_dir, capture_output=True, timeout=600, check=False)
+        with zipfile.ZipFile(out) as z:
+            exported = json.loads(z.read("Metadata/project_settings.config"))
+        sources.append((own, exported))
+    defaults: dict[str, dict[str, Any]] = {"process": {}, "filament": {}, "machine": {}}
+    for kind, keys in sections.items():
+        for key in keys:
+            for own, exported in sources:
+                if key in exported and key not in own[kind]:
+                    defaults[kind][key] = exported[key]
+                    break
+    return defaults
+
+
+def build_printer_index(profiles_dir: str, print_config_cpp: str | None = None) -> dict[str, Any]:
     """Index every printer preset Orca offers, from a ``resources/profiles`` checkout."""
     source = LocalProfileSource(profiles_dir)
     profiles = OrcaProfiles(source)
@@ -432,6 +594,14 @@ def build_printer_index(profiles_dir: str) -> dict[str, Any]:
             if process is None:
                 logger.warning("Skipping printer %s: no process preset", name)
                 continue
+            nozzles = nozzle_list(cfg.get("nozzle_diameter"))
+            nozzle = nozzles[0] if nozzles else str(cfg.get("printer_variant") or "")
+            try:
+                if min(float(n) for n in nozzles) > MAX_NOZZLE_MM:
+                    logger.info("Skipping printer %s: %s mm nozzle is too coarse for colour layers", name, nozzle)
+                    continue
+            except ValueError:
+                pass
             bed = _bed_rect(cfg.get("printable_area"))
             if bed[2] - bed[0] <= 0 or bed[3] - bed[1] <= 0:
                 logger.warning("Skipping printer %s: no usable printable_area", name)
@@ -445,15 +615,22 @@ def build_printer_index(profiles_dir: str) -> dict[str, Any]:
                 "name": name,
                 "vendor": vendor,
                 "model": model,
-                "nozzle": str(_first(as_list(cfg.get("nozzle_diameter")), cfg.get("printer_variant") or "")),
-                "extruders": max(1, len(as_list(cfg.get("nozzle_diameter")))),
+                "nozzle": nozzle,
+                "extruders": max(1, len(nozzles)),
                 "bed": bed,
                 "height": float(cfg.get("printable_height") or 0),
                 "process": process,
                 "filaments": filaments,
             })
     printers.sort(key=lambda p: (p["vendor"].lower(), p["model"].lower(), p["name"].lower()))
-    return {"orca_tag": ORCA_TAG, "printers": printers}
+    if print_config_cpp is None:
+        guess = os.path.join(profiles_dir, "..", "..", "src", "libslic3r", "PrintConfig.cpp")
+        print_config_cpp = guess if os.path.exists(guess) else None
+    ranges = extract_option_ranges(print_config_cpp) if print_config_cpp else {}
+    nullable = extract_nullable_options(print_config_cpp) if print_config_cpp else []
+    ints = extract_int_options(print_config_cpp) if print_config_cpp else []
+    return {"orca_tag": ORCA_TAG, "printers": printers, "option_ranges": ranges, "nullable": nullable,
+            "int_options": ints}
 
 
 _index_cache: dict[str, Any] | None = None
@@ -526,9 +703,29 @@ def main(argv=None):
     )
     parser.add_argument("profiles_dir", help="Path to OrcaSlicer's resources/profiles")
     parser.add_argument("--out", default=INDEX_PATH)
+    parser.add_argument(
+        "--orca",
+        default="flatpak run --filesystem={work} --command=orca-slicer com.orcaslicer.OrcaSlicer",
+        help="Command that runs the OrcaSlicer CLI ({work} is the scratch directory), for the option defaults",
+    )
+    parser.add_argument(
+        "--print-config",
+        help="OrcaSlicer's src/libslic3r/PrintConfig.cpp, for the option ranges "
+        "(default: next to the profiles in a checkout)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    index = build_printer_index(args.profiles_dir)
+    index = build_printer_index(args.profiles_dir, args.print_config)
+    if not index["option_ranges"]:
+        parser.error("PrintConfig.cpp not found: pass --print-config (the option ranges are required)")
+    preset_cpp = os.path.join(os.path.dirname(args.print_config or os.path.join(
+        args.profiles_dir, "..", "..", "src", "libslic3r", "PrintConfig.cpp")), "Preset.cpp")
+    sections = extract_preset_sections(preset_cpp)
+    with tempfile.TemporaryDirectory(prefix="orca-defaults-") as work:
+        command = [part.replace("{work}", work) for part in args.orca.split()]
+        index["defaults"] = extract_orca_defaults(
+            OrcaProfiles(LocalProfileSource(args.profiles_dir)), index, sections, command, work
+        )
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(index, f, separators=(",", ":"), ensure_ascii=False)
         f.write("\n")

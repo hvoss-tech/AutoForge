@@ -652,6 +652,13 @@ def build_parser() -> configargparse.ArgParser:
         "as a filament change. The printer's profile is downloaded from OrcaSlicer's GitHub once.",
     )
     parser.add_argument(
+        "--orca_autoforge_settings",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="In the slicer project, use AutoForge print settings for colour-layer prints (1 wall, all solid, "
+        "monotonic top, slower first layer, ...). On by default.",
+    )
+    parser.add_argument(
         "--orca_manual_swaps",
         choices=["auto", "yes", "no"],
         default="auto",
@@ -1344,6 +1351,7 @@ def _export_slicer_project(args, disc_global, disc_height_image, material_colors
             out, os.path.join(args.output_folder, "final_model.stl"), plan, args.orca_printer,
             args.layer_height, args.background_height, manual, title="AutoForge",
             nozzle=getattr(args, "nozzle_diameter", None),
+            autoforge_settings=getattr(args, "orca_autoforge_settings", True),
         )
         print(f"Slicer project for {info['printer']}: {out}")
         for message in info["notes"]:

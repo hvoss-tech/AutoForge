@@ -135,10 +135,12 @@ def write_project_3mf(
     title: str,
     base: dict[str, Any] | None = None,
     progress=None,
+    autoforge_settings: bool = True,
 ) -> dict[str, Any]:
     """Write the project; returns export_3mf's info (preset used, notes, warnings)."""
     plan, layer_height, background_height = export_plan(job_dir, project, base)
     return export_3mf(
         out_path, stl_path, plan, printer, layer_height, background_height, manual_swaps,
         title=title, progress=progress, nozzle=run_nozzle(job_dir, project),
+        autoforge_settings=autoforge_settings,
     )
