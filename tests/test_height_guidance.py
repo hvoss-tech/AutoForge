@@ -588,3 +588,19 @@ def test_tiled_guided_proxy_matches_one_stack_per_program():
     tiled = fc.proxy_losses(pal, t, w, guided=guided)
     single = torch.cat([fc.proxy_losses(pal[i : i + 1], t, w, guided=guided) for i in range(B)])
     torch.testing.assert_close(tiled, single, rtol=1e-5, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_maps_downsize_to_non_divisible_shape_on_mps():
+    # "area" downsizing is adaptive_avg_pool2d, which MPS only implements
+    # for divisible sizes: 1000x750 -> 333x250 must still work there.
+    rng = np.random.default_rng(0)
+    tmap = rng.random((1000, 750)).astype(np.float32)
+    weight = rng.random((1000, 750)).astype(np.float32)
+    g = HeightGuidance(GuidanceSpec(strength=1), COLORS, 20, tmap, weight, device="mps")
+    t, w = g.maps((333, 250))
+    assert t.device.type == "mps" and w.device.type == "mps"
+    assert tuple(t.shape) == (333, 250) and tuple(w.shape) == (333, 250)
+    ref = HeightGuidance(GuidanceSpec(strength=1), COLORS, 20, tmap, weight, device="cpu").maps((333, 250))
+    assert torch.allclose(t.cpu(), ref[0], atol=1e-5)
+    assert torch.allclose(w.cpu(), ref[1], atol=1e-5)

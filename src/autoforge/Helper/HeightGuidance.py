@@ -492,8 +492,13 @@ class HeightGuidance:
             if tuple(t.shape) != shape:
                 mode = "area" if t.shape[0] * t.shape[1] > shape[0] * shape[1] else "bilinear"
                 kw = {} if mode == "area" else {"align_corners": False}
-                t = F.interpolate(t[None, None], size=shape, mode=mode, **kw)[0, 0]
-                w = F.interpolate(w[None, None], size=shape, mode=mode, **kw)[0, 0]
+                dev = t.device
+                # "area" is adaptive_avg_pool2d, which MPS only supports for
+                # divisible sizes; the result is cached, so resize on the CPU.
+                if mode == "area" and dev.type == "mps":
+                    t, w = t.cpu(), w.cpu()
+                t = F.interpolate(t[None, None], size=shape, mode=mode, **kw)[0, 0].to(dev)
+                w = F.interpolate(w[None, None], size=shape, mode=mode, **kw)[0, 0].to(dev)
             hit = (t.contiguous(), w.contiguous())
             if len(self._maps_cache) > 8:
                 self._maps_cache.clear()
