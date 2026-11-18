@@ -41,7 +41,7 @@ def _viterbi_swaps(score: torch.Tensor, max_swaps: int, base: Optional[int] = No
     """
     dev = score.device
     return torch.from_numpy(
-        _viterbi_swaps_np(score.detach().to("cpu", torch.float64).numpy(), max_swaps, base)
+        _viterbi_swaps_np(score.detach().cpu().to(torch.float64).numpy(), max_swaps, base)
     ).to(dev)
 
 
@@ -367,7 +367,7 @@ def project_assignment(
         # Greedy palette and swap DP both on the host, from one copy: as
         # small GPU kernels they were ~1000 launches and a sync per call.
         dev = score.device
-        sc = score.detach().to("cpu", torch.float64).numpy()
+        sc = score.detach().cpu().to(torch.float64).numpy()
         mask = _palette_masks_greedy_np(sc, max_colors, mat)
         sc = np.where(mask[:, None, :], sc, -1e9)
         out_np = _viterbi_swaps_np(sc, max_swaps, free) if need_swaps else sc.argmax(-1)
