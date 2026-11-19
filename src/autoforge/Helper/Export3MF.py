@@ -527,6 +527,8 @@ def project_settings(
     index = load_printer_index()
     fill_nil_values(config, set(index.get("nullable") or []), defaults, set(index.get("int_options") or []))
     clamp_to_orca_ranges(config, index.get("option_ranges") or {})
+    if printer["vendor"] == "BBL":
+        make_bambu_compatible(config)
     config["flush_volumes_matrix"] = flush_matrix(config, [s.color for s in slots])
     config["flush_volumes_vector"] = ["140"] * (2 * len(slots))
 
@@ -827,6 +829,40 @@ def fill_nil_values(config: dict[str, Any], nullable: set[str], defaults: dict[s
     return changed
 
 
+_PATTERN_KEYS = (
+    "sparse_infill_pattern", "top_surface_pattern", "bottom_surface_pattern",
+    "internal_solid_infill_pattern", "ironing_pattern", "support_ironing_pattern",
+)
+# Bambu Studio has no "off" level, only its old on/off switch.
+_BAMBU_VERTICAL_SHELL = {"none": "0", "ensure_critical_only": "0", "ensure_moderate": "0", "ensure_all": "1"}
+_BAMBU_ARC_FITTING = {"disabled": "0", "enabled": "1"}
+
+
+def make_bambu_compatible(config: dict[str, Any]) -> list[str]:
+    """Write the values Bambu Studio names differently from OrcaSlicer its
+    way. Bambu Studio swaps a value it doesn't know for its default: a 100 %
+    "rectilinear" infill became "cubic", which it refuses at that density, so
+    it dropped the project's settings and opened the stock 0.2 mm profile.
+    OrcaSlicer converts each of these back on load (handle_legacy), so the
+    project still opens there. Returns the keys changed."""
+    changed = []
+
+    def convert(key: str, table: dict[str, str]) -> None:
+        value = config.get(key)
+        if value is None:
+            return
+        fixed = [table.get(str(v), v) for v in value] if isinstance(value, list) else table.get(str(value), value)
+        if fixed != value:
+            config[key] = fixed
+            changed.append(key)
+
+    for key in _PATTERN_KEYS:
+        convert(key, {"rectilinear": "zig-zag"})
+    convert("enable_arc_fitting", _BAMBU_ARC_FITTING)
+    convert("ensure_vertical_shell_thickness", _BAMBU_VERTICAL_SHELL)
+    return changed
+
+
 def clamp_to_orca_ranges(config: dict[str, Any], ranges: dict[str, Any]) -> list[str]:
     """Bring values into OrcaSlicer's allowed range for each option.
 
@@ -1070,5 +1106,5 @@ def export_3mf(
 
 __all__ = [
     "Cancelled", "ProfileError", "Slot", "SwapPlan", "export_3mf", "printer_changes_filament",
-    "project_settings", "read_stl", "swap_plan",
+    "make_bambu_compatible", "project_settings", "read_stl", "swap_plan",
 ]

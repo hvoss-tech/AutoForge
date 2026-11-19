@@ -757,3 +757,47 @@ def test_layer_limits_follow_autoforges_layer_height(acme, layer, base, min_expe
     cfg = E.project_settings(printer, _slots("PLA", "PLA"), layer, base, False, acme)
     assert cfg["layer_height"] == f"{layer:g}" and cfg["initial_layer_print_height"] == f"{base:g}"
     assert cfg["min_layer_height"] == min_expected and cfg["max_layer_height"] == max_expected
+
+
+# ------------------------------------------------------- Bambu Studio values
+
+def test_bambu_printers_get_values_bambu_studio_reads():
+    """Bambu Studio names some values differently from OrcaSlicer and swaps
+    a name it doesn't know for its default: sparse "rectilinear" became
+    "cubic", which it refuses at 100 % infill, so it dropped the project's
+    settings (0.04 mm layers opened as 0.2 mm). OrcaSlicer reads Bambu's
+    names as legacy values, so one file works in both."""
+    cfg = {
+        "sparse_infill_pattern": "rectilinear",
+        "bottom_surface_pattern": "rectilinear",
+        "ironing_pattern": ["rectilinear"],
+        "top_surface_pattern": "monotonic",
+        "internal_solid_infill_pattern": "alignedrectilinear",
+        "enable_arc_fitting": "disabled",
+        "ensure_vertical_shell_thickness": "none",
+    }
+    changed = E.make_bambu_compatible(cfg)
+    assert cfg == {
+        "sparse_infill_pattern": "zig-zag",
+        "bottom_surface_pattern": "zig-zag",
+        "ironing_pattern": ["zig-zag"],
+        "top_surface_pattern": "monotonic",
+        "internal_solid_infill_pattern": "alignedrectilinear",
+        "enable_arc_fitting": "0",
+        "ensure_vertical_shell_thickness": "0",
+    }
+    assert set(changed) == {
+        "sparse_infill_pattern", "bottom_surface_pattern", "ironing_pattern",
+        "enable_arc_fitting", "ensure_vertical_shell_thickness",
+    }
+    assert E.make_bambu_compatible(cfg) == []  # already Bambu's
+
+
+def test_ensure_vertical_shell_levels_map_to_bambus_old_switch():
+    for orca, bambu in (("none", "0"), ("ensure_critical_only", "0"), ("ensure_moderate", "0"), ("ensure_all", "1")):
+        cfg = {"ensure_vertical_shell_thickness": orca}
+        E.make_bambu_compatible(cfg)
+        assert cfg["ensure_vertical_shell_thickness"] == bambu
+    cfg = {"enable_arc_fitting": "enabled"}
+    E.make_bambu_compatible(cfg)
+    assert cfg["enable_arc_fitting"] == "1"
